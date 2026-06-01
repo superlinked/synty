@@ -3,6 +3,16 @@ name = "synty"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Apple Silicon GPU encode (candle Metal backend). Build: --features metal.
+metal = ["pylate-rs/metal", "candle-core/metal"]
+# CPU BLAS via Apple Accelerate (macOS) — safe fallback when a Metal op is
+# unimplemented. Build: --features accelerate.
+accelerate = ["pylate-rs/accelerate", "candle-core/accelerate"]
+# CPU BLAS via Intel MKL (Linux/x86). Build: --features mkl.
+mkl = ["pylate-rs/mkl", "candle-core/mkl"]
+
 [dependencies]
 anyhow = "1.0.102"
 candle-core = "0.9.2"
