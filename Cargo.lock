@@ -3372,6 +3372,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "half",
  "ndarray",
  "next-plaid",
  "object_store",

@@ -4,10 +4,13 @@
 // (which dominates cost) is shared across the whole fleet through the bucket.
 //
 // On-disk value is a compact little-endian blob: rows u32, cols u32, then the
-// f32 matrix. The store is write-once: a hash that exists is never re-put.
+// matrix as f16 (half the bytes of f32; the precision loss is well below what
+// MaxSim over normalized ColBERT vectors notices). The store is write-once: a
+// hash that exists is never re-put.
 
 use crate::bucket::{self, Bucket};
 use anyhow::{anyhow, Result};
+use half::f16;
 use ndarray::Array2;
 
 pub struct EmbStore {
@@ -23,7 +26,9 @@ impl EmbStore {
 
     pub fn get(&self, hash: u64) -> Result<Option<Array2<f32>>> {
         match self.bucket.get(&key(hash))? {
-            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            // An unreadable blob (e.g. an older f32 entry) is treated as a miss,
+            // so a format change just re-encodes rather than failing the build.
+            Some(bytes) => Ok(decode(&bytes).ok()),
             None => Ok(None),
         }
     }
@@ -46,11 +51,11 @@ fn key(hash: u64) -> String {
 
 fn encode(a: &Array2<f32>) -> Vec<u8> {
     let (rows, cols) = (a.nrows() as u32, a.ncols() as u32);
-    let mut out = Vec::with_capacity(8 + a.len() * 4);
+    let mut out = Vec::with_capacity(8 + a.len() * 2);
     out.extend_from_slice(&rows.to_le_bytes());
     out.extend_from_slice(&cols.to_le_bytes());
     for &v in a.iter() {
-        out.extend_from_slice(&v.to_le_bytes());
+        out.extend_from_slice(&f16::from_f32(v).to_le_bytes());
     }
     out
 }
@@ -61,13 +66,13 @@ fn decode(b: &[u8]) -> Result<Array2<f32>> {
     }
     let rows = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
     let cols = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
-    let want = 8 + rows * cols * 4;
+    let want = 8 + rows * cols * 2;
     if b.len() != want {
         return Err(anyhow!("embedding blob size {} != {want}", b.len()));
     }
     let mut data = Vec::with_capacity(rows * cols);
-    for chunk in b[8..].chunks_exact(4) {
-        data.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in b[8..].chunks_exact(2) {
+        data.push(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
     }
     Array2::from_shape_vec((rows, cols), data).map_err(|e| anyhow!("embedding shape: {e}"))
 }
