@@ -89,8 +89,8 @@ runs on CI or a server without a developer machine.
 
 ## Surfaces
 
-- **CLI → stdout (agents):** `search`, `topic`, `recent` print Markdown an agent
-  reads over the shell — no server, no auth, no network. *Built: `search`.*
+- **CLI → stdout (agents):** `search`, `topic`, `recent`, `status` print Markdown
+  an agent reads over the shell — no server, no auth, no network. *Built.*
 - **TUI (humans):** tracker status (is it running, what it sees, throughput,
   autostart) + browse/drill. *Planned.*
 - **MCP server (optional):** expose `synty_search / synty_topic / synty_session`

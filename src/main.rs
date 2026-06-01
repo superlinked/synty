@@ -21,6 +21,7 @@ mod sync;
 mod tail;
 mod track;
 mod up;
+mod view;
 mod index;
 mod ingest;
 mod model;
@@ -142,6 +143,17 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         resolution: f64,
     },
+    /// List emergent topics (from the last `cluster` run); optional substring filter
+    Topic { query: Option<String> },
+    /// Recent activity: latest PRs, issues, and prompts
+    Recent {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// What synty holds and how fresh it is
+    Status,
     /// Extractive session + topic summaries
     Summarize {
         #[arg(long, default_value_t = 10)]
@@ -222,6 +234,21 @@ fn main() -> Result<()> {
             search::run(&query, filter.as_deref(), k, &model_id(), &bucket)?
         }
         Cmd::Cluster { resolution } => cluster::run(resolution)?,
+        Cmd::Topic { query } => {
+            let mut topics = view::topics()?;
+            if let Some(q) = query {
+                let ql = q.to_lowercase();
+                topics.retain(|t| {
+                    t.label.to_lowercase().contains(&ql)
+                        || t.members.iter().any(|m| m.to_lowercase().contains(&ql))
+                });
+            }
+            print!("{}", view::topics_md(&topics));
+        }
+        Cmd::Recent { repo, limit } => {
+            print!("{}", view::recent_md(&view::recent(repo.as_deref(), limit)?));
+        }
+        Cmd::Status => print!("{}", view::status_md(&view::status()?)),
         Cmd::Summarize { sessions, topics } => summarize::run(sessions, topics)?,
         Cmd::Eval => eval::run(&model_id())?,
         Cmd::Track { source, out, max_age_days, machine, watch, poll, install, cursors, bucket } => {
