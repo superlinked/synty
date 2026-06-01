@@ -1,12 +1,9 @@
-// Shared tailer machinery, ported from synty-legacy/internal/source/tail.
-// A `Source` detects a file's format version and builds a stateful `FileParser`;
-// `drive` feeds it complete JSONL lines and collects canonical envelopes. The
-// watch loop (track.rs) and the one-shot oracle validator both go through
-// `drive`, so they emit identical events.
+// Shared tailer machinery: a `Source` detects a file's format version and builds
+// a stateful `FileParser`; `drive` feeds it complete JSONL lines and collects
+// canonical envelopes.
 //
-// event_ids are deterministic in (source, file, line offset, sub-index) so a
-// re-parse after a lost cursor mints the same ids — the idempotency property
-// the engine relies on.
+// event_ids are deterministic in (source, file, line offset, sub-index): a
+// re-parse after a lost cursor mints the same ids.
 
 use crate::event::{deterministic_ulid, Event, Sequencer};
 use anyhow::Result;
@@ -130,8 +127,8 @@ pub fn ms_to_rfc3339(ms: i64) -> String {
 
 /// Drive a parser over a buffer of complete JSONL lines starting at byte
 /// `start_offset`, collecting all emitted events. Empty lines advance the
-/// offset without parsing. Returns (events, bytes_consumed). A line that fails
-/// to parse is skipped (the watch engine reports it as a health event).
+/// offset without parsing; a malformed line is skipped. Returns (events,
+/// bytes_consumed).
 pub fn drive(
     parser: &mut dyn FileParser,
     content: &[u8],

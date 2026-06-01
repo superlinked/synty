@@ -1,7 +1,6 @@
-// Claude Code session JSONL → canonical envelopes, ported from
-// synty-legacy/internal/source/claudecode (parser_v2_1.go). Each
+// Claude Code session JSONL → canonical envelopes. Each
 // ~/.claude/projects/<slug>/<uuid>.jsonl line is one JSON record discriminated
-// by `type`; the envelope mapping mirrors the legacy format.md.
+// by `type` (user, assistant, attachment, system, …).
 
 use crate::event::{kind, source, Event};
 use crate::tail::{resolve_ts, EmitCtx, FileParser, Source};

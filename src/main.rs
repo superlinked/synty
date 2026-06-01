@@ -6,6 +6,7 @@
 
 mod claudecode;
 mod cluster;
+mod codex;
 mod community;
 mod encode;
 mod eval;

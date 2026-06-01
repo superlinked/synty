@@ -1,17 +1,15 @@
-// The canonical envelope every native tailer emits, ported from
-// synty-legacy/internal/event. It serializes to the same JSON the v1 Go agent
-// wrote (event_id, stream, seq, ts, source, session_id, kind, payload), so the
-// existing `ingest` consumes native-tailer output unchanged.
+// The canonical envelope every tailer emits and `ingest` reads: source, kind,
+// session, timestamp, and a kind-specific JSON payload.
 //
-// event_id is a ULID whose 80-bit entropy is sha256(key)[..10] — deterministic,
-// so re-parsing the same source line (after a lost cursor) mints the same id
-// and a downstream event_id-keyed upsert dedupes the re-emission.
+// event_id is a ULID whose 80-bit entropy is sha256(key)[..10], so re-parsing a
+// source line (e.g. after a lost cursor) mints the same id and downstream dedup
+// recognizes the re-emission.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Canonical source identifiers (mirror event.Source in the Go envelope). The
-/// full set is intentionally declared up front; later tailers use the rest.
+/// Canonical source identifiers. The full set is declared up front; later
+/// tailers use the rest.
 #[allow(dead_code)]
 pub mod source {
     pub const CLAUDE_CODE: &str = "claude_code";
@@ -21,7 +19,7 @@ pub mod source {
     pub const SYNTY: &str = "synty";
 }
 
-/// Canonical payload kinds (mirror event.Kind).
+/// Canonical payload kinds.
 #[allow(dead_code)]
 pub mod kind {
     pub const USER_PROMPT: &str = "user_prompt";

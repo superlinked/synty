@@ -1,13 +1,12 @@
 // `synty track` — the native tracker. Discovers each source's session files,
-// parses new content into canonical envelopes, and writes them out. This is the
-// Rust replacement for the v1 Go agent.
+// parses their content into canonical envelopes, and writes them out.
 //
-// This first cut runs a one-shot drain (--once): walk the roots, parse every
-// in-window file from the start, synthesize a session_end per session, write
-// JSONL under <out>/<stream>/. The watch loop + persistent cursors land in a
-// follow-up; the parsers and envelope output are the validated core.
+// This first cut is a one-shot drain: walk the roots, parse every in-window file
+// from the start, synthesize a session_end per session, and write JSONL under
+// <out>/<stream>/. A continuous watch loop with persistent cursors lands next.
 
 use crate::claudecode::ClaudeCode;
+use crate::codex::Codex;
 use crate::event::{kind, Sequencer};
 use crate::tail::{drive, ms_to_rfc3339, EmitCtx, Source};
 use anyhow::{anyhow, bail, Result};
@@ -23,18 +22,19 @@ const HEAD_BYTES: usize = 64 << 10;
 fn default_roots(id: &str, home: &str) -> Vec<String> {
     match id {
         "claudecode" => vec![format!("{home}/.claude/projects")],
+        "codex" => vec![format!("{home}/.codex/sessions")],
         _ => vec![],
     }
 }
 
 fn sources(which: &str) -> Result<Vec<Box<dyn Source>>> {
-    let all: Vec<Box<dyn Source>> = vec![Box::new(ClaudeCode)];
+    let all: Vec<Box<dyn Source>> = vec![Box::new(ClaudeCode), Box::new(Codex)];
     if which == "all" {
         return Ok(all);
     }
     let picked: Vec<Box<dyn Source>> = all.into_iter().filter(|s| s.id() == which).collect();
     if picked.is_empty() {
-        bail!("unknown source {which} (have: claudecode)");
+        bail!("unknown source {which} (have: claudecode, codex)");
     }
     Ok(picked)
 }
