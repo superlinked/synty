@@ -25,8 +25,8 @@ ordered; each lists its projects as one-liners. Design detail lives in
 - Content-addressed f16 embedding store: each message encoded once across the fleet; a second device rebuilds with no re-encode.
 
 ## M4 — Surfaces
-- Agent surface complete: `search / topic / recent` Markdown to stdout; MCP server exposing the same as tools.
-- TUI: tracker status + autostart toggle + browse/drill.
+- CLI surface complete: `search / topic / recent / status` print Markdown to stdout.
+- TUI (humans): tracker status + autostart toggle + browse/drill topics and sessions, at rough feature parity with the CLI (more expressive where a terminal UI allows).
 
 ## M5 — Team frontend & privacy
 - Optional HTTP frontend over a shared bucket (same view models as the CLI/TUI).
@@ -35,3 +35,6 @@ ordered; each lists its projects as one-liners. Design detail lives in
 ## M6 — Distribution & OSS
 - Single-binary packaging (optional model bundling via `include_bytes!`); cross-platform release artifacts.
 - Install one-liner; license; public docs; OSS release.
+
+## Future work (after the milestones)
+- MCP server exposing `synty_search / synty_topic / synty_session` as agent tools over stdio.

@@ -94,7 +94,7 @@ runs on CI or a server without a developer machine.
 - **TUI (humans):** tracker status (is it running, what it sees, throughput,
   autostart) + browse/drill. *Planned.*
 - **MCP server (optional):** expose `synty_search / synty_topic / synty_session`
-  as agent tools. *Planned.*
+  as agent tools. *Deferred to future work (after the milestones).*
 - **Team web frontend (optional):** the same view models served over HTTP for a
   shared bucket. *Planned.*
 
