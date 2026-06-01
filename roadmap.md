@@ -9,15 +9,15 @@ ordered; each lists its projects as one-liners. Design detail lives in
 - Model download-on-demand (mxbai-edge) with local cache.
 - Validated on real data — retrieval, agent dogfood, extractive summaries (see `eval_report.md`).
 
-## M1 — Retrieval & topics solid
-- Community-detection clustering (Louvain/Leiden with a resolution knob); GitHub links as a weighted signal, not a transitive union.
-- Topic labels from extractive keyphrases.
-- Optional Candle `accelerate`/`openblas`; incremental (re-)indexing.
+## M1 — Retrieval & topics solid · done
+- Louvain community detection with a `--resolution` knob; GitHub links as a weighted edge signal, not a transitive union.
+- Topic labels from extractive c-TF-IDF keyphrases.
+- Opt-in Candle `metal`/`accelerate`/`mkl`; incremental (re-)indexing (content-hash embedding cache + unchanged fast-path).
 
-## M2 — Native tracker
-- Rust tailers for Claude Code / Codex / Cowork (replace the v1 Go agent as the source).
-- GitHub ingestion independent of a developer machine (App + backfill/webhooks).
-- Autostart registration (launchd / systemd).
+## M2 — Native tracker · done
+- Rust tailers for Claude Code / Codex / Cowork (`synty track`), validated against the v1 agent as oracle; codex version gap fixed.
+- GitHub ingestion independent of a developer machine (`synty github` GraphQL backfill, token-based); App install-token + webhooks still planned.
+- Autostart registration (launchd / systemd) + `--watch` with per-file cursors.
 
 ## M3 — Local mode & bucket backplane
 - `synty up`: one command to track + index + serve locally, zero config.

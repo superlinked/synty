@@ -63,11 +63,14 @@ the bucket; `docs.jsonl` + the index are derived.
 
 | Source | Mechanism | Status |
 |---|---|---|
-| Claude Code / Codex / Cowork | tail local session files → canonical envelopes | **reuses v1 Go agent dumps today**; native Rust tailers planned |
-| GitHub (PRs, issues, comments) | `gh` / GraphQL backfill + webhooks | **`gh` JSON today**; App-based ingestion planned |
+| Claude Code / Codex / Cowork | `synty track` tails local session files → canonical envelopes | **Built** (native Rust tailers, one per tool; `--watch` + per-file cursors + launchd/systemd autostart) |
+| GitHub (PRs, issues, comments) | `synty github` GraphQL backfill (token) | **Built** (machine-independent, no `gh`); App install-token + webhooks planned |
 
-The target is native Rust tailers (one per tool) that write envelopes to the
-bucket, plus a GitHub path that does not depend on a developer machine.
+`synty track` is the source of truth for sessions: a `Source` per tool detects
+the file format version and builds a parser; a shared driver mints canonical
+envelopes with deterministic event_ids (so a re-parse never duplicates). The
+GitHub path pulls PRs/issues straight from the GraphQL API with a token, so it
+runs on CI or a server without a developer machine.
 
 ## Derivations (all without an LLM)
 
@@ -124,9 +127,10 @@ the binary does locally.
 
 ## What's built (kernel)
 
-A working binary: `ingest` (v1 dumps + `gh` → `corpus/docs.jsonl`), `index`
+A working binary: `track` (native tailers → envelope streams), `github`
+(GraphQL backfill), `ingest` (envelopes + GitHub → `corpus/docs.jsonl`), `index`
 (encode + build + cached embeddings), `search [--filter col=value]`,
-`cluster [--resolution]`, `summarize`, `eval`, plus 22 scenario tests.
+`cluster [--resolution]`, `summarize`, `eval`, plus 45 scenario tests.
 Validated on real data (3,938 docs / 770 K embeddings): retrieval 12/12 relevant
 top-3, agent task-start dogfood 3/3, extractive session summaries specific and
 accurate, all with no generative model. Clustering (M1) is Louvain over the
