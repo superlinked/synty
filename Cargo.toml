@@ -12,6 +12,9 @@ metal = ["pylate-rs/metal", "candle-core/metal"]
 accelerate = ["pylate-rs/accelerate", "candle-core/accelerate"]
 # CPU BLAS via Intel MKL (Linux/x86). Build: --features mkl.
 mkl = ["pylate-rs/mkl", "candle-core/mkl"]
+# Cloud bucket backends (object_store). Build: --features s3 / --features gcs.
+s3 = ["dep:object_store", "object_store/aws", "dep:tokio", "dep:futures"]
+gcs = ["dep:object_store", "object_store/gcp", "dep:tokio", "dep:futures"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -26,3 +29,8 @@ serde_json = "1.0.150"
 sha2 = "0.10.9"
 ureq = "2"
 walkdir = "2.5.0"
+
+# Cloud bucket backends, pulled in only by the s3 / gcs features.
+object_store = { version = "0.11", optional = true, default-features = false }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
+futures = { version = "0.3", optional = true }

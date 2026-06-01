@@ -5,6 +5,7 @@
 // Subcommands: ingest, index, search, cluster, summarize, eval.
 
 mod blocks;
+mod bucket;
 mod claudecode;
 mod cluster;
 mod codex;
@@ -15,6 +16,7 @@ mod eval;
 mod event;
 mod github;
 mod keyphrase;
+mod store;
 mod tail;
 mod track;
 mod index;
@@ -111,7 +113,12 @@ enum Cmd {
     /// Parse corpus/{local,github} into corpus/docs.jsonl
     Ingest,
     /// Encode docs (pylate-rs) and build the next-plaid index
-    Index,
+    Index {
+        /// Bucket holding the content-addressed embedding store (file path or
+        /// s3://, gs:// with the matching feature). Shared across devices.
+        #[arg(long, default_value = ".synty")]
+        bucket: String,
+    },
     /// Semantic search; --filter is a SQL WHERE over metadata
     Search {
         query: String,
@@ -183,7 +190,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Ingest => ingest::run(CORPUS_DIR, DOCS_PATH)?,
-        Cmd::Index => index::run(DOCS_PATH, INDEX_PATH, &model_id())?,
+        Cmd::Index { bucket } => index::run(DOCS_PATH, INDEX_PATH, &model_id(), &bucket)?,
         Cmd::Search { query, filter, k } => {
             search::run(&query, filter.as_deref(), k, &model_id())?
         }

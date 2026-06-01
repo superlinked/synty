@@ -1,19 +1,18 @@
-// Encode docs with pylate-rs and build the next-plaid index (+ metadata for
-// WHERE-filtering and FTS). Encoding is incremental: per-doc embeddings are
-// cached by content hash (embeddings.npy + emb_hashes.json), so a re-index
-// after editing the corpus only encodes the new/changed texts, and an
-// unchanged corpus skips the model load entirely. The index itself is rebuilt
-// from scratch each run (cheap relative to encoding).
+// Encode docs and build the next-plaid index. Encoding is content-addressed:
+// each doc's embedding is fetched from (or stored to) a shared EmbStore keyed
+// by a hash of its text, so a message is encoded exactly once across all runs
+// and devices. The PLAID index is rebuilt from the assembled embeddings (cheap
+// next to encoding); an unchanged corpus skips even that.
 
+use crate::store::EmbStore;
 use crate::{encode::Encoder, load_docs};
 use anyhow::{Context, Result};
 use ndarray::Array2;
 use next_plaid::{IndexConfig, MmapIndex, UpdateConfig};
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-pub fn run(docs_path: &str, index_path: &str, model_id: &str) -> Result<()> {
+pub fn run(docs_path: &str, index_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     let docs = load_docs(docs_path)?;
     anyhow::ensure!(!docs.is_empty(), "no docs at {docs_path}; run `ingest` first");
     let path = Path::new(index_path);
@@ -25,23 +24,19 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str) -> Result<()> {
         .map(|d| serde_json::to_value(&d.meta))
         .collect::<std::result::Result<_, _>>()?;
 
-    // Fast path: if the corpus is byte-identical to what the current index was
-    // built from (same content hashes in the same order) and that index still
-    // loads, there is nothing to do — skip the re-encode and the rebuild.
-    if let Some(stored) = load_hashes(path) {
-        if stored == hashes && MmapIndex::load(index_path).is_ok() {
-            eprintln!("index up to date ({} docs, corpus unchanged)", docs.len());
-            return Ok(());
-        }
+    // Unchanged corpus → the current index already matches; nothing to do.
+    if load_manifest(path).as_deref() == Some(hashes.as_slice()) && MmapIndex::load(index_path).is_ok() {
+        eprintln!("index up to date ({} docs, corpus unchanged)", docs.len());
+        return Ok(());
     }
 
-    // Reuse prior embeddings for unchanged texts — load before the dir is wiped.
-    let cache = load_emb_cache(path);
+    // Pull every known embedding from the store; encode only the rest.
+    let store = EmbStore::open(bucket)?;
     let mut embeddings: Vec<Option<Array2<f32>>> = vec![None; texts.len()];
     let mut miss: Vec<usize> = Vec::new();
     for i in 0..texts.len() {
-        match cache.get(&hashes[i]) {
-            Some(e) => embeddings[i] = Some(e.clone()),
+        match store.get(hashes[i])? {
+            Some(e) => embeddings[i] = Some(e),
             None => miss.push(i),
         }
     }
@@ -49,15 +44,16 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str) -> Result<()> {
 
     let t0 = Instant::now();
     if miss.is_empty() {
-        eprintln!("all {reused} embeddings cached; no encode needed");
+        eprintln!("all {reused} embeddings in store; no encode needed");
     } else {
         eprintln!("loading model {model_id} (first run downloads from HF, then offline)...");
         let mut enc = Encoder::load(model_id)?;
-        eprintln!("reusing {reused} cached, encoding {} new/changed", miss.len());
+        eprintln!("reusing {reused} from store, encoding {} new/changed", miss.len());
         let mut done = 0;
         for chunk in miss.chunks(64) {
             let chunk_texts: Vec<String> = chunk.iter().map(|&i| texts[i].clone()).collect();
             for (&i, e) in chunk.iter().zip(enc.encode_docs(&chunk_texts)?) {
+                store.put(hashes[i], &e)?; // share to the fleet
                 embeddings[i] = Some(e);
             }
             done += chunk.len();
@@ -81,11 +77,11 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str) -> Result<()> {
     )
     .context("build next-plaid index")?;
 
-    // Persist embeddings + their content hashes so the next `index` reuses them
-    // and `cluster` reads them instead of re-encoding the corpus.
+    // embeddings.npy feeds `cluster`; doc_hashes.json is the build manifest the
+    // fast-path above reads.
     next_plaid::update::save_embeddings_npy(path, &embeddings)
-        .map_err(|e| anyhow::anyhow!("save embeddings cache: {e}"))?;
-    std::fs::write(path.join("emb_hashes.json"), serde_json::to_string(&hashes)?)?;
+        .map_err(|e| anyhow::anyhow!("save embeddings: {e}"))?;
+    std::fs::write(path.join("doc_hashes.json"), serde_json::to_string(&hashes)?)?;
 
     eprintln!(
         "indexed {} docs / {} embeddings in {:?} → {index_path}",
@@ -96,31 +92,15 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The content hashes the current index was built from, in doc order.
-fn load_hashes(path: &Path) -> Option<Vec<u64>> {
-    let raw = std::fs::read_to_string(path.join("emb_hashes.json")).ok()?;
+/// The doc content hashes (in order) the current index was built from.
+fn load_manifest(path: &Path) -> Option<Vec<u64>> {
+    let raw = std::fs::read_to_string(path.join("doc_hashes.json")).ok()?;
     serde_json::from_str::<Vec<u64>>(&raw).ok()
 }
 
-/// Map content-hash → cached embedding from the prior index, or empty if the
-/// cache is absent or inconsistent.
-fn load_emb_cache(path: &Path) -> HashMap<u64, Array2<f32>> {
-    let Ok(embs) = next_plaid::update::load_embeddings_npy(path) else {
-        return HashMap::new();
-    };
-    let Some(hashes) = load_hashes(path) else {
-        return HashMap::new();
-    };
-    if hashes.len() != embs.len() {
-        return HashMap::new();
-    }
-    hashes.into_iter().zip(embs).collect()
-}
-
-/// FNV-1a 64-bit — a small, deterministic, dependency-free content hash. A
-/// collision just costs one needless re-encode, never a wrong embedding (the
-/// rebuilt index re-derives everything), so cryptographic strength is not
-/// needed.
+/// FNV-1a 64-bit — a small, deterministic content hash. A collision only costs
+/// a needless re-encode (the index re-derives everything), so it need not be
+/// cryptographic.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -134,12 +114,10 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::fnv1a;
 
-    // Same bytes hash the same; different bytes differ. (Stable across runs so
-    // the embedding cache hits on an unchanged corpus.)
     #[test]
     fn fnv1a_is_stable_and_distinguishing() {
         assert_eq!(fnv1a(b"generation isolation"), fnv1a(b"generation isolation"));
         assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"));
-        assert_eq!(fnv1a(b""), 0xcbf29ce484222325); // FNV offset basis
+        assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
     }
 }
