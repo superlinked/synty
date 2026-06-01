@@ -7,6 +7,7 @@
 
 use crate::claudecode::ClaudeCode;
 use crate::codex::Codex;
+use crate::cowork::Cowork;
 use crate::event::{kind, Sequencer};
 use crate::tail::{drive, ms_to_rfc3339, EmitCtx, Source};
 use anyhow::{anyhow, bail, Result};
@@ -23,18 +24,22 @@ fn default_roots(id: &str, home: &str) -> Vec<String> {
     match id {
         "claudecode" => vec![format!("{home}/.claude/projects")],
         "codex" => vec![format!("{home}/.codex/sessions")],
+        "cowork" => vec![
+            format!("{home}/Library/Application Support/Claude/local-agent-mode-sessions"),
+            format!("{home}/Library/Application Support/Claude/claude-code-sessions"),
+        ],
         _ => vec![],
     }
 }
 
 fn sources(which: &str) -> Result<Vec<Box<dyn Source>>> {
-    let all: Vec<Box<dyn Source>> = vec![Box::new(ClaudeCode), Box::new(Codex)];
+    let all: Vec<Box<dyn Source>> = vec![Box::new(ClaudeCode), Box::new(Codex), Box::new(Cowork)];
     if which == "all" {
         return Ok(all);
     }
     let picked: Vec<Box<dyn Source>> = all.into_iter().filter(|s| s.id() == which).collect();
     if picked.is_empty() {
-        bail!("unknown source {which} (have: claudecode, codex)");
+        bail!("unknown source {which} (have: claudecode, codex, cowork)");
     }
     Ok(picked)
 }

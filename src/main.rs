@@ -4,9 +4,11 @@
 //
 // Subcommands: ingest, index, search, cluster, summarize, eval.
 
+mod blocks;
 mod claudecode;
 mod cluster;
 mod codex;
+mod cowork;
 mod community;
 mod encode;
 mod eval;

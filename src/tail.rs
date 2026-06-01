@@ -8,8 +8,16 @@
 use crate::event::{deterministic_ulid, Event, Sequencer};
 use anyhow::Result;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
+
+/// Deserialize a string field that may be JSON `null` (or absent) as "". Tools
+/// emit nullable fields like `parent_tool_use_id`; serde rejects null for a
+/// plain `String`, so a typed record needs this to avoid dropping the line.
+pub fn de_null_string<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
 
 /// A per-tool tailer: format detection + parser construction.
 pub trait Source {

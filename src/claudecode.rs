@@ -1,6 +1,7 @@
 // Claude Code session JSONL → canonical envelopes. Each
 // ~/.claude/projects/<slug>/<uuid>.jsonl line is one JSON record discriminated
-// by `type` (user, assistant, attachment, system, …).
+// by `type` (user, assistant, attachment, system, …). The Claude message shape
+// (user/assistant content) is decoded in `blocks`, shared with Cowork.
 
 use crate::event::{kind, source, Event};
 use crate::tail::{resolve_ts, EmitCtx, FileParser, Source};
@@ -103,8 +104,6 @@ struct RawRecord {
     is_snapshot_update: bool,
 }
 
-const FILE_TOOLS: &[&str] = &["Read", "Write", "Edit", "MultiEdit", "NotebookEdit"];
-
 impl FileParser for ParserV21 {
     fn parse_line(&mut self, line: &[u8], ec: &mut EmitCtx) -> Result<Vec<Event>> {
         let mut r: RawRecord =
@@ -155,8 +154,15 @@ impl FileParser for ParserV21 {
         }
 
         match r.rtype.as_str() {
-            "user" => out.extend(handle_user(ts_ms, &ts, &r, ec)),
-            "assistant" => out.extend(handle_assistant(ts_ms, &ts, &r, ec)),
+            "user" => {
+                let content = r.message.get("content").cloned().unwrap_or(Value::Null);
+                out.extend(crate::blocks::user_content(&content, r.is_meta, ts_ms, &ts, &r.session_id, ec));
+            }
+            "assistant" => {
+                let model = r.message.get("model").and_then(Value::as_str).unwrap_or("");
+                let content = r.message.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
+                out.extend(crate::blocks::assistant_content(&content, model, "claudecode", ts_ms, &ts, &r.session_id, ec));
+            }
             "attachment" => out.push(ec.event(
                 ts_ms,
                 &ts,
@@ -208,138 +214,9 @@ impl FileParser for ParserV21 {
                     "pr_url": r.pr_url,
                 }),
             )),
-            other => out.push(ec.event(
-                ts_ms,
-                &ts,
-                kind::AGENT_META,
-                &r.session_id,
-                json!({"subtype": other}),
-            )),
+            other => out.push(ec.event(ts_ms, &ts, kind::AGENT_META, &r.session_id, json!({"subtype": other}))),
         }
         Ok(out)
-    }
-}
-
-fn handle_user(ts_ms: i64, ts: &str, r: &RawRecord, ec: &mut EmitCtx) -> Vec<Event> {
-    let content = r.message.get("content").cloned().unwrap_or(Value::Null);
-    let (ukind, meta) = if r.is_meta { (kind::AGENT_META, true) } else { (kind::USER_PROMPT, false) };
-
-    // content is either a plain string (free-form prompt) …
-    if let Some(s) = content.as_str() {
-        let mut p = json!({"text": s, "preview": preview(s)});
-        if meta {
-            p["subtype"] = json!("user_meta");
-        }
-        return vec![ec.event(ts_ms, ts, ukind, &r.session_id, p)];
-    }
-
-    // … or an array of blocks (tool_result, or text).
-    let mut out = Vec::new();
-    if let Some(blocks) = content.as_array() {
-        for b in blocks {
-            match b.get("type").and_then(Value::as_str) {
-                Some("tool_result") => out.push(ec.event(
-                    ts_ms,
-                    ts,
-                    kind::TOOL_RESULT,
-                    &r.session_id,
-                    json!({
-                        "tool_use_id": b.get("tool_use_id").and_then(Value::as_str).unwrap_or(""),
-                        "content": b.get("content").cloned().unwrap_or(Value::Null),
-                        "is_error": b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-                    }),
-                )),
-                _ => {
-                    let text = b.get("text").and_then(Value::as_str).unwrap_or("");
-                    let mut p = json!({"text": text, "preview": preview(text)});
-                    if meta {
-                        p["subtype"] = json!("user_meta");
-                    }
-                    out.push(ec.event(ts_ms, ts, ukind, &r.session_id, p));
-                }
-            }
-        }
-    }
-    out
-}
-
-fn handle_assistant(ts_ms: i64, ts: &str, r: &RawRecord, ec: &mut EmitCtx) -> Vec<Event> {
-    let model = r.message.get("model").and_then(Value::as_str).unwrap_or("").to_string();
-    let blocks = r.message.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
-
-    let mut out = Vec::new();
-    let mut text_chunks: Vec<String> = Vec::new();
-    for b in &blocks {
-        match b.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(t) = b.get("text").and_then(Value::as_str) {
-                    text_chunks.push(t.to_string());
-                }
-            }
-            Some("thinking") => {
-                let t = b.get("thinking").and_then(Value::as_str).unwrap_or("");
-                out.push(ec.event(ts_ms, ts, kind::THINKING, &r.session_id, json!({"text": t, "preview": preview(t)})));
-            }
-            Some("tool_use") => {
-                let id = b.get("id").and_then(Value::as_str).unwrap_or("");
-                let name = b.get("name").and_then(Value::as_str).unwrap_or("");
-                let input = b.get("input").cloned().unwrap_or(Value::Null);
-                out.push(ec.event(
-                    ts_ms,
-                    ts,
-                    kind::TOOL_CALL,
-                    &r.session_id,
-                    json!({"tool_use_id": id, "name": name, "input": input}),
-                ));
-                if FILE_TOOLS.contains(&name) {
-                    if let Some(path) = input_file_path(&input) {
-                        out.push(ec.event(
-                            ts_ms,
-                            ts,
-                            kind::ATTACHMENT_REF,
-                            &r.session_id,
-                            json!({
-                                "tool_use_id": id,
-                                "tool_name": name,
-                                "local_path": path,
-                                "source_system": format!("claudecode_{}", name.to_lowercase()),
-                            }),
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if !text_chunks.is_empty() {
-        let joined = text_chunks.join("\n\n");
-        out.push(ec.event(
-            ts_ms,
-            ts,
-            kind::ASSISTANT_MESSAGE,
-            &r.session_id,
-            json!({"text": joined, "preview": preview(&joined), "model": model}),
-        ));
-    }
-    out
-}
-
-fn input_file_path(input: &Value) -> Option<String> {
-    for key in ["file_path", "notebook_path", "path", "target_file"] {
-        if let Some(v) = input.get(key).and_then(Value::as_str) {
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn preview(s: &str) -> String {
-    if s.chars().count() <= 200 {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(200).collect::<String>())
     }
 }
 
@@ -367,8 +244,6 @@ mod tests {
         assert!(ClaudeCode.new_parser("1.0.0").is_none());
     }
 
-    // A user prompt becomes one session_start + one user_prompt; a string
-    // content turns into the text payload ingest reads.
     #[test]
     fn user_string_prompt_yields_session_start_then_prompt() {
         let evts = run(r#"{"type":"user","sessionId":"S1","timestamp":"2026-05-31T20:00:00Z","version":"2.1.119","cwd":"/c/sie-internal","message":{"role":"user","content":"fix the login redirect"}}"#);
@@ -380,8 +255,6 @@ mod tests {
         assert_eq!(evts[1].source, "claude_code");
     }
 
-    // Assistant text + a file-touching tool_use → assistant_message, tool_call,
-    // and a sibling attachment_ref carrying the file path.
     #[test]
     fn assistant_text_and_file_tool_emit_message_call_and_attachment() {
         let line = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-05-31T20:01:00Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"editing auth.ts"},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/c/sie/auth.ts"}}]}}"#;
@@ -401,7 +274,6 @@ mod tests {
         assert_eq!(msg.payload["model"], "claude-opus-4-8");
     }
 
-    // session_start is emitted once even across multiple records.
     #[test]
     fn session_start_emitted_once() {
         let evts = run(&format!(
@@ -412,8 +284,6 @@ mod tests {
         assert_eq!(evts.iter().filter(|e| e.kind == "session_start").count(), 1);
     }
 
-    // A sidechain record rewrites the session to a synthetic child and emits a
-    // subagent_parent edge.
     #[test]
     fn sidechain_emits_subagent_parent_edge() {
         let evts = run(r#"{"type":"user","sessionId":"PARENT","isSidechain":true,"agentId":"a2","timestamp":"2026-05-31T20:00:00Z","message":{"content":"sub task"}}"#);
