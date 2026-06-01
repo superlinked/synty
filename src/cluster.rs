@@ -1,50 +1,67 @@
-// Emergent topics with no LLM: a mutual-kNN graph over late-interaction
-// similarity (each doc re-queried against the index), unioned with GitHub
-// "#<num>" references within a repo, then connected components (>=3 members)
-// labeled by dominant repo / labels / kind. Writes clusters.json.
+// Emergent topics with no LLM. A weighted similarity graph drives Louvain
+// community detection (`community.rs`):
+//   - kNN edges: each doc's cached embedding is queried against the index;
+//     neighbor scores are normalized per-doc (÷ best neighbor) to strip the
+//     length bias of token-sum MaxSim, floored, and summed across both
+//     directions so mutual neighbors weigh more than one-way ones.
+//   - GitHub "#<num>" references within a repo add a fixed-weight edge — a
+//     *signal*, not the hard transitive union that previously merged a whole
+//     homogeneous repo into one blob.
+// Louvain then optimizes modularity with a `--resolution` knob (higher → more,
+// smaller topics). Embeddings are reused from the index, so re-clustering (e.g.
+// a resolution sweep) never re-encodes. Writes clusters.json.
 
-use crate::{encode::Encoder, first_line, load_docs, short, Doc, DOCS_PATH, INDEX_PATH};
+use crate::community::{louvain, Graph};
+use crate::{first_line, load_docs, short, Doc, DOCS_PATH, INDEX_PATH};
 use anyhow::{anyhow, Result};
 use next_plaid::{MmapIndex, SearchParameters};
-use std::collections::{HashMap, HashSet};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::path::Path;
 
 const K: usize = 6;
-const FLOOR: f32 = 0.6; // keep a neighbor only if its score is >=60% of the best neighbor's
+const FLOOR: f64 = 0.6; // keep a neighbor only if its normalized score ≥ 60% of the best
+const LINK_WEIGHT: f64 = 1.0; // weight of one GitHub #-reference edge
 const MIN_CLUSTER: usize = 3;
 
-pub fn run(model_id: &str) -> Result<()> {
+pub fn run(resolution: f64) -> Result<()> {
     let docs = load_docs(DOCS_PATH)?;
-    let idx = MmapIndex::load(INDEX_PATH).map_err(|e| anyhow!("load index: {e}"))?;
-    let mut enc = Encoder::load(model_id)?;
+    let idx = MmapIndex::load(INDEX_PATH).map_err(|e| anyhow!("load index: {e} (run `index` first)"))?;
+    let emb = next_plaid::update::load_embeddings_npy(Path::new(INDEX_PATH))
+        .map_err(|e| anyhow!("load embeddings cache: {e} (re-run `index`)"))?;
+    anyhow::ensure!(
+        emb.len() == docs.len(),
+        "embeddings cache ({}) != docs ({}); re-run `index`",
+        emb.len(),
+        docs.len()
+    );
     let n = docs.len();
 
-    let params = SearchParameters { top_k: K + 1, ..Default::default() };
-    let mut neigh: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, d) in docs.iter().enumerate() {
-        let q = enc.encode_query(&d.text)?;
-        let r = idx.search(&q, &params, None).map_err(|e| anyhow!("search: {e}"))?;
-        let pairs: Vec<(usize, f32)> = r
-            .passage_ids
-            .iter()
-            .zip(r.scores.iter())
-            .map(|(id, s)| (*id as usize, *s))
-            .filter(|(x, _)| *x != i)
-            .collect();
-        let best = pairs.first().map(|(_, s)| *s).unwrap_or(0.0);
-        neigh[i] = pairs.into_iter().filter(|(_, s)| *s >= FLOOR * best).take(K).map(|(x, _)| x).collect();
-        if i % 500 == 0 {
-            eprint!("\rknn {i}/{n}");
-        }
+    let edges = load_or_build_edges(&idx, &emb, &docs)?;
+    let comm = louvain(Graph::from_edges(n, &edges), resolution);
+    let q = crate::community::modularity(&Graph::from_edges(n, &edges), &comm, resolution);
+
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, &c) in comm.iter().enumerate() {
+        groups.entry(c).or_default().push(i);
     }
-    eprintln!("\rknn {n}/{n} done");
+    let mut clusters: Vec<Vec<usize>> =
+        groups.into_values().filter(|v| v.len() >= MIN_CLUSTER).collect();
+    clusters.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
 
-    let links = github_links(&docs);
-    let clusters = components(&neigh, &links, MIN_CLUSTER);
+    // Extractive c-TF-IDF labels need every cluster's text at once.
+    let cluster_texts: Vec<Vec<&str>> =
+        clusters.iter().map(|c| c.iter().map(|&m| docs[m].text.as_str()).collect()).collect();
+    let phrases = crate::keyphrase::labels(&cluster_texts, 4);
 
-    let mut out = format!("# clusters: {} (>={MIN_CLUSTER} members)\n\n", clusters.len());
+    let mut out = format!(
+        "# clusters: {} (>={MIN_CLUSTER} members · resolution {resolution} · modularity {q:.3})\n\n",
+        clusters.len()
+    );
     let mut assign: Vec<Value> = Vec::new();
     for (ci, c) in clusters.iter().enumerate() {
-        let (label, repos, kinds) = describe(&docs, c);
+        let (fallback, repos, kinds) = describe(&docs, c);
+        let label = if phrases[ci].is_empty() { fallback } else { phrases[ci].join(", ") };
         out.push_str(&format!("## C{ci} — {label}  ({} docs)\n", c.len()));
         out.push_str(&format!("repos: {repos} · kinds: {kinds}\n"));
         for &m in c.iter().take(6) {
@@ -57,11 +74,99 @@ pub fn run(model_id: &str) -> Result<()> {
     }
     print!("{out}");
     std::fs::write("clusters.json", serde_json::to_string(&assign)?)?;
-    eprintln!("wrote clusters.json ({} docs in {} clusters)", assign.len(), clusters.len());
+    eprintln!(
+        "wrote clusters.json ({} docs in {} clusters)",
+        assign.len(),
+        clusters.len()
+    );
     Ok(())
 }
 
-use serde_json::Value;
+/// The weighted graph is a function only of (docs, embeddings), both fixed once
+/// `index` has run — so cache it next to the index (which `index` wipes on
+/// rebuild, invalidating the cache for free). A resolution sweep then re-runs
+/// only Louvain (milliseconds), never the ~1.8k index searches.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EdgeCache {
+    n: usize,
+    edges: Vec<(usize, usize, f64)>,
+}
+
+fn cache_path() -> std::path::PathBuf {
+    Path::new(INDEX_PATH).join("knn_edges.json")
+}
+
+fn load_or_build_edges(
+    idx: &MmapIndex,
+    emb: &[ndarray::Array2<f32>],
+    docs: &[Doc],
+) -> Result<HashMap<(usize, usize), f64>> {
+    if let Ok(raw) = std::fs::read_to_string(cache_path()) {
+        if let Ok(c) = serde_json::from_str::<EdgeCache>(&raw) {
+            if c.n == docs.len() {
+                eprintln!("cluster: reusing cached graph ({} edges)", c.edges.len());
+                return Ok(c.edges.into_iter().map(|(a, b, w)| ((a, b), w)).collect());
+            }
+        }
+    }
+    let edges = build_graph_edges(idx, emb, docs)?;
+    let c = EdgeCache {
+        n: docs.len(),
+        edges: edges.iter().map(|(&(a, b), &w)| (a, b, w)).collect(),
+    };
+    let _ = std::fs::write(cache_path(), serde_json::to_string(&c)?);
+    Ok(edges)
+}
+
+/// Build the weighted edge map feeding Louvain: normalized+floored kNN
+/// similarity summed over both directions, plus fixed-weight GitHub links.
+/// kNN runs as one parallel batched search rather than 1.8k sequential ones.
+fn build_graph_edges(
+    idx: &MmapIndex,
+    emb: &[ndarray::Array2<f32>],
+    docs: &[Doc],
+) -> Result<HashMap<(usize, usize), f64>> {
+    let n = docs.len();
+    // Coarse topic kNN only needs the few nearest neighbors, so approximate
+    // aggressively: probe fewer IVF cells and fully MaxSim-score far fewer
+    // candidates than retrieval's default (4096). This is the dominant cost of
+    // a fresh build; 256/4 cuts it ~16× with negligible effect on the top-K.
+    let params = SearchParameters {
+        top_k: K + 1,
+        n_full_scores: 256,
+        n_ivf_probe: 4,
+        ..Default::default()
+    };
+    eprintln!("cluster: kNN over {n} docs (parallel batched search)…");
+    let results = idx.search_batch(emb, &params, true, None).map_err(|e| anyhow!("search: {e}"))?;
+
+    let mut edges: HashMap<(usize, usize), f64> = HashMap::new();
+    for (i, r) in results.iter().enumerate() {
+        let pairs: Vec<(usize, f32)> = r
+            .passage_ids
+            .iter()
+            .zip(r.scores.iter())
+            .map(|(id, s)| (*id as usize, *s))
+            .filter(|(x, _)| *x != i)
+            .collect();
+        let best = pairs.first().map(|(_, s)| *s).unwrap_or(0.0);
+        if best <= 0.0 {
+            continue;
+        }
+        for (j, s) in pairs.into_iter().take(K) {
+            let d = (s / best) as f64; // normalized directed weight in (0,1]
+            if d < FLOOR {
+                continue;
+            }
+            *edges.entry((i.min(j), i.max(j))).or_insert(0.0) += d;
+        }
+    }
+
+    for (a, b) in github_links(docs) {
+        *edges.entry((a.min(b), a.max(b))).or_insert(0.0) += LINK_WEIGHT;
+    }
+    Ok(edges)
+}
 
 /// GitHub "#<num>" references between docs in the same repo → edges.
 fn github_links(docs: &[Doc]) -> Vec<(usize, usize)> {
@@ -87,33 +192,6 @@ fn github_links(docs: &[Doc]) -> Vec<(usize, usize)> {
     edges
 }
 
-/// Mutual-kNN edges (i→j kept only if j→i too) unioned with `links`, then
-/// connected components with at least `min` members, largest first.
-fn components(neigh: &[Vec<usize>], links: &[(usize, usize)], min: usize) -> Vec<Vec<usize>> {
-    let n = neigh.len();
-    let nset: Vec<HashSet<usize>> = neigh.iter().map(|v| v.iter().copied().collect()).collect();
-    let mut dsu = Dsu::new(n);
-    for i in 0..n {
-        for &j in &neigh[i] {
-            if j < n && nset[j].contains(&i) {
-                dsu.union(i, j);
-            }
-        }
-    }
-    for &(a, b) in links {
-        if a < n && b < n {
-            dsu.union(a, b);
-        }
-    }
-    let mut comp: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..n {
-        comp.entry(dsu.find(i)).or_default().push(i);
-    }
-    let mut out: Vec<Vec<usize>> = comp.into_values().filter(|v| v.len() >= min).collect();
-    out.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
-    out
-}
-
 fn hash_refs(s: &str) -> Vec<i64> {
     let b = s.as_bytes();
     let mut out = Vec::new();
@@ -137,27 +215,6 @@ fn hash_refs(s: &str) -> Vec<i64> {
         }
     }
     out
-}
-
-struct Dsu {
-    p: Vec<usize>,
-}
-impl Dsu {
-    fn new(n: usize) -> Self {
-        Self { p: (0..n).collect() }
-    }
-    fn find(&mut self, x: usize) -> usize {
-        if self.p[x] != x {
-            self.p[x] = self.find(self.p[x]);
-        }
-        self.p[x]
-    }
-    fn union(&mut self, a: usize, b: usize) {
-        let (a, b) = (self.find(a), self.find(b));
-        if a != b {
-            self.p[a] = b;
-        }
-    }
 }
 
 fn describe(docs: &[Doc], c: &[usize]) -> (String, String, String) {
@@ -207,44 +264,33 @@ mod tests {
         assert_eq!(hash_refs("see #12 and again #12"), vec![12, 12]);
     }
 
-    // A user expects only mutually-similar docs to group: 0<->1<->2 are
-    // mutual, {3,4} mutual but separate, 5 is a one-way neighbor of 0 so it
-    // stays out. min=3 keeps only the first group.
+    // Same-repo #-references become edges; cross-repo numbers and self-refs do
+    // not. (Two PRs in sie-internal referencing each other → one edge.)
     #[test]
-    fn mutual_knn_groups_only_reciprocated_neighbors() {
-        let neigh = vec![
-            vec![1, 2, 5], // 0
-            vec![0, 2],    // 1
-            vec![0, 1],    // 2
-            vec![4],       // 3
-            vec![3],       // 4
-            vec![0],       // 5 — points at 0, but 0 does not reciprocate to 5? it does (5 in 0's list)
+    fn github_links_same_repo_only() {
+        let mk = |id: i64, num: i64, repo: &str, text: &str| Doc {
+            id,
+            text: text.into(),
+            meta: crate::Meta {
+                source: "github".into(),
+                kind: "pull_request".into(),
+                repo: repo.into(),
+                author: String::new(),
+                session_id: String::new(),
+                ts: String::new(),
+                number: Some(num),
+                url: None,
+                state: None,
+                labels: vec![],
+            },
+        };
+        let docs = vec![
+            mk(0, 10, "sie-internal", "closes #11"),     // → doc 1 (same repo)
+            mk(1, 11, "sie-internal", "follow-up"),       // referenced
+            mk(2, 11, "sie-web", "different repo same #"), // not linked (other repo)
         ];
-        // 5 is in 0's list AND 0 is in 5's list → mutual, so 5 joins {0,1,2}.
-        let cs = components(&neigh, &[], 3);
-        assert_eq!(cs.len(), 1);
-        assert_eq!(cs[0].len(), 4); // {0,1,2,5}
-        assert!(cs[0].contains(&0) && cs[0].contains(&5));
-    }
-
-    // One-way neighbors do not create an edge.
-    #[test]
-    fn one_way_neighbor_is_not_an_edge() {
-        let neigh = vec![vec![1], vec![2], vec![1], vec![]]; // 0->1 (1 doesn't list 0)
-        // mutual pairs: 1->2? 2 lists 1 and 1 lists 2 → mutual {1,2}. 0->1 one-way.
-        let cs = components(&neigh, &[], 2);
-        assert_eq!(cs.len(), 1);
-        assert_eq!(cs[0], vec![1, 2]);
-    }
-
-    // A GitHub link bridges two otherwise-separate mutual groups.
-    #[test]
-    fn github_link_bridges_groups() {
-        let neigh = vec![vec![1], vec![0], vec![3], vec![2]]; // {0,1} and {2,3}
-        let with_link = components(&neigh, &[(1, 2)], 3);
-        assert_eq!(with_link.len(), 1);
-        assert_eq!(with_link[0].len(), 4);
-        let without = components(&neigh, &[], 3);
-        assert!(without.is_empty()); // both groups are size 2 < 3
+        let mut e = github_links(&docs);
+        e.sort();
+        assert_eq!(e, vec![(0, 1)]);
     }
 }

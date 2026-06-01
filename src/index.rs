@@ -42,6 +42,12 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str) -> Result<()> {
         Some(&metas),
     )
     .context("build next-plaid index")?;
+
+    // Persist the raw per-doc embeddings alongside the index so `cluster` (and
+    // incremental re-index) can reuse them instead of re-encoding the corpus.
+    next_plaid::update::save_embeddings_npy(std::path::Path::new(index_path), &embeddings)
+        .map_err(|e| anyhow::anyhow!("save embeddings cache: {e}"))?;
+
     eprintln!(
         "indexed {} docs / {} embeddings in {:?} → {index_path}",
         idx.num_documents(),

@@ -5,8 +5,10 @@
 // Subcommands: ingest, index, search, cluster, summarize, eval.
 
 mod cluster;
+mod community;
 mod encode;
 mod eval;
+mod keyphrase;
 mod index;
 mod ingest;
 mod model;
@@ -110,8 +112,12 @@ enum Cmd {
         #[arg(long, default_value_t = 5)]
         k: usize,
     },
-    /// Build clusters (kNN ∪ github links) and print labeled topics
-    Cluster,
+    /// Louvain topics over a weighted kNN + github-link graph; print labeled
+    /// clusters. --resolution >1 yields more/smaller topics, <1 fewer/larger.
+    Cluster {
+        #[arg(long, default_value_t = 1.0)]
+        resolution: f64,
+    },
     /// Extractive session + topic summaries
     Summarize {
         #[arg(long, default_value_t = 10)]
@@ -131,7 +137,7 @@ fn main() -> Result<()> {
         Cmd::Search { query, filter, k } => {
             search::run(&query, filter.as_deref(), k, &model_id())?
         }
-        Cmd::Cluster => cluster::run(&model_id())?,
+        Cmd::Cluster { resolution } => cluster::run(resolution)?,
         Cmd::Summarize { sessions, topics } => summarize::run(sessions, topics)?,
         Cmd::Eval => eval::run(&model_id())?,
     }

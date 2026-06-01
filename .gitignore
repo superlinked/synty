@@ -20,3 +20,6 @@ cluster.err
 .synty/
 tmp/
 .DS_Store
+
+# Local-only Claude Code permission overrides (not committed).
+.claude/settings.local.json
