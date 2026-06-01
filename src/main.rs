@@ -136,11 +136,11 @@ enum Cmd {
     Eval,
     /// Native tracker: parse local agent session files into canonical envelopes
     Track {
-        /// Source to drain: claudecode | all
+        /// Source to track: claudecode | codex | cowork | all
         #[arg(long, default_value = "all")]
         source: String,
-        /// Output dir for envelope streams
-        #[arg(long, default_value = ".synty/events")]
+        /// Output dir for envelope streams (where `ingest` reads)
+        #[arg(long, default_value = "corpus/local")]
         out: String,
         /// Skip files whose mtime is older than this many days (0 = unbounded)
         #[arg(long, default_value_t = 90)]
@@ -148,6 +148,18 @@ enum Cmd {
         /// Machine id used in the stream name
         #[arg(long, default_value = "local")]
         machine: String,
+        /// Watch continuously instead of a single drain
+        #[arg(long)]
+        watch: bool,
+        /// Poll interval in seconds for --watch
+        #[arg(long, default_value_t = 30)]
+        poll: u64,
+        /// Write an autostart unit and exit: launchd | systemd
+        #[arg(long)]
+        install: Option<String>,
+        /// Per-file cursor store
+        #[arg(long, default_value = ".synty/cursors.json")]
+        cursors: String,
     },
 }
 
@@ -162,8 +174,17 @@ fn main() -> Result<()> {
         Cmd::Cluster { resolution } => cluster::run(resolution)?,
         Cmd::Summarize { sessions, topics } => summarize::run(sessions, topics)?,
         Cmd::Eval => eval::run(&model_id())?,
-        Cmd::Track { source, out, max_age_days, machine } => {
-            track::run(&source, &out, max_age_days, &machine)?
+        Cmd::Track { source, out, max_age_days, machine, watch, poll, install, cursors } => {
+            track::run(track::Opts {
+                which: source,
+                out,
+                max_age_days,
+                machine,
+                watch,
+                poll_secs: poll,
+                install,
+                cursors,
+            })?
         }
     }
     Ok(())

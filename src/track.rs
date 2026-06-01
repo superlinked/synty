@@ -1,25 +1,255 @@
-// `synty track` — the native tracker. Discovers each source's session files,
-// parses their content into canonical envelopes, and writes them out.
+// `synty track` — the native tracker. Discovers each agent's session files,
+// parses new bytes into canonical envelopes, and appends them to per-stream
+// JSONL under `--out` (default corpus/local, where `ingest` reads). Per-file
+// byte offsets persist in a cursor file, so each pass only parses what's new.
 //
-// This first cut is a one-shot drain: walk the roots, parse every in-window file
-// from the start, synthesize a session_end per session, and write JSONL under
-// <out>/<stream>/. A continuous watch loop with persistent cursors lands next.
+// One-shot by default; `--watch` polls forever, holding parser state in memory
+// and synthesizing session_end after a session goes idle. `--install` writes a
+// launchd/systemd unit that runs the watcher at login.
 
 use crate::claudecode::ClaudeCode;
 use crate::codex::Codex;
 use crate::cowork::Cowork;
-use crate::event::{kind, Sequencer};
+use crate::event::{kind, Event, Sequencer};
 use crate::tail::{drive, ms_to_rfc3339, EmitCtx, Source};
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const HEAD_BYTES: usize = 64 << 10;
+const IDLE_MS: i64 = 10 * 60 * 1000;
 
-/// Default watch roots per source on this machine.
+pub struct Opts {
+    pub which: String,
+    pub out: String,
+    pub max_age_days: u64,
+    pub machine: String,
+    pub watch: bool,
+    pub poll_secs: u64,
+    pub install: Option<String>,
+    pub cursors: String,
+}
+
+pub fn run(o: Opts) -> Result<()> {
+    if let Some(kind) = &o.install {
+        return install(kind, &o);
+    }
+    let mut t = Tracker::new(&o)?;
+    if o.watch {
+        t.watch(o.poll_secs.max(1))
+    } else {
+        let n = t.drain()?;
+        t.flush_ends(unix_ms(SystemTime::now()), true)?;
+        t.save_cursors()?;
+        eprintln!("track: {n} events ({} sessions) → {}", t.session_count(), o.out);
+        Ok(())
+    }
+}
+
+struct FileState {
+    offset: i64,
+    parser: Box<dyn crate::tail::FileParser>,
+}
+
+struct Stream {
+    src: Box<dyn Source>,
+    roots: Vec<String>,
+    name: String,
+    out: PathBuf,
+    seq: Sequencer,
+    started: HashSet<String>,
+    files: HashMap<PathBuf, FileState>,
+    /// last (ts_ms, ts) seen per still-open session, for idle session_end.
+    open: HashMap<String, (i64, String)>,
+    n_sessions: usize,
+}
+
+struct Tracker {
+    streams: Vec<Stream>,
+    cutoff_ms: i64,
+    cursors_path: PathBuf,
+    cursors: HashMap<String, i64>,
+}
+
+impl Tracker {
+    fn new(o: &Opts) -> Result<Self> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let cursors_path = PathBuf::from(&o.cursors);
+        let cursors: HashMap<String, i64> = std::fs::read_to_string(&cursors_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let mut streams = Vec::new();
+        for src in sources(&o.which)? {
+            let name = format!("edge-{}-{}", o.machine, src.id());
+            let out = Path::new(&o.out).join(&name).join("track.jsonl");
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            // Seed offsets from saved cursors so a restart resumes mid-file.
+            let mut files = HashMap::new();
+            let roots = default_roots(src.id(), &home);
+            streams.push(Stream {
+                roots,
+                name,
+                out,
+                seq: Sequencer::new(),
+                started: HashSet::new(),
+                files: std::mem::take(&mut files),
+                open: HashMap::new(),
+                n_sessions: 0,
+                src,
+            });
+        }
+        let cutoff_ms = if o.max_age_days == 0 {
+            0
+        } else {
+            unix_ms(SystemTime::now()) - (o.max_age_days as i64) * 86_400_000
+        };
+        Ok(Self { streams, cutoff_ms, cursors_path, cursors })
+    }
+
+    /// One pass over every stream's files; returns the number of events emitted.
+    fn drain(&mut self) -> Result<usize> {
+        let cutoff = self.cutoff_ms;
+        let mut total = 0;
+        for st in &mut self.streams {
+            total += st.drain(cutoff, &self.cursors)?;
+        }
+        Ok(total)
+    }
+
+    fn watch(&mut self, poll_secs: u64) -> Result<()> {
+        eprintln!(
+            "track --watch: {} stream(s), poll {poll_secs}s, idle session_end {}m. Ctrl-C to stop.",
+            self.streams.len(),
+            IDLE_MS / 60000
+        );
+        loop {
+            let n = self.drain()?;
+            let now = unix_ms(SystemTime::now());
+            let ended = self.flush_ends(now, false)?;
+            self.save_cursors()?;
+            if n > 0 || ended > 0 {
+                eprintln!("track: +{n} events, {ended} session(s) ended");
+            }
+            std::thread::sleep(Duration::from_secs(poll_secs));
+        }
+    }
+
+    /// Emit session_end: `all` ends every open session (one-shot shutdown);
+    /// otherwise only those idle past IDLE_MS.
+    fn flush_ends(&mut self, now_ms: i64, all: bool) -> Result<usize> {
+        let mut ended = 0;
+        for st in &mut self.streams {
+            ended += st.flush_ends(now_ms, all)?;
+        }
+        Ok(ended)
+    }
+
+    fn save_cursors(&mut self) -> Result<()> {
+        for st in &self.streams {
+            for (path, fs) in &st.files {
+                self.cursors.insert(format!("{}\0{}", st.src.id(), path.display()), fs.offset);
+            }
+        }
+        if let Some(p) = self.cursors_path.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(&self.cursors_path, serde_json::to_string(&self.cursors)?)?;
+        Ok(())
+    }
+
+    fn session_count(&self) -> usize {
+        self.streams.iter().map(|s| s.n_sessions).sum()
+    }
+}
+
+impl Stream {
+    fn drain(&mut self, cutoff_ms: i64, cursors: &HashMap<String, i64>) -> Result<usize> {
+        let mut events = Vec::new();
+        for path in discover(&self.roots, cutoff_ms) {
+            let Ok(content) = std::fs::read(&path) else { continue };
+
+            // First sight: detect version, build a parser, seed the offset from
+            // a saved cursor so a restart resumes rather than re-emits.
+            if !self.files.contains_key(&path) {
+                let head = &content[..content.len().min(HEAD_BYTES)];
+                let version = self.src.detect_version(head);
+                let Some(parser) = self.src.new_parser(&version) else { continue };
+                let offset = cursors.get(&format!("{}\0{}", self.src.id(), path.display())).copied().unwrap_or(0);
+                self.files.insert(path.clone(), FileState { offset, parser });
+            }
+            let fs = self.files.get_mut(&path).unwrap();
+            // Only complete lines (up to the last newline past the offset).
+            if content.len() as i64 <= fs.offset {
+                continue;
+            }
+            let slice = &content[fs.offset as usize..];
+            let Some(last_nl) = slice.iter().rposition(|&b| b == b'\n') else { continue };
+            let complete = &slice[..=last_nl];
+            let fallback_ms = file_mtime_ms(&path);
+
+            let path_str = path.to_string_lossy();
+            let before = self.started.len();
+            let mut ec = EmitCtx::new(self.name.clone(), &*self.src, &mut self.seq, &mut self.started);
+            let (evts, consumed) = drive(&mut *fs.parser, complete, &path_str, fs.offset, fallback_ms, &mut ec);
+            drop(ec);
+            fs.offset += consumed;
+            self.n_sessions += self.started.len() - before;
+
+            for e in &evts {
+                if !e.session_id.is_empty() && e.kind != kind::SESSION_END {
+                    self.open.insert(e.session_id.clone(), (fallback_ms, e.ts.clone()));
+                }
+            }
+            events.extend(evts);
+        }
+        let n = events.len();
+        self.append(&events)?;
+        Ok(n)
+    }
+
+    fn flush_ends(&mut self, now_ms: i64, all: bool) -> Result<usize> {
+        let due: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(_, (ms, _))| all || now_ms - *ms > IDLE_MS)
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        if due.is_empty() {
+            return Ok(0);
+        }
+        let mut events = Vec::new();
+        let mut ec = EmitCtx::new(self.name.clone(), &*self.src, &mut self.seq, &mut self.started);
+        for sid in &due {
+            let (ms, ts) = self.open.remove(sid).unwrap();
+            events.push(ec.event(ms, &ts, kind::SESSION_END, sid, json!({"reason": if all {"shutdown"} else {"idle"}})));
+        }
+        self.append(&events)?;
+        Ok(due.len())
+    }
+
+    fn append(&self, events: &[Event]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.out)?;
+        let mut body = String::new();
+        for e in events {
+            body.push_str(&serde_json::to_string(e).map_err(|e| anyhow!("encode: {e}"))?);
+            body.push('\n');
+        }
+        f.write_all(body.as_bytes())?;
+        Ok(())
+    }
+}
+
 fn default_roots(id: &str, home: &str) -> Vec<String> {
     match id {
         "claudecode" => vec![format!("{home}/.claude/projects")],
@@ -44,61 +274,6 @@ fn sources(which: &str) -> Result<Vec<Box<dyn Source>>> {
     Ok(picked)
 }
 
-pub fn run(which: &str, out_dir: &str, max_age_days: u64, machine: &str) -> Result<()> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let now_ms = unix_ms(SystemTime::now());
-    let cutoff_ms = if max_age_days == 0 { 0 } else { now_ms - (max_age_days as i64) * 86_400_000 };
-
-    for src in sources(which)? {
-        let stream = format!("edge-{machine}-{}", src.id());
-        let mut seq = Sequencer::new();
-        let mut started: HashSet<String> = HashSet::new();
-        let mut ec = EmitCtx::new(stream.clone(), &*src, &mut seq, &mut started);
-
-        let files = discover(&default_roots(src.id(), &home), cutoff_ms);
-        let mut events = Vec::new();
-        // last (ts_ms, ts) seen per session, to synthesize session_end on drain.
-        let mut last_seen: HashMap<String, (i64, String)> = HashMap::new();
-        let mut n_files = 0;
-
-        for f in files {
-            let Ok(content) = std::fs::read(&f) else { continue };
-            let head = &content[..content.len().min(HEAD_BYTES)];
-            let version = src.detect_version(head);
-            let Some(mut parser) = src.new_parser(&version) else { continue };
-            n_files += 1;
-            let fallback_ms = file_mtime_ms(&f);
-            let path = f.to_string_lossy();
-            let (evts, _) = drive(&mut *parser, &content, &path, 0, fallback_ms, &mut ec);
-            for e in &evts {
-                if !e.session_id.is_empty() && e.kind != kind::SESSION_END {
-                    last_seen.insert(e.session_id.clone(), (fallback_ms, e.ts.clone()));
-                }
-            }
-            events.extend(evts);
-        }
-
-        // One synthesized session_end per session (the engine does this on idle
-        // / shutdown; the drain does it once at the end).
-        let mut ends: Vec<_> = last_seen.into_iter().collect();
-        ends.sort_by(|a, b| a.0.cmp(&b.0));
-        for (sid, (ts_ms, ts)) in ends {
-            events.push(ec.event(ts_ms, &ts, kind::SESSION_END, &sid, json!({"reason": "drain"})));
-        }
-
-        write_stream(out_dir, &stream, &events, now_ms)?;
-        eprintln!(
-            "track {}: {} files → {} events ({} sessions) → {out_dir}/{stream}/",
-            src.id(),
-            n_files,
-            events.len(),
-            events.iter().filter(|e| e.kind == kind::SESSION_START).count(),
-        );
-    }
-    Ok(())
-}
-
-/// Walk roots for *.jsonl files within the mtime window, oldest first.
 fn discover(roots: &[String], cutoff_ms: i64) -> Vec<PathBuf> {
     let mut out: Vec<(i64, PathBuf)> = Vec::new();
     for root in roots {
@@ -118,20 +293,7 @@ fn discover(roots: &[String], cutoff_ms: i64) -> Vec<PathBuf> {
     out.into_iter().map(|(_, p)| p).collect()
 }
 
-fn write_stream(out_dir: &str, stream: &str, events: &[crate::event::Event], now_ms: i64) -> Result<()> {
-    let dir = PathBuf::from(out_dir).join(stream);
-    std::fs::create_dir_all(&dir)?;
-    let fname = format!("drain-{}.jsonl", now_ms);
-    let mut body = String::new();
-    for e in events {
-        body.push_str(&serde_json::to_string(e).map_err(|e| anyhow!("encode: {e}"))?);
-        body.push('\n');
-    }
-    std::fs::write(dir.join(fname), body)?;
-    Ok(())
-}
-
-fn file_mtime_ms(p: &std::path::Path) -> i64 {
+fn file_mtime_ms(p: &Path) -> i64 {
     std::fs::metadata(p).and_then(|m| m.modified()).map(unix_ms).unwrap_or(0)
 }
 
@@ -139,7 +301,46 @@ fn unix_ms(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-#[allow(dead_code)]
-fn rfc3339_now() -> String {
-    ms_to_rfc3339(unix_ms(SystemTime::now()))
+/// Write a login-time autostart unit running `synty track --watch`.
+fn install(kind: &str, o: &Opts) -> Result<()> {
+    let exe = std::env::current_exe()?.display().to_string();
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let args = format!("track --watch --out {} --machine {}", o.out, o.machine);
+    match kind {
+        "launchd" => {
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.superlinked.synty</string>
+  <key>ProgramArguments</key><array>
+    <string>{exe}</string>{}
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>WorkingDirectory</key><string>{cwd}</string>
+</dict></plist>
+"#,
+                args.split_whitespace().map(|a| format!("\n    <string>{a}</string>")).collect::<String>(),
+                cwd = std::env::current_dir()?.display(),
+            );
+            let path = format!("{home}/Library/LaunchAgents/com.superlinked.synty.plist");
+            std::fs::write(&path, plist)?;
+            println!("wrote {path}\nload with:  launchctl load -w {path}");
+        }
+        "systemd" => {
+            let unit = format!(
+                "[Unit]\nDescription=synty native tracker\n\n[Service]\nExecStart={exe} {args}\nWorkingDirectory={cwd}\nRestart=always\n\n[Install]\nWantedBy=default.target\n",
+                cwd = std::env::current_dir()?.display(),
+            );
+            let dir = format!("{home}/.config/systemd/user");
+            std::fs::create_dir_all(&dir)?;
+            let path = format!("{dir}/synty.service");
+            std::fs::write(&path, unit)?;
+            println!("wrote {path}\nenable with:  systemctl --user enable --now synty.service");
+        }
+        _ => bail!("install kind must be launchd or systemd"),
+    }
+    let _ = ms_to_rfc3339; // reserved for future status output
+    Ok(())
 }
