@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+
+# Real activity data dumped from the v1 agent + GitHub. Local only, never committed.
+corpus/
+*.jsonl
+
+# Model weights (fetched, not committed).
+*.onnx
+models/
+
+# Derived projections + run outputs (rebuildable).
+index/
+clusters.json
+clusters.md
+summary.md
+eval_runs.md
+cluster.err
+
+.synty/
+tmp/
+.DS_Store
