@@ -24,9 +24,14 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str, bucket: &str) -> R
         .map(|d| serde_json::to_value(&d.meta))
         .collect::<std::result::Result<_, _>>()?;
 
-    // Unchanged corpus → the current index already matches; nothing to do.
+    // Unchanged corpus → the local index already matches; skip the rebuild but
+    // still ensure the bucket has it (publish is a no-op if already current).
     if load_manifest(path).as_deref() == Some(hashes.as_slice()) && MmapIndex::load(index_path).is_ok() {
         eprintln!("index up to date ({} docs, corpus unchanged)", docs.len());
+        let published = crate::sync::publish(bucket, index_path, docs_path)?;
+        if published > 0 {
+            eprintln!("published {published} read-model files → {bucket}/index/");
+        }
         return Ok(());
     }
 
@@ -89,6 +94,10 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str, bucket: &str) -> R
         idx.num_embeddings(),
         t1.elapsed()
     );
+
+    // Publish the read-model so other devices can query without rebuilding.
+    let published = crate::sync::publish(bucket, index_path, docs_path)?;
+    eprintln!("published {published} read-model files → {bucket}/index/");
     Ok(())
 }
 

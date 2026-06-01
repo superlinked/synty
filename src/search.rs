@@ -21,7 +21,10 @@ pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
     Ok(Some(ids))
 }
 
-pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str) -> Result<()> {
+pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str, bucket: &str) -> Result<()> {
+    if crate::sync::pull_if_stale(bucket, INDEX_PATH, DOCS_PATH).unwrap_or(false) {
+        eprintln!("pulled published index from {bucket}/index/");
+    }
     let docs = load_docs(DOCS_PATH)?;
     let idx = MmapIndex::load(INDEX_PATH)
         .map_err(|e| anyhow!("load index: {e} (run `index` first)"))?;

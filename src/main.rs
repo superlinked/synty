@@ -17,8 +17,10 @@ mod event;
 mod github;
 mod keyphrase;
 mod store;
+mod sync;
 mod tail;
 mod track;
+mod up;
 mod index;
 mod ingest;
 mod model;
@@ -126,6 +128,9 @@ enum Cmd {
         filter: Option<String>,
         #[arg(long, default_value_t = 5)]
         k: usize,
+        /// Bucket to pull the published index from when local is stale/absent
+        #[arg(long, default_value = ".synty")]
+        bucket: String,
     },
     /// Louvain topics over a weighted kNN + github-link graph; print labeled
     /// clusters. --resolution >1 yields more/smaller topics, <1 fewer/larger.
@@ -169,6 +174,21 @@ enum Cmd {
         #[arg(long, default_value = ".synty/cursors.json")]
         cursors: String,
     },
+    /// One-command solo mode: track + ingest + index on a loop, zero config
+    Up {
+        /// Bucket for the embedding store + published index
+        #[arg(long, default_value = ".synty")]
+        bucket: String,
+        /// Machine id used in stream names
+        #[arg(long, default_value = "local")]
+        machine: String,
+        /// Seconds between passes
+        #[arg(long, default_value_t = 60)]
+        poll: u64,
+        /// Skip the startup GitHub pull
+        #[arg(long)]
+        no_github: bool,
+    },
     /// Pull GitHub PRs/issues via GraphQL (token-based, no `gh` needed)
     Github {
         /// Repository owner / org
@@ -191,8 +211,8 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Ingest => ingest::run(CORPUS_DIR, DOCS_PATH)?,
         Cmd::Index { bucket } => index::run(DOCS_PATH, INDEX_PATH, &model_id(), &bucket)?,
-        Cmd::Search { query, filter, k } => {
-            search::run(&query, filter.as_deref(), k, &model_id())?
+        Cmd::Search { query, filter, k, bucket } => {
+            search::run(&query, filter.as_deref(), k, &model_id(), &bucket)?
         }
         Cmd::Cluster { resolution } => cluster::run(resolution)?,
         Cmd::Summarize { sessions, topics } => summarize::run(sessions, topics)?,
@@ -208,6 +228,9 @@ fn main() -> Result<()> {
                 install,
                 cursors,
             })?
+        }
+        Cmd::Up { bucket, machine, poll, no_github } => {
+            up::run(&bucket, &machine, poll, !no_github)?
         }
         Cmd::Github { owner, repos, since_days, out } => {
             github::run(&owner, repos, since_days, &out)?
