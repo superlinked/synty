@@ -73,3 +73,44 @@ The one area needing work is **clustering into topics**: connected-components ov
 - **Filters:** next-plaid WHERE wants bound parameters, so the surface is `col=value` (e.g. `repo=sie-web`), not inline SQL literals.
 - **Clustering:** add Louvain/Leiden community detection; cache per-doc neighbors so re-clustering does not re-encode.
 - Remaining product milestones (unchanged): Rust tailers, bucket-as-backplane sync, TUI, optional team HTTP frontend, privacy guardrails.
+
+## M1 update — clustering refined, encode accelerated (2026-05-31)
+
+The scoped clustering refinement and the encode/iteration items from "Notes for
+step 2" are done. Re-validated on a fresh full pull (3,938 docs / 770 K
+embeddings, 90 d GitHub + 90 d sessions).
+
+**Clustering → PASS.** Connected-components is replaced by **Louvain** modularity
+optimization over a weighted graph: kNN similarity (normalized per-doc, floored,
+summed both directions) plus GitHub `#`-references as a **fixed-weight edge
+signal**, not a transitive union. A `--resolution` knob trades granularity
+(8 → 38 clusters on a 7 d corpus; 22 clusters at res 1.0 on the full corpus),
+and modularity is reported (**0.75**).
+
+- The **710-doc GitHub blob is gone.** Largest cluster is now 462 docs (the
+  slide-deck *sessions*, not a GitHub blob); the old blob is distributed across
+  recognizable topics — OCR (`ocr, sie server, olmocr, docling`), gateway
+  (`worker, gateway, config`), MTEB (`mteb, target, quality`), infra
+  (`superlinked sie, terraform, aws`), docs (`docs, sdk, mdx`).
+- **Labels are extractive c-TF-IDF keyphrases** (no LLM): the "local" blobs
+  became nameable themes (`next plaid, rust, synty`; `pdl, people, company`;
+  `rlm, daytona, sandbox, e2b`).
+
+**Retrieval → still PASS (12/12).** The same probe set returns the same relevant
+top hits (OCR `#1149`, gateway isolation `#1136`, SOC2 `infrastructure#225`,
+docs-search `sie-web#91`, VLM cache `#1143`, dense loader `#1144`); the
+clustering change does not touch retrieval.
+
+**Encode + iteration.** `--features metal` runs encode on the Apple GPU, ~5.7×
+faster than the hardcoded CPU path (37 vs 6.5 docs/s; 3,938 docs in 97 s).
+`index` persists per-doc embeddings and `cluster` caches the weighted graph, so
+a resolution sweep re-runs only Louvain (~0.7 s) and never re-encodes or
+re-searches. The shipped default stays plain CPU.
+
+**Known cost.** A *fresh* full-corpus cluster build is search-bound (~335 s at
+3,938 docs, even with approximate search params); cached re-runs are
+sub-second. A candidate for later optimization (lower probe, or pooled-vector
+kNN for the graph), not on the M1 path.
+
+Tests: 22 scenario unit tests green (Louvain split/resolution/modularity,
+c-TF-IDF labels, same-repo link edges, plus the originals).

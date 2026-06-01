@@ -33,11 +33,16 @@ cargo run --release -- ingest                 # → corpus/docs.jsonl
 cargo run --release -- index                  # encode + build the index
 cargo run --release -- search "OCR adapter"   # filtered semantic search
 cargo run --release -- search "docs search fix" --filter repo=sie-web
-cargo run --release -- cluster                # emergent topics → clusters.json
+cargo run --release -- cluster                # Louvain topics → clusters.json
+cargo run --release -- cluster --resolution 2.0   # finer/more topics
 cargo run --release -- summarize              # extractive sessions + topic digests
 cargo run --release -- eval                   # retrieval probe set → eval_runs.md
 cargo test                                    # scenario tests
 ```
 
-`SYNTY_MODEL` defaults to `lightonai/GTE-ModernColBERT-v1` (downloaded); set it to
-a local dir for offline use.
+On Apple Silicon, add `--features metal` to `build`/`run` for GPU encode (~5.7×
+faster); `accelerate` (macOS) and `mkl` (Linux) are CPU-BLAS alternatives. The
+default build is plain CPU and portable.
+
+`SYNTY_MODEL` defaults to `mixedbread-ai/mxbai-edge-colbert-v0-32m` (downloaded
+on first use); set it to a local dir for offline use.

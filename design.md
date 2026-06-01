@@ -32,11 +32,14 @@ records the validation of the kernel on real data.
 
 ## Engine
 
-- **Encode:** `pylate-rs` (ColBERT on Candle, CPU, ModernBERT backend). Default
+- **Encode:** `pylate-rs` (ColBERT on Candle, ModernBERT backend). Default
   model `mixedbread-ai/mxbai-edge-colbert-v0-32m` (32 M params, 127 MB, PyLate
   format). `model.rs` resolves a model to a local dir, downloading on first use
   under `~/.cache/synty/models` with connect/read timeouts and retry (avoids the
-  hf_hub no-timeout hang); a directory spec is used verbatim.
+  hf_hub no-timeout hang); a directory spec is used verbatim. The shipped build
+  is plain CPU and portable; opt-in cargo features pick a faster backend —
+  `metal` (Apple GPU, ~5.7× encode on Apple Silicon, with CPU fallback if the
+  GPU can't init), `accelerate` (macOS CPU BLAS), `mkl` (Linux CPU BLAS).
 - **Index / search:** `next-plaid` (PLAID multi-vector index + MaxSim scoring,
   SQLite metadata store). Filtered search resolves a `column=value` predicate to
   a doc-id subset via the metadata DB, then runs MaxSim over it.
@@ -69,11 +72,15 @@ bucket, plus a GitHub path that does not depend on a developer machine.
 ## Derivations (all without an LLM)
 
 - **Search** — filtered late-interaction retrieval. *Built.*
-- **Clusters (topics)** — emergent, no taxonomy. Today: mutual-kNN over
-  similarity ∪ GitHub `#`-references → connected components. This over-merges a
-  homogeneous repo (one giant component); the target is **community detection
-  (Louvain/Leiden) with a resolution knob**, treating GitHub links as a weighted
-  signal rather than a transitive union. *Built (interim); refinement planned.*
+- **Clusters (topics)** — emergent, no taxonomy. **Louvain community detection**
+  over a weighted graph: kNN similarity (normalized per-doc, floored, summed
+  over both directions) plus GitHub `#`-references as a fixed-weight edge signal
+  — not the hard transitive union that previously merged a homogeneous repo into
+  one blob. A `--resolution` knob trades topic count vs size; modularity is
+  reported. Labels are extractive c-TF-IDF keyphrases. The kNN graph and per-doc
+  embeddings are cached next to the index, so a resolution sweep re-runs only
+  Louvain (sub-second) and never re-encodes. *Built (Louvain + resolution +
+  keyphrase labels).*
 - **Summaries** — extractive. Per session: opening ask, files touched, prompt
   count, linked PR. Per topic: counts, repos, notable titles. *Built.*
 
@@ -118,15 +125,18 @@ the binary does locally.
 ## What's built (kernel)
 
 A working binary: `ingest` (v1 dumps + `gh` → `corpus/docs.jsonl`), `index`
-(encode + build), `search [--filter col=value]`, `cluster`, `summarize`, `eval`,
-plus 16 scenario tests. Validated on real data (3,157 docs / 652 K embeddings):
-retrieval 12/12 relevant top-3, agent task-start dogfood 3/3, extractive session
-summaries specific and accurate, all with no generative model. Clustering works
-for sessions; GitHub over-merges (the named refinement above). Full results in
-`eval_report.md`.
+(encode + build + cached embeddings), `search [--filter col=value]`,
+`cluster [--resolution]`, `summarize`, `eval`, plus 22 scenario tests.
+Validated on real data (3,938 docs / 770 K embeddings): retrieval 12/12 relevant
+top-3, agent task-start dogfood 3/3, extractive session summaries specific and
+accurate, all with no generative model. Clustering (M1) is Louvain over the
+weighted graph: the prior GitHub over-merge (a 710-doc blob) is gone — 22
+recognizable keyphrase-labeled topics, largest 462 docs, modularity 0.75. Full
+results in `eval_report.md`.
 
 ## Stack
 
 Rust (edition 2024). `pylate-rs`, `next-plaid`, `candle-core`, `ndarray`,
 `serde`, `clap`, `ureq`. Cross-compiles to darwin-arm64/amd64 + linux-amd64;
-CPU by default, optional Candle `accelerate`/`openblas` for faster encode.
+CPU by default, opt-in `metal` (Apple GPU) / `accelerate` (macOS) / `mkl`
+(Linux) features for faster encode.
