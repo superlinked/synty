@@ -4,11 +4,15 @@
 //
 // Subcommands: ingest, index, search, cluster, summarize, eval.
 
+mod claudecode;
 mod cluster;
 mod community;
 mod encode;
 mod eval;
+mod event;
 mod keyphrase;
+mod tail;
+mod track;
 mod index;
 mod ingest;
 mod model;
@@ -127,6 +131,21 @@ enum Cmd {
     },
     /// Run the probe query set and write eval_report.md
     Eval,
+    /// Native tracker: parse local agent session files into canonical envelopes
+    Track {
+        /// Source to drain: claudecode | all
+        #[arg(long, default_value = "all")]
+        source: String,
+        /// Output dir for envelope streams
+        #[arg(long, default_value = ".synty/events")]
+        out: String,
+        /// Skip files whose mtime is older than this many days (0 = unbounded)
+        #[arg(long, default_value_t = 90)]
+        max_age_days: u64,
+        /// Machine id used in the stream name
+        #[arg(long, default_value = "local")]
+        machine: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -140,6 +159,9 @@ fn main() -> Result<()> {
         Cmd::Cluster { resolution } => cluster::run(resolution)?,
         Cmd::Summarize { sessions, topics } => summarize::run(sessions, topics)?,
         Cmd::Eval => eval::run(&model_id())?,
+        Cmd::Track { source, out, max_age_days, machine } => {
+            track::run(&source, &out, max_age_days, &machine)?
+        }
     }
     Ok(())
 }

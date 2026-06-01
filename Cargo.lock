@@ -3103,13 +3103,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "chrono",
  "clap",
  "ndarray",
  "next-plaid",
  "pylate-rs",
  "serde",
  "serde_json",
+ "sha2",
  "ureq",
+ "walkdir",
 ]
 
 [[package]]
