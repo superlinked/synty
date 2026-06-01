@@ -13,6 +13,7 @@ mod community;
 mod encode;
 mod eval;
 mod event;
+mod github;
 mod keyphrase;
 mod tail;
 mod track;
@@ -161,6 +162,21 @@ enum Cmd {
         #[arg(long, default_value = ".synty/cursors.json")]
         cursors: String,
     },
+    /// Pull GitHub PRs/issues via GraphQL (token-based, no `gh` needed)
+    Github {
+        /// Repository owner / org
+        #[arg(long, default_value = "superlinked")]
+        owner: String,
+        /// Comma-separated repo names (default: the known active set)
+        #[arg(long)]
+        repos: Option<String>,
+        /// Trailing window in days
+        #[arg(long, default_value_t = 90)]
+        since_days: u64,
+        /// Output dir for the per-repo JSON
+        #[arg(long, default_value = "corpus/github")]
+        out: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -185,6 +201,9 @@ fn main() -> Result<()> {
                 install,
                 cursors,
             })?
+        }
+        Cmd::Github { owner, repos, since_days, out } => {
+            github::run(&owner, repos, since_days, &out)?
         }
     }
     Ok(())
