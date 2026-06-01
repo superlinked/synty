@@ -113,7 +113,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Parse corpus/{local,github} into corpus/docs.jsonl
-    Ingest,
+    Ingest {
+        /// Pull all devices' events from this bucket before ingesting
+        #[arg(long)]
+        bucket: Option<String>,
+    },
     /// Encode docs (pylate-rs) and build the next-plaid index
     Index {
         /// Bucket holding the content-addressed embedding store (file path or
@@ -173,6 +177,9 @@ enum Cmd {
         /// Per-file cursor store
         #[arg(long, default_value = ".synty/cursors.json")]
         cursors: String,
+        /// Push drained events to this bucket under events/ (for a fleet)
+        #[arg(long)]
+        bucket: Option<String>,
     },
     /// One-command solo mode: track + ingest + index on a loop, zero config
     Up {
@@ -209,7 +216,7 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Ingest => ingest::run(CORPUS_DIR, DOCS_PATH)?,
+        Cmd::Ingest { bucket } => ingest::run(CORPUS_DIR, DOCS_PATH, bucket.as_deref())?,
         Cmd::Index { bucket } => index::run(DOCS_PATH, INDEX_PATH, &model_id(), &bucket)?,
         Cmd::Search { query, filter, k, bucket } => {
             search::run(&query, filter.as_deref(), k, &model_id(), &bucket)?
@@ -217,7 +224,7 @@ fn main() -> Result<()> {
         Cmd::Cluster { resolution } => cluster::run(resolution)?,
         Cmd::Summarize { sessions, topics } => summarize::run(sessions, topics)?,
         Cmd::Eval => eval::run(&model_id())?,
-        Cmd::Track { source, out, max_age_days, machine, watch, poll, install, cursors } => {
+        Cmd::Track { source, out, max_age_days, machine, watch, poll, install, cursors, bucket } => {
             track::run(track::Opts {
                 which: source,
                 out,
@@ -227,6 +234,7 @@ fn main() -> Result<()> {
                 poll_secs: poll,
                 install,
                 cursors,
+                bucket,
             })?
         }
         Cmd::Up { bucket, machine, poll, no_github } => {

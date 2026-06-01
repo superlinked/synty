@@ -17,6 +17,9 @@ pub trait Bucket: Send + Sync {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
     fn exists(&self, key: &str) -> Result<bool>;
+    /// Byte size of an object, or None if absent — a cheap change check for
+    /// append-only event files (no full download).
+    fn size(&self, key: &str) -> Result<Option<u64>>;
     /// All keys under `prefix` (recursive), relative to the bucket root.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -69,6 +72,13 @@ impl Bucket for LocalFs {
     }
     fn exists(&self, key: &str) -> Result<bool> {
         Ok(self.path(key).exists())
+    }
+    fn size(&self, key: &str) -> Result<Option<u64>> {
+        match std::fs::metadata(self.path(key)) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let base = self.path(prefix);

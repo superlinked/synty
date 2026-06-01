@@ -18,7 +18,18 @@ const KNOWN_REPOS: &[&str] = &[
     "VectorHub", "agents", "brave-new-demos",
 ];
 
-pub fn run(corpus_dir: &str, out_path: &str) -> Result<()> {
+pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()> {
+    // Pull every device's events from the shared bucket so this build sees the
+    // whole fleet's sessions, not just the local machine's.
+    if let Some(b) = bucket {
+        let local = Path::new(corpus_dir).join("local");
+        match crate::sync::pull_events(b, &local.to_string_lossy()) {
+            Ok(n) if n > 0 => eprintln!("ingest: pulled {n} event files from {b}/events/"),
+            Ok(_) => {}
+            Err(e) => eprintln!("ingest: event pull skipped ({e})"),
+        }
+    }
+
     let mut docs: Vec<Doc> = Vec::new();
     let mut n_github = 0usize;
 

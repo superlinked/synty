@@ -32,6 +32,9 @@ pub struct Opts {
     pub poll_secs: u64,
     pub install: Option<String>,
     pub cursors: String,
+    /// If set, push drained event files to this bucket under events/ (the
+    /// shared backplane for a fleet of trackers).
+    pub bucket: Option<String>,
 }
 
 pub fn run(o: Opts) -> Result<()> {
@@ -45,7 +48,11 @@ pub fn run(o: Opts) -> Result<()> {
         let n = t.drain()?;
         t.flush_ends(unix_ms(SystemTime::now()), true)?;
         t.save_cursors()?;
+        let pushed = t.push()?;
         eprintln!("track: {n} events ({} sessions) → {}", t.session_count(), o.out);
+        if pushed > 0 {
+            eprintln!("track: pushed {pushed} event files → {}/events/", t.bucket.as_deref().unwrap_or(""));
+        }
         Ok(())
     }
 }
@@ -73,6 +80,8 @@ struct Tracker {
     cutoff_ms: i64,
     cursors_path: PathBuf,
     cursors: HashMap<String, i64>,
+    out: String,
+    bucket: Option<String>,
 }
 
 impl Tracker {
@@ -111,7 +120,15 @@ impl Tracker {
         } else {
             unix_ms(SystemTime::now()) - (o.max_age_days as i64) * 86_400_000
         };
-        Ok(Self { streams, cutoff_ms, cursors_path, cursors })
+        Ok(Self { streams, cutoff_ms, cursors_path, cursors, out: o.out.clone(), bucket: o.bucket.clone() })
+    }
+
+    /// Push drained event files to the shared bucket, if configured.
+    fn push(&self) -> Result<usize> {
+        match &self.bucket {
+            Some(b) => crate::sync::push_events(b, &self.out),
+            None => Ok(0),
+        }
     }
 
     /// One pass over every stream's files; returns the number of events emitted.
@@ -135,8 +152,9 @@ impl Tracker {
             let now = unix_ms(SystemTime::now());
             let ended = self.flush_ends(now, false)?;
             self.save_cursors()?;
-            if n > 0 || ended > 0 {
-                eprintln!("track: +{n} events, {ended} session(s) ended");
+            let pushed = self.push()?;
+            if n > 0 || ended > 0 || pushed > 0 {
+                eprintln!("track: +{n} events, {ended} ended, {pushed} files pushed");
             }
             std::thread::sleep(Duration::from_secs(poll_secs));
         }

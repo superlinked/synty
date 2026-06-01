@@ -42,8 +42,9 @@ fn tick(bucket: &str, machine: &str, poll_secs: u64) -> Result<()> {
         poll_secs,
         install: None,
         cursors: ".synty/cursors.json".into(),
+        bucket: None, // solo: events stay local; the bucket holds embeddings + index
     })?;
-    ingest::run(CORPUS_DIR, DOCS_PATH)?;
+    ingest::run(CORPUS_DIR, DOCS_PATH, None)?;
     index::run(DOCS_PATH, INDEX_PATH, &crate::model_id(), bucket)?;
     Ok(())
 }

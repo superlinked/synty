@@ -86,10 +86,14 @@ impl Bucket for Cloud {
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.size(key)?.is_some())
+    }
+
+    fn size(&self, key: &str) -> Result<Option<u64>> {
         let p = self.full(key);
         match self.rt.block_on(self.store.head(&p)) {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Ok(meta) => Ok(Some(meta.size as u64)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(anyhow!("head {key}: {e}")),
         }
     }

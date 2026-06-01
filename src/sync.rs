@@ -13,7 +13,56 @@ use std::path::Path;
 const PREFIX: &str = "index";
 const MANIFEST: &str = "doc_hashes.json";
 const DOCS_KEY: &str = "docs.jsonl";
+const EVENTS: &str = "events";
 const SKIP: &[&str] = &["embeddings.npy", "embeddings_lengths.json"];
+
+/// Upload this device's event files to the bucket under `events/`, skipping any
+/// whose bucket copy is already the same size (append-only files only grow).
+/// With many trackers pointed at one bucket, each device's events converge here
+/// under its own stream path, ready for a single build to process them all.
+pub fn push_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
+    let b = bucket::open(bucket_uri)?;
+    let mut n = 0;
+    for entry in walkdir::WalkDir::new(local_dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(local_dir)?.to_string_lossy().replace('\\', "/");
+        let key = format!("{EVENTS}/{rel}");
+        let bytes = std::fs::read(entry.path())?;
+        if b.size(&key)? == Some(bytes.len() as u64) {
+            continue;
+        }
+        b.put(&key, &bytes)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Download all devices' event files from the bucket into `local_dir`, skipping
+/// any already present at the same size. This is how a build sees every
+/// device's sessions, not just the local machine's.
+pub fn pull_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
+    let b = bucket::open(bucket_uri)?;
+    let mut n = 0;
+    for key in b.list(EVENTS)? {
+        let rel = key.strip_prefix(&format!("{EVENTS}/")).unwrap_or(&key);
+        let dest = Path::new(local_dir).join(rel);
+        let local_size = std::fs::metadata(&dest).ok().map(|m| m.len());
+        if local_size.is_some() && local_size == b.size(&key)? {
+            continue;
+        }
+        let Some(bytes) = b.get(&key)? else { continue };
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::write(&dest, bytes)?;
+        n += 1;
+    }
+    Ok(n)
+}
 
 /// Upload the index (minus build-side embeddings) and the docs to the bucket,
 /// unless the bucket already holds this exact build (same manifest).
