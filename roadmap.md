@@ -19,9 +19,10 @@ ordered; each lists its projects as one-liners. Design detail lives in
 - GitHub ingestion independent of a developer machine (`synty github` GraphQL backfill, token-based); App install-token + webhooks still planned.
 - Autostart registration (launchd / systemd) + `--watch` with per-file cursors.
 
-## M3 — Local mode & bucket backplane
-- `synty up`: one command to track + index + serve locally, zero config.
-- Events to a bucket (local dir / S3 / GCS); index + metadata as rebuildable projections; incremental sync.
+## M3 — Local mode & bucket backplane · done
+- `synty up`: one command to track + ingest + index on a loop, zero config (solo).
+- Bucket trait (local dir always; S3/GCS first-class behind `--features s3/gcs` via object_store). Events sync to the bucket (push/pull) so many trackers converge; index + docs publish as a rebuildable read-model clients pull.
+- Content-addressed f16 embedding store: each message encoded once across the fleet; a second device rebuilds with no re-encode.
 
 ## M4 — Surfaces
 - Agent surface complete: `search / topic / recent` Markdown to stdout; MCP server exposing the same as tools.

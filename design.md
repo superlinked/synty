@@ -117,20 +117,30 @@ never by person.
 ## Storage layout (bucket)
 
 ```
-events/<source>/<yyyy-mm-dd>/…       append-only envelopes (source of truth)
-index/                               next-plaid PLAID index (derived projection)
-meta.sqlite                          metadata for WHERE-filtering (derived)
+events/<stream>/…                    append-only envelopes (source of truth);
+                                       stream = edge-<machine>-<source>, so many
+                                       trackers' files coexist without collision
+embeddings/<hash[..2]>/<hash>.emb     content-addressed f16 vectors (write-once)
+index/  docs.jsonl                    published read-model (derived projection)
 ```
 
-A web/worker node rebuilds `index/` + `meta.sqlite` from `events/`, the same way
-the binary does locally.
+A `Bucket` trait abstracts this store: a local directory always, S3/GCS behind
+`--features s3/gcs`. The design is **build-once-read-many**, made cheap by two
+content-addressed layers: every tracker pushes events to the bucket; a build
+pulls all devices' events, encodes only text not already in `embeddings/` (so a
+message is encoded once across the whole fleet), and publishes `index/` +
+`docs.jsonl`; clients pull the read-model when their copy is stale and query
+locally. `synty up` runs the loop locally for solo use.
 
 ## What's built (kernel)
 
-A working binary: `track` (native tailers → envelope streams), `github`
-(GraphQL backfill), `ingest` (envelopes + GitHub → `corpus/docs.jsonl`), `index`
-(encode + build + cached embeddings), `search [--filter col=value]`,
-`cluster [--resolution]`, `summarize`, `eval`, plus 45 scenario tests.
+A working binary: `up` (one-command solo loop), `track` (native tailers →
+envelope streams, `--bucket` to push), `github` (GraphQL backfill), `ingest`
+(envelopes + GitHub → `corpus/docs.jsonl`, `--bucket` to pull), `index` (encode
++ build + content-addressed store + publish), `search [--filter col=value]`
+(pulls the published read-model), `cluster [--resolution]`, `summarize`, `eval`,
+plus 50 scenario tests. The bucket backplane (local always, S3/GCS opt-in) gives
+fleet-wide encode-once and build-once-read-many.
 Validated on real data (3,938 docs / 770 K embeddings): retrieval 12/12 relevant
 top-3, agent task-start dogfood 3/3, extractive session summaries specific and
 accurate, all with no generative model. Clustering (M1) is Louvain over the

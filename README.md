@@ -25,20 +25,28 @@ done
 export SYNTY_MODEL="$PWD/models/mxbai"
 ```
 
-Build the corpus (reuses the v1 agent + `gh`), then index and query:
+Track local agent sessions and pull GitHub, then index and query:
 
 ```sh
-# corpus → corpus/{local,github}; see design.md for the dump commands
+cargo run --release -- up                     # solo: track + ingest + index loop
+# …or the steps individually:
+cargo run --release -- track                  # tail Claude Code/Codex/Cowork → envelopes
+cargo run --release -- github                 # PRs/issues via GraphQL ($GITHUB_TOKEN, or gh)
 cargo run --release -- ingest                 # → corpus/docs.jsonl
-cargo run --release -- index                  # encode + build the index
+cargo run --release -- index                  # encode + build + content-addressed store
 cargo run --release -- search "OCR adapter"   # filtered semantic search
 cargo run --release -- search "docs search fix" --filter repo=sie-web
-cargo run --release -- cluster                # Louvain topics → clusters.json
-cargo run --release -- cluster --resolution 2.0   # finer/more topics
+cargo run --release -- cluster --resolution 2.0   # Louvain topics → clusters.json
 cargo run --release -- summarize              # extractive sessions + topic digests
 cargo run --release -- eval                   # retrieval probe set → eval_runs.md
 cargo test                                    # scenario tests
 ```
+
+For a team, point commands at a shared bucket: `track --bucket s3://b`,
+`ingest --bucket s3://b`, `index --bucket s3://b`, `search --bucket s3://b`
+(build with `--features s3` or `gcs`). Events from every device converge there,
+each message is encoded once across the fleet, and clients pull the published
+index. `track --install launchd|systemd` registers the watcher at login.
 
 On Apple Silicon, add `--features metal` to `build`/`run` for GPU encode (~5.7×
 faster); `accelerate` (macOS) and `mkl` (Linux) are CPU-BLAS alternatives. The
