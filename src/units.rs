@@ -271,19 +271,21 @@ pub fn units() -> Result<Vec<Unit>> {
 
     if let Ok(docs) = load_docs(DOCS_PATH) {
         let topic_of = doc_topics().unwrap_or_default();
+        let cache = load_summary_cache();
         for d in &docs {
             let kind = match d.meta.kind.as_str() {
                 "pull_request" => Kind::Pr,
                 "issue" => Kind::Issue,
                 _ => continue,
             };
+            let num = d.meta.number.unwrap_or(0);
             out.push(Unit {
                 kind,
                 when: day(&d.meta.ts),
                 repo: d.meta.repo.clone(),
-                title: format!("{}#{} {}", d.meta.repo, d.meta.number.unwrap_or(0), first_line(&d.text)),
+                title: format!("{}#{} {}", d.meta.repo, num, first_line(&d.text)),
                 outcome: d.meta.state.clone().unwrap_or_default(),
-                summary: None,
+                summary: cache.get(&gh_key(&d.meta.repo, num)).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
                 topic: topic_of.get(&d.id).copied(),
                 struggle: 0.0,
                 doc_id: Some(d.id),
@@ -447,6 +449,43 @@ pub fn session_inputs() -> Result<Vec<SessionInput>> {
                 turns: top_turns(&a.texts, &kps, 8),
                 keyphrases: kps,
             }
+        })
+        .collect())
+}
+
+/// Stable cache key for a GitHub PR/issue summary (repo#number is unique and
+/// survives re-indexing, unlike doc ids).
+pub fn gh_key(repo: &str, number: i64) -> String {
+    format!("gh:{repo}#{number}")
+}
+
+/// A PR/issue as summarizer input: title + body, capped.
+pub struct DocInput {
+    pub key: String,
+    pub kind: &'static str, // "pull request" | "issue"
+    pub repo: String,
+    pub title: String,
+    pub text: String,
+}
+
+/// PR/issue docs as summarizer inputs, so every work unit can get a summary.
+pub fn doc_inputs() -> Result<Vec<DocInput>> {
+    let docs = load_docs(DOCS_PATH).unwrap_or_default();
+    Ok(docs
+        .iter()
+        .filter_map(|d| {
+            let kind = match d.meta.kind.as_str() {
+                "pull_request" => "pull request",
+                "issue" => "issue",
+                _ => return None,
+            };
+            Some(DocInput {
+                key: gh_key(&d.meta.repo, d.meta.number.unwrap_or(0)),
+                kind,
+                repo: d.meta.repo.clone(),
+                title: first_line(&d.text).to_string(),
+                text: crate::excerpt(&d.text, 1500),
+            })
         })
         .collect())
 }

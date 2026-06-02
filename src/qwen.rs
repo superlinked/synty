@@ -4,7 +4,7 @@
 // it reproducible. This is the ONLY place a generative model is used — retrieval,
 // clustering, and keyphrases stay LLM-free, and nothing leaves the machine.
 
-use crate::units::{self, CachedSummary, SessionInput};
+use crate::units::{self, CachedSummary, DocInput, SessionInput};
 use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::VarBuilder;
@@ -112,6 +112,18 @@ Repo: {}\nFiles changed: {}\nInitial request: {}\nKey terms: {}\nMessages (chron
     )
 }
 
+/// One-line instruction prompt for a GitHub PR/issue (title + body).
+fn prompt_for_doc(d: &DocInput) -> String {
+    format!(
+        "<|im_start|>user\nYou are writing a one-line memory of a GitHub {} for a searchable index. \
+Write ONE self-contained past-tense sentence (max 26 words) a teammate with no prior context can understand. \
+Name the concrete subject and the key change or decision. \
+Skip boilerplate and templates. Never echo a field label. No preamble, no quotes, no lists.\n\n\
+Repo: {}\nTitle: {}\nBody:\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        d.kind, d.repo, d.title, d.text,
+    )
+}
+
 /// Strip any reasoning block, surrounding quotes, and extra lines; collapse to
 /// one capped line.
 fn clean(s: &str) -> String {
@@ -131,36 +143,56 @@ fn clean(s: &str) -> String {
     line
 }
 
-fn input_hash(s: &SessionInput) -> String {
+/// 8-byte content hash of arbitrary parts, salted by the prompt version so a
+/// prompt change invalidates the cache.
+fn hash_parts(parts: &[&str]) -> String {
     let mut h = Sha256::new();
     h.update(PROMPT_VERSION.as_bytes());
-    h.update(b"\0");
-    h.update(s.ask.as_bytes());
-    h.update(b"\0");
-    h.update(s.keyphrases.join(",").as_bytes());
-    h.update(b"\0");
-    h.update(s.files.join(",").as_bytes());
-    h.update(b"\0");
-    for t in &s.turns {
-        h.update(t.as_bytes());
+    for p in parts {
         h.update(b"\0");
+        h.update(p.as_bytes());
     }
     h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-/// Generate and cache one-line summaries for every session whose inputs changed.
-/// `SYNTY_LLM_LIMIT` caps how many are generated in one run (for quick checks).
+fn input_hash(s: &SessionInput) -> String {
+    hash_parts(&[&s.ask, &s.keyphrases.join(","), &s.files.join(","), &s.turns.join("\n")])
+}
+
+fn doc_hash(d: &DocInput) -> String {
+    hash_parts(&[d.kind, &d.title, &d.text])
+}
+
+/// One unit of summarization work: a cache key, its input hash, and the prompt.
+struct Job {
+    key: String,
+    hash: String,
+    prompt: String,
+    label: String,
+}
+
+/// Generate and cache one-line summaries for every work unit (session, PR, or
+/// issue) whose inputs changed. `SYNTY_LLM_ONLY=<substr,...>` restricts to
+/// matching keys and `SYNTY_LLM_LIMIT=N` caps the count — both for quick checks.
 pub fn summarize_all() -> Result<()> {
-    let inputs = units::session_inputs()?;
+    let sessions = units::session_inputs()?;
+    let docs = units::doc_inputs()?;
+    let mut jobs: Vec<Job> = Vec::with_capacity(sessions.len() + docs.len());
+    for s in &sessions {
+        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id) });
+    }
+    for d in &docs {
+        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone() });
+    }
+
     let mut cache = units::load_summary_cache();
-    let mut todo: Vec<&SessionInput> = inputs
+    let mut todo: Vec<&Job> = jobs
         .iter()
-        .filter(|s| cache.get(&s.id).map(|c| c.hash != input_hash(s)).unwrap_or(true))
+        .filter(|j| cache.get(&j.key).map(|c| c.hash != j.hash).unwrap_or(true))
         .collect();
-    // Restrict to specific sessions (comma-separated id prefixes) for fast A/B.
     if let Ok(only) = std::env::var("SYNTY_LLM_ONLY") {
         let want: Vec<String> = only.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        todo.retain(|s| want.iter().any(|w| s.id.starts_with(w) || crate::short(&s.id) == *w));
+        todo.retain(|j| want.iter().any(|w| j.key.contains(w.as_str())));
     }
     if let Ok(n) = std::env::var("SYNTY_LLM_LIMIT") {
         if let Ok(n) = n.parse::<usize>() {
@@ -168,30 +200,30 @@ pub fn summarize_all() -> Result<()> {
         }
     }
     if todo.is_empty() {
-        eprintln!("summaries up to date ({} sessions)", inputs.len());
+        eprintln!("summaries up to date ({} items)", jobs.len());
         return Ok(());
     }
-    eprintln!("summarizing {} session(s) with {REPO} (CPU)…", todo.len());
+    eprintln!("summarizing {} item(s) with {REPO}…", todo.len());
     let t_load = std::time::Instant::now();
     let mut llm = Summarizer::load()?;
     eprintln!("model loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 
     let t_gen = std::time::Instant::now();
     let (mut in_tok, mut out_tok) = (0usize, 0usize);
-    for (n, s) in todo.iter().enumerate() {
-        let (summary, pt, ot) = match llm.generate(&prompt_for(s)) {
+    for (n, j) in todo.iter().enumerate() {
+        let (summary, pt, ot) = match llm.generate(&j.prompt) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("  {} failed: {e}", crate::short(&s.id));
+                eprintln!("  {} failed: {e}", j.label);
                 (String::new(), 0, 0)
             }
         };
         in_tok += pt;
         out_tok += ot;
-        eprintln!("  [{}/{}] {} — {}", n + 1, todo.len(), crate::short(&s.id), summary);
-        cache.insert(s.id.clone(), CachedSummary { hash: input_hash(s), summary });
-        // Persist periodically so a long CPU pass is resumable.
-        if (n + 1) % 5 == 0 {
+        eprintln!("  [{}/{}] {} — {}", n + 1, todo.len(), j.label, summary);
+        cache.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
+        // Persist periodically so a long pass is resumable.
+        if (n + 1) % 10 == 0 {
             units::save_summary_cache(&cache)?;
         }
     }
@@ -199,7 +231,7 @@ pub fn summarize_all() -> Result<()> {
 
     let secs = t_gen.elapsed().as_secs_f64();
     eprintln!(
-        "done: {} sessions in {:.1}s — {:.2} s/session, {:.1} output tok/s ({} prompt + {} output tok)",
+        "done: {} items in {:.1}s — {:.2} s/item, {:.1} output tok/s ({} prompt + {} output tok)",
         todo.len(),
         secs,
         secs / todo.len() as f64,
