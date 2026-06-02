@@ -331,7 +331,10 @@ impl App {
     fn breadcrumb(&self) -> String {
         match (self.view, self.drill_topic) {
             (View::Topics, Some(t)) => format!("synty › Topics › {}", self.topics.get(t).map(|x| x.label.as_str()).unwrap_or("")),
-            _ => "synty".to_string(),
+            (View::Topics, None) => format!("synty › Topics ({})", self.topics.len()),
+            (View::Work, _) => format!("synty › Work ({})", self.work.len()),
+            (View::Search, _) => format!("synty › Search ({})", self.results.len()),
+            (View::Status, _) => "synty › Status".to_string(),
         }
     }
 
@@ -339,9 +342,14 @@ impl App {
         let split = if self.view == View::Search {
             let [q, s] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
             let cursor = if matches!(self.engine, Engine::Ready | Engine::Searching) { "▏" } else { "" };
+            let body = if self.query.is_empty() && cursor.is_empty() {
+                Span::styled("type to search…", Style::new().fg(theme::DIM))
+            } else {
+                Span::styled(format!("{}{cursor}", self.query), Style::new().fg(theme::FG))
+            };
             f.render_widget(
-                Paragraph::new(format!("{}{cursor}", self.query))
-                    .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("search")),
+                Paragraph::new(Line::from(vec![Span::styled("⌕ ", Style::new().fg(theme::ACCENT)), body]))
+                    .block(Block::bordered().border_style(Style::new().fg(theme::BORDER))),
                 q,
             );
             s
@@ -359,13 +367,13 @@ impl App {
             .header(Row::new(header).style(Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD)))
             .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
             .highlight_symbol("▌")
-            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(self.list_title()));
+            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)));
         f.render_stateful_widget(table, left, &mut ts);
 
         f.render_widget(
             Paragraph::new(self.detail_lines())
                 .wrap(Wrap { trim: false })
-                .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("detail")),
+                .block(Block::bordered().border_style(Style::new().fg(theme::BORDER))),
             right,
         );
     }
@@ -394,7 +402,7 @@ impl App {
                         })
                         .collect();
                     (
-                        vec!["TOPIC", "ACTIVITY", "UNITS", "LAST"],
+                        vec!["", "ACTIVITY", "UNITS", "LAST"],
                         vec![Constraint::Min(20), Constraint::Length(8), Constraint::Length(5), Constraint::Length(11)],
                         rows,
                     )
@@ -418,7 +426,7 @@ impl App {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    (vec!["WHEN", "TYPE", "SUMMARY"], vec![Constraint::Length(11), Constraint::Length(8), Constraint::Min(20)], rows)
+                    (vec!["WHEN", "TYPE", ""], vec![Constraint::Length(11), Constraint::Length(8), Constraint::Min(20)], rows)
                 }
             },
             View::Work => {
@@ -438,8 +446,8 @@ impl App {
                     })
                     .collect();
                 (
-                    vec!["WHEN", "TYPE", "REPO", "SUMMARY", "EFFORT"],
-                    vec![Constraint::Length(11), Constraint::Length(8), Constraint::Length(12), Constraint::Min(20), Constraint::Length(6)],
+                    vec!["WHEN", "TYPE", "REPO", "", "EFFORT"],
+                    vec![Constraint::Length(11), Constraint::Length(8), Constraint::Length(12), Constraint::Min(20), Constraint::Length(7)],
                     rows,
                 )
             }
@@ -458,19 +466,9 @@ impl App {
                         ])
                     })
                     .collect();
-                (vec!["TYPE", "REPO", "TITLE"], vec![Constraint::Length(8), Constraint::Length(12), Constraint::Min(20)], rows)
+                (vec!["TYPE", "REPO", ""], vec![Constraint::Length(8), Constraint::Length(12), Constraint::Min(20)], rows)
             }
             View::Status => (vec![], vec![], vec![]),
-        }
-    }
-
-    fn list_title(&self) -> String {
-        match self.view {
-            View::Topics if self.drill_topic.is_none() => format!("topics · recent first ({})", self.topics.len()),
-            View::Topics => "units".into(),
-            View::Work => format!("work ({})", self.work.len()),
-            View::Search => format!("results ({})", self.results.len()),
-            _ => String::new(),
         }
     }
 
@@ -532,7 +530,7 @@ impl App {
 
     fn session_detail(&self, s: &Session) -> String {
         let mut o = format!(
-            "session {} · {}\n{} → {}\n\nstruggle {}\n{} prompts · {} assistant · {} thinking · {} tool calls\n",
+            "session {} · {}\n{} → {}\n\neffort {}\n{} prompts · {} assistant · {} thinking · {} tool calls\n",
             short(&s.id),
             s.repo,
             day(&s.started),
@@ -576,7 +574,7 @@ impl App {
     fn status_para(&self) -> Paragraph<'static> {
         Paragraph::new(crate::view::status_md(&self.status))
             .wrap(Wrap { trim: false })
-            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("status"))
+            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)))
     }
 
     fn footer(&self) -> String {
@@ -660,13 +658,13 @@ fn type_cell(k: Kind) -> Cell<'static> {
     Cell::from(kind_tag(k)).style(Style::new().fg(kind_color(k)))
 }
 
-/// A 3-cell effort bar from a session's struggle score; empty for PR/issue.
+/// The shared 5-dot effort meter from a session's struggle score; empty for
+/// PR/issue. Same representation as the CLI and the detail pane.
 fn effort_cell(u: &Unit) -> Cell<'static> {
     if u.kind != Kind::Session {
         return Cell::from("");
     }
-    let filled = (u.struggle * 3.0).round().clamp(0.0, 3.0) as usize;
-    Cell::from(format!("{}{}", "▰".repeat(filled), "▱".repeat(3 - filled))).style(Style::new().fg(theme::ACCENT))
+    Cell::from(crate::view::meter(u.struggle)).style(Style::new().fg(theme::ACCENT))
 }
 
 fn doc_kind_title(d: &Doc) -> (Kind, String) {
@@ -829,7 +827,10 @@ mod tests {
             assert!(text.contains(label), "nav missing {label}");
         }
         assert!(text.contains("autostart"), "footer missing autostart status");
-        assert!(text.contains("TOPIC") && text.contains("ACTIVITY"), "topics table missing headers");
+        // breadcrumb-only chrome: no redundant TOPIC header, but functional ones remain
+        assert!(text.contains("ACTIVITY"), "topics table missing ACTIVITY header");
+        assert!(!text.contains("TOPIC"), "redundant TOPIC header should be gone");
+        assert!(text.contains("synty › Topics"), "breadcrumb missing");
     }
 
     #[test]
@@ -840,9 +841,9 @@ mod tests {
         a.on_key(KeyCode::Enter); // drill
         assert_eq!(a.drill_topic, Some(0));
         assert_eq!(a.list_len(), 2); // its two units
-        // session unit detail mentions struggle + counts
+        // session unit detail mentions effort + counts
         let d = a.detail_lines();
-        assert!(d.contains("struggle"), "detail: {d}");
+        assert!(d.contains("effort"), "detail: {d}");
         a.on_key(KeyCode::Char('h'));
         assert!(a.drill_topic.is_none());
     }
@@ -864,7 +865,7 @@ mod tests {
         a.view = View::Work;
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("SUMMARY"), "work header missing SUMMARY");
+        assert!(text.contains("synty › Work"), "work breadcrumb missing");
         assert!(text.contains("OCR adapter to the sie"), "work row missing summary text: {text}");
     }
 }
