@@ -20,6 +20,7 @@ mod store;
 mod sync;
 mod tail;
 mod track;
+mod tui;
 mod up;
 mod view;
 mod index;
@@ -154,6 +155,8 @@ enum Cmd {
     },
     /// What synty holds and how fresh it is
     Status,
+    /// Interactive terminal UI: status + browse/drill over topics, recent, search
+    Tui,
     /// Extractive session + topic summaries
     Summarize {
         #[arg(long, default_value_t = 10)]
@@ -249,6 +252,7 @@ fn main() -> Result<()> {
             print!("{}", view::recent_md(&view::recent(repo.as_deref(), limit)?));
         }
         Cmd::Status => print!("{}", view::status_md(&view::status()?)),
+        Cmd::Tui => tui::run(model_id())?,
         Cmd::Summarize { sessions, topics } => summarize::run(sessions, topics)?,
         Cmd::Eval => eval::run(&model_id())?,
         Cmd::Track { source, out, max_age_days, machine, watch, poll, install, cursors, bucket } => {

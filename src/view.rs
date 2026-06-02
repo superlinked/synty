@@ -70,6 +70,24 @@ pub fn topics() -> Result<Vec<Topic>> {
     Ok(topics)
 }
 
+/// Topics as (label, member doc ids), largest first — for the TUI to drill into
+/// the actual documents rather than just titles.
+pub fn topic_groups() -> Result<Vec<(String, Vec<i64>)>> {
+    let raw = std::fs::read_to_string("clusters.json")
+        .map_err(|_| anyhow::anyhow!("no clusters.json; run `cluster` first"))?;
+    let arr: Vec<Value> = serde_json::from_str(&raw)?;
+    let mut groups: HashMap<i64, (String, Vec<i64>)> = HashMap::new();
+    for it in &arr {
+        let c = it["cluster"].as_i64().unwrap_or(-1);
+        let label = it["label"].as_str().unwrap_or("").to_string();
+        let id = it["id"].as_i64().unwrap_or(-1);
+        groups.entry(c).or_insert_with(|| (label, Vec::new())).1.push(id);
+    }
+    let mut out: Vec<(String, Vec<i64>)> = groups.into_values().collect();
+    out.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    Ok(out)
+}
+
 /// The most recent human-initiated activity: PRs, issues, and user prompts.
 pub fn recent(repo: Option<&str>, limit: usize) -> Result<Vec<RecentItem>> {
     let docs = load_docs(DOCS_PATH)?;

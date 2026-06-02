@@ -91,8 +91,9 @@ runs on CI or a server without a developer machine.
 
 - **CLI → stdout (agents):** `search`, `topic`, `recent`, `status` print Markdown
   an agent reads over the shell — no server, no auth, no network. *Built.*
-- **TUI (humans):** tracker status (is it running, what it sees, throughput,
-  autostart) + browse/drill. *Planned.*
+- **TUI (humans):** `synty tui` — tabs for status, topics, recent, and search,
+  with browse/drill (topic → members → full document), reusing the CLI's
+  view-models. *Built.*
 - **MCP server (optional):** expose `synty_search / synty_topic / synty_session`
   as agent tools. *Deferred to future work (after the milestones).*
 - **Team web frontend (optional):** the same view models served over HTTP for a
@@ -138,9 +139,10 @@ A working binary: `up` (one-command solo loop), `track` (native tailers →
 envelope streams, `--bucket` to push), `github` (GraphQL backfill), `ingest`
 (envelopes + GitHub → `corpus/docs.jsonl`, `--bucket` to pull), `index` (encode
 + build + content-addressed store + publish), `search [--filter col=value]`
-(pulls the published read-model), `cluster [--resolution]`, `summarize`, `eval`,
-plus 50 scenario tests. The bucket backplane (local always, S3/GCS opt-in) gives
-fleet-wide encode-once and build-once-read-many.
+(pulls the published read-model), `topic`, `recent`, `status`, `tui`,
+`cluster [--resolution]`, `summarize`, `eval`, plus 55 scenario tests. The
+bucket backplane (local always, S3/GCS opt-in) gives fleet-wide encode-once and
+build-once-read-many.
 Validated on real data (3,938 docs / 770 K embeddings): retrieval 12/12 relevant
 top-3, agent task-start dogfood 3/3, extractive session summaries specific and
 accurate, all with no generative model. Clustering (M1) is Louvain over the

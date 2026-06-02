@@ -24,7 +24,7 @@ ordered; each lists its projects as one-liners. Design detail lives in
 - Bucket trait (local dir always; S3/GCS first-class behind `--features s3/gcs` via object_store). Events sync to the bucket (push/pull) so many trackers converge; index + docs publish as a rebuildable read-model clients pull.
 - Content-addressed f16 embedding store: each message encoded once across the fleet; a second device rebuilds with no re-encode.
 
-## M4 — Surfaces
+## M4 — Surfaces · done
 - CLI surface complete: `search / topic / recent / status` print Markdown to stdout.
 - TUI (humans): tracker status + autostart toggle + browse/drill topics and sessions, at rough feature parity with the CLI (more expressive where a terminal UI allows).
 
