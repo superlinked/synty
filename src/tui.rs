@@ -75,11 +75,53 @@ struct App {
 }
 
 pub fn run(model_id: String) -> Result<()> {
+    // Gag stderr first: the background model load (and candle/pylate-rs) write
+    // device/diagnostic lines to stderr, which would scroll the alternate screen
+    // and shove the header off the top. Restored when `_gag` drops.
+    let _gag = StderrGag::new();
     let mut app = App::load(model_id);
     let mut term = ratatui::init();
+    let _ = term.clear();
     let res = app.run_loop(&mut term);
     ratatui::restore();
     res
+}
+
+/// Redirects fd 2 (stderr) to /dev/null while alive, restoring it on drop.
+struct StderrGag {
+    #[cfg(unix)]
+    saved: i32,
+}
+
+impl StderrGag {
+    fn new() -> Self {
+        #[cfg(unix)]
+        unsafe {
+            let saved = libc::dup(2);
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+            if saved >= 0 && fd >= 0 {
+                libc::dup2(fd, 2);
+            }
+            if fd >= 0 {
+                libc::close(fd);
+            }
+            return Self { saved };
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+}
+
+impl Drop for StderrGag {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            if self.saved >= 0 {
+                libc::dup2(self.saved, 2);
+                libc::close(self.saved);
+            }
+        }
+    }
 }
 
 impl App {

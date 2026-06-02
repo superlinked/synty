@@ -3526,6 +3526,7 @@ dependencies = [
  "clap",
  "futures",
  "half",
+ "libc",
  "ndarray",
  "next-plaid",
  "object_store",
