@@ -8,6 +8,7 @@
 use crate::units::{self, Kind, Session, TopicUnits, Unit};
 use crate::{first_line, load_docs, short, Doc, DOCS_PATH, INDEX_PATH};
 use anyhow::Result;
+use chrono::{Datelike, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -29,6 +30,15 @@ mod theme {
     pub const SESSION: Color = Color::Rgb(0xCE, 0xBC, 0xAA); // sand
     pub const SAGE: Color = Color::Rgb(0x86, 0x95, 0x82); // "on" / open
     pub const HILITE: Color = Color::Rgb(0x35, 0x3A, 0x4E); // selected-row background
+    // Pastels for timeline cards; dark text reads on all of them.
+    pub const BAR_COLORS: [Color; 6] = [
+        Color::Rgb(0xFE, 0xCC, 0xBE), // peach
+        Color::Rgb(0x86, 0xA1, 0xBC), // sky
+        Color::Rgb(0xCE, 0xBC, 0xAA), // sand
+        Color::Rgb(0x86, 0x95, 0x82), // sage
+        Color::Rgb(0xA0, 0xB4, 0xC1), // mist
+        Color::Rgb(0xFD, 0xE4, 0xDD), // blush
+    ];
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -202,11 +212,10 @@ impl App {
 
     fn list_len(&self) -> usize {
         match self.view {
-            View::Topics => match self.drill_topic {
+            View::Topics | View::Timeline => match self.drill_topic {
                 None => self.topics.len(),
                 Some(t) => self.topics.get(t).map(|t| t.units.len()).unwrap_or(0),
             },
-            View::Timeline => self.topics.len(),
             View::Work => self.work.len(),
             View::Search => self.results.len(),
             View::Status => 0,
@@ -236,7 +245,7 @@ impl App {
             KeyCode::Char('g') => self.sel = 0,
             KeyCode::Char('G') => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.view == View::Topics && self.drill_topic.is_none() && !self.topics.is_empty() {
+                if matches!(self.view, View::Topics | View::Timeline) && self.drill_topic.is_none() && !self.topics.is_empty() {
                     self.drill_topic = Some(self.sel);
                     self.sel = 0;
                 }
@@ -334,7 +343,8 @@ impl App {
         match (self.view, self.drill_topic) {
             (View::Topics, Some(t)) => format!("synty › Topics › {}", self.topics.get(t).map(|x| x.label.as_str()).unwrap_or("")),
             (View::Topics, None) => format!("synty › Topics ({})", self.topics.len()),
-            (View::Timeline, _) => format!("synty › Timeline ({})", self.topics.len()),
+            (View::Timeline, Some(t)) => format!("synty › Timeline › {}", self.topics.get(t).map(|x| x.label.as_str()).unwrap_or("")),
+            (View::Timeline, None) => format!("synty › Timeline ({})", self.topics.len()),
             (View::Work, _) => format!("synty › Work ({})", self.work.len()),
             (View::Search, _) => format!("synty › Search ({})", self.results.len()),
             (View::Status, _) => "synty › Status".to_string(),
@@ -466,43 +476,73 @@ impl App {
         o
     }
 
-    /// Timeline: a gantt — each topic a row of weekly cells, shaded by activity,
-    /// so you see when each theme was alive and how they overlap. Newest week at
-    /// the right.
+    /// Timeline: a day-level gantt. Each topic is a coloured card positioned and
+    /// sized by its active span, so overlapping themes are visible at a glance.
+    /// ↑↓ selects (details in the status strip); Enter opens the drill overlay.
     fn draw_timeline(&self, f: &mut Frame, area: Rect) {
-        let weeks = self.topics.iter().map(|t| t.activity.len()).max().unwrap_or(0);
-        let gmax = self.topics.iter().flat_map(|t| t.activity.iter().copied()).max().unwrap_or(0);
-        let rows: Vec<Row> = self
+        let block = Block::bordered().border_style(Style::new().fg(theme::BORDER));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let [axis_a, body_a, status_a] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(2)]).areas(inner);
+
+        // Global day range across all dated topics.
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        for t in &self.topics {
+            if let Some((a, b)) = &t.span {
+                if let (Some(x), Some(y)) = (day_num(a), day_num(b)) {
+                    lo = lo.min(x);
+                    hi = hi.max(y);
+                }
+            }
+        }
+        if lo > hi {
+            f.render_widget(Paragraph::new("no dated activity yet").fg(theme::DIM), body_a);
+            return;
+        }
+        let total = (hi - lo + 1) as u32;
+        let w = body_a.width.max(1) as u32;
+        let col = |d: i32| ((d - lo).max(0) as u32 * w / total).min(w - 1) as usize;
+        let sel = self.drill_topic.unwrap_or(self.sel);
+
+        let lines: Vec<Line> = self
             .topics
             .iter()
-            .map(|t| {
-                let track: Vec<Span> = (0..weeks)
-                    .map(|w| {
-                        let c = t.activity.get(w).copied().unwrap_or(0);
-                        if c == 0 {
-                            Span::styled("·", Style::new().fg(theme::HILITE))
-                        } else {
-                            Span::styled("█", Style::new().fg(shade(c, gmax)))
-                        }
-                    })
-                    .collect();
-                Row::new(vec![
-                    Cell::from(t.label.clone()).style(Style::new().fg(theme::FG)),
-                    Cell::from(Line::from(track)),
-                ])
+            .enumerate()
+            .map(|(i, t)| {
+                let Some((a, b)) = &t.span else { return Line::from("") };
+                let (Some(da), Some(db)) = (day_num(a), day_num(b)) else { return Line::from("") };
+                let x0 = col(da);
+                let x1 = (col(db) + 1).min(w as usize); // inclusive end day
+                let bar_w = x1.saturating_sub(x0).max(1);
+                let style = if i == sel {
+                    Style::new().bg(theme::ACCENT).fg(theme::BG).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().bg(theme::BAR_COLORS[i % theme::BAR_COLORS.len()]).fg(theme::BG)
+                };
+                Line::from(vec![Span::raw(" ".repeat(x0)), Span::styled(pad_trunc(&t.label, bar_w), style)])
             })
             .collect();
-        let mut ts = TableState::default();
-        if !self.topics.is_empty() {
-            ts.select(Some(self.sel.min(self.topics.len() - 1)));
+        f.render_widget(Paragraph::new(lines), body_a);
+        f.render_widget(Paragraph::new(day_axis(lo, hi, w as usize)).fg(theme::DIM), axis_a);
+
+        // Status strip: the selected topic in full (cards truncate).
+        if let Some(t) = self.topics.get(sel) {
+            let span = t.span.as_ref().map(|(a, b)| format!("{a} → {b}")).unwrap_or_default();
+            let sum = t.summary.clone().unwrap_or_else(|| t.label.clone());
+            let head = Line::from(vec![
+                Span::styled(format!("▸ {}", t.label), Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("   {span} · {} units", t.units.len()), Style::new().fg(theme::DIM)),
+            ]);
+            f.render_widget(Paragraph::new(vec![head, Line::from(sum).fg(theme::FG)]).wrap(Wrap { trim: false }), status_a);
         }
-        let axis = format!("◄ older · {weeks} weeks · newer ►");
-        let table = Table::new(rows, [Constraint::Length(22), Constraint::Min(0)])
-            .header(Row::new(vec![Cell::from(""), Cell::from(axis)]).style(Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD)))
-            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
-            .highlight_symbol("▌")
-            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)));
-        f.render_stateful_widget(table, area, &mut ts);
+
+        if let Some(ti) = self.drill_topic {
+            if let Some(t) = self.topics.get(ti) {
+                self.draw_topic_overlay(f, area, t);
+            }
+        }
     }
 
     /// (header, column widths, rows) for the current view's table.
@@ -653,9 +693,9 @@ impl App {
                 Engine::Err(e) => return format!("  {e}"),
                 Engine::Ready => "type · Enter search · ↑↓ results · 1-5 views · Esc quit",
             },
-            View::Topics if self.drill_topic.is_some() => "↑↓ units · h back · 1-5 views · q quit",
+            _ if self.drill_topic.is_some() => "↑↓ units · h back · 1-5 views · q quit",
             View::Topics => "↑↓ move · Enter drill · 1-5 views · q quit",
-            View::Timeline => "↑↓ move · 1-5 views · Tab cycle · q quit",
+            View::Timeline => "↑↓ move · Enter drill · 1-5 views · q quit",
             View::Status => "1-5 views · Tab cycle · q quit",
             View::Work => "↑↓ move · 1-5 views · Tab cycle · q quit",
         };
@@ -716,6 +756,39 @@ const SHADES: [Color; 5] = [
 fn shade(count: u64, gmax: u64) -> Color {
     let lvl = if gmax == 0 || count == 0 { 0 } else { (((count * 4) + gmax - 1) / gmax).min(4) as usize };
     SHADES[lvl]
+}
+
+/// Days from the CE epoch for a YYYY-MM-DD day, for positioning on the axis.
+fn day_num(day: &str) -> Option<i32> {
+    NaiveDate::parse_from_str(day, "%Y-%m-%d").ok().map(|d| d.num_days_from_ce())
+}
+
+/// A one-row date axis spanning [lo, hi] over `w` columns: start left, end
+/// right, midpoint in between when there is room.
+fn day_axis(lo: i32, hi: i32, w: usize) -> String {
+    let fmt = |n: i32| NaiveDate::from_num_days_from_ce_opt(n).map(|d| d.format("%b %d").to_string()).unwrap_or_default();
+    let (a, b) = (fmt(lo), fmt(hi));
+    if w <= a.len() + b.len() + 1 {
+        return a;
+    }
+    let mid = fmt(lo + (hi - lo) / 2);
+    let gap = w - a.len() - b.len();
+    if gap > mid.len() + 2 {
+        let left = (gap - mid.len()) / 2;
+        format!("{a}{}{mid}{}{b}", " ".repeat(left), " ".repeat(gap - mid.len() - left))
+    } else {
+        format!("{a}{}{b}", " ".repeat(gap))
+    }
+}
+
+/// Truncate to `w` chars and pad to a solid `w`-wide block (a timeline card).
+fn pad_trunc(s: &str, w: usize) -> String {
+    let mut o: String = s.chars().take(w).collect();
+    let n = o.chars().count();
+    if n < w {
+        o.push_str(&" ".repeat(w - n));
+    }
+    o
 }
 
 /// 3 boxes shaded on the activity ramp (vs the global max), so topics compare.
@@ -850,7 +923,7 @@ mod tests {
             Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), struggle: 0.6, doc_id: None, session_id: Some("S1".into()) },
             Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), summary: None, topic: Some(0), struggle: 0.0, doc_id: Some(0), session_id: None },
         ];
-        let topics = vec![TopicUnits { id: 0, label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()) }];
+        let topics = vec![TopicUnits { id: 0, label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()), span: Some(("2026-05-29".into(), "2026-05-31".into())) }];
         App {
             docs,
             doc_by_id,
@@ -934,17 +1007,17 @@ mod tests {
         assert!(matches!(a.view, View::Status));
     }
 
-    // The timeline shows each topic as a labelled track with a week axis.
+    // The timeline shows each topic as a positioned, labelled card with a date axis.
     #[test]
-    fn timeline_renders_topic_tracks() {
+    fn timeline_renders_topic_cards() {
         let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
         let mut a = app();
         a.view = View::Timeline;
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("synty › Timeline"), "timeline breadcrumb missing");
-        assert!(text.contains("weeks"), "timeline axis missing");
-        assert!(text.contains("ocr"), "timeline topic label missing");
+        assert!(text.contains("May"), "timeline date axis missing: {text}");
+        assert!(text.contains("ocr"), "timeline topic card label missing");
     }
 
     // Work rows surface the session's one-line summary, not just the ask.

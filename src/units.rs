@@ -106,6 +106,7 @@ pub struct TopicUnits {
     pub repos: Vec<String>,   // repos involved, most frequent first
     pub authors: Vec<String>, // authors involved, most frequent first
     pub summary: Option<String>, // map-reduced topic summary (local LLM), if cached
+    pub span: Option<(String, String)>, // first/last active day (YYYY-MM-DD)
 }
 
 /// Cache key for a topic's reduced summary.
@@ -325,11 +326,12 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
             let last_active = units.iter().map(|u| u.when.clone()).max().unwrap_or_default();
             // activity from the constituent docs' timestamps (clusters are over docs)
             let ts: Vec<String> = cluster_doc_ts(id, &by_id);
+            let span = day_span(&ts);
             let activity = weekly_buckets(&ts, weeks);
             let mix = cluster_mix(id, &by_id);
             let (repos, authors) = cluster_facets(id, &by_id);
             let summary = cache.get(&topic_key(id)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
-            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors, summary }
+            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors, summary, span }
         })
         .collect();
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));
@@ -410,6 +412,13 @@ fn session_topics() -> Result<HashMap<String, i64>> {
         .into_iter()
         .filter_map(|(sid, m)| m.into_iter().max_by_key(|(_, n)| *n).map(|(t, _)| (sid, t)))
         .collect())
+}
+
+/// First and last active day (YYYY-MM-DD) across a set of ISO timestamps.
+/// Lexicographic min/max works because the day prefix is zero-padded.
+fn day_span(ts: &[String]) -> Option<(String, String)> {
+    let days: Vec<&str> = ts.iter().filter_map(|t| t.split('T').next()).filter(|d| d.len() == 10).collect();
+    Some((days.iter().min()?.to_string(), days.iter().max()?.to_string()))
 }
 
 fn cluster_doc_ts(topic: i64, by_id: &HashMap<i64, &Doc>) -> Vec<String> {
