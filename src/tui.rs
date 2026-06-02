@@ -484,7 +484,7 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
         let [axis_a, body_a, status_a] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(2)]).areas(inner);
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(3)]).areas(inner);
 
         // Global day range across all dated topics.
         let mut lo = i32::MAX;
