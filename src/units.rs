@@ -30,6 +30,46 @@ pub struct Session {
     pub struggle: f32, // 0..1, normalized across sessions
     pub keyphrases: Vec<String>,
     pub gist: String, // representative line (most keyphrase coverage)
+    pub summary: Option<String>, // abstractive one-liner (local LLM), if cached
+}
+
+/// A session's cached LLM summary, keyed by a hash of its inputs so the
+/// summarizer only regenerates when the underlying turns change.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CachedSummary {
+    pub hash: String,
+    pub summary: String,
+}
+
+pub type SummaryCache = HashMap<String, CachedSummary>;
+
+const SUMMARIES_PATH: &str = "index/summaries.json";
+
+/// Read the on-disk summary cache (empty if the summarizer hasn't run).
+pub fn load_summary_cache() -> SummaryCache {
+    std::fs::read_to_string(SUMMARIES_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the summary cache next to the index.
+pub fn save_summary_cache(c: &SummaryCache) -> Result<()> {
+    if let Some(parent) = Path::new(SUMMARIES_PATH).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(SUMMARIES_PATH, serde_json::to_string_pretty(c)?)?;
+    Ok(())
+}
+
+/// Per-session material for the summarizer: the ask, keyphrases, and the few
+/// messages with the most keyphrase coverage (the on-topic turns).
+pub struct SessionInput {
+    pub id: String,
+    pub repo: String,
+    pub ask: String,
+    pub keyphrases: Vec<String>,
+    pub turns: Vec<String>,
 }
 
 /// The kind of a unit in a unified list.
@@ -79,9 +119,8 @@ struct Agg {
     texts: Vec<String>, // message texts for keyphrase extraction
 }
 
-/// Build session units from the raw envelopes, with topic membership and a
-/// normalized struggle score.
-pub fn sessions() -> Result<Vec<Session>> {
+/// Aggregate the raw envelopes under corpus/local into per-session tallies.
+fn aggregate() -> HashMap<String, Agg> {
     let mut aggs: HashMap<String, Agg> = HashMap::new();
     for f in jsonl_files(Path::new(LOCAL_DIR)) {
         let Ok(data) = std::fs::read_to_string(&f) else { continue };
@@ -160,10 +199,17 @@ pub fn sessions() -> Result<Vec<Session>> {
             }
         }
     }
+    aggs
+}
 
+/// Build session units from the raw envelopes, with topic membership, a
+/// normalized struggle score, and any cached LLM summary.
+pub fn sessions() -> Result<Vec<Session>> {
+    let aggs = aggregate();
+    let cache = load_summary_cache();
     let topic_of = session_topics().unwrap_or_default();
 
-    // Raw struggle signals → z-scores → summed → min-max to 0..1.
+    // Raw struggle signals → z-scores → summed → percentile-ranked to 0..1.
     let ids: Vec<String> = aggs.keys().cloned().collect();
     let sig = |a: &Agg| [a.thinking as f64, a.tools as f64, a.prompts as f64, duration_secs(a) as f64];
     let raw: Vec<[f64; 4]> = ids.iter().map(|id| sig(&aggs[id])).collect();
@@ -195,6 +241,7 @@ pub fn sessions() -> Result<Vec<Session>> {
                 struggle: scores[i],
                 gist: best_line(&aggs[id].texts, keyphrases.get(i).map(Vec::as_slice).unwrap_or(&[])),
                 keyphrases: keyphrases.get(i).cloned().unwrap_or_default(),
+                summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
             }
         })
         .collect();
@@ -373,6 +420,46 @@ fn cluster_mix(topic: i64, by_id: &HashMap<i64, &Doc>) -> (usize, usize, usize) 
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// Per-session inputs for the LLM summarizer (ask + keyphrases + on-topic
+/// turns). Shares aggregation and keyphrase extraction with `sessions`.
+pub fn session_inputs() -> Result<Vec<SessionInput>> {
+    let aggs = aggregate();
+    let ids: Vec<String> = aggs.keys().cloned().collect();
+    let text_refs: Vec<Vec<&str>> = ids.iter().map(|id| aggs[id].texts.iter().map(String::as_str).collect()).collect();
+    let keyphrases = crate::keyphrase::labels(&text_refs, 4);
+    Ok(ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| aggs[*id].prompts > 0)
+        .map(|(i, id)| {
+            let a = &aggs[id];
+            let kps = keyphrases.get(i).cloned().unwrap_or_default();
+            SessionInput {
+                id: id.clone(),
+                repo: if a.repo.is_empty() { "local".into() } else { a.repo.clone() },
+                ask: a.ask.clone(),
+                turns: top_turns(&a.texts, &kps, 5),
+                keyphrases: kps,
+            }
+        })
+        .collect())
+}
+
+/// The k messages with the most keyphrase coverage (ties toward concision),
+/// each whitespace-collapsed and capped — the material a summarizer reads.
+fn top_turns(texts: &[String], kps: &[String], k: usize) -> Vec<String> {
+    let lk: Vec<String> = kps.iter().map(|s| s.to_lowercase()).collect();
+    let mut scored: Vec<(usize, &String)> = texts
+        .iter()
+        .map(|t| {
+            let lt = t.to_lowercase();
+            (lk.iter().filter(|k| lt.contains(k.as_str())).count(), t)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())));
+    scored.into_iter().take(k).map(|(_, t)| crate::excerpt(t, 240)).collect()
+}
 
 /// The session's most representative line: the message covering the most of its
 /// own keyphrases (ties broken toward the more concise one), whitespace-collapsed

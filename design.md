@@ -6,8 +6,8 @@ synty is a passively-collected memory of how work actually happens: it ingests
 coding-agent sessions (Claude Code, Codex, Cowork) and GitHub activity, and makes
 the result searchable and readable by both humans and agents. The pivot from v1
 (`superlinked/synty-legacy`) is to a **single self-contained Rust binary** built
-on **late-interaction retrieval with no generative model** — nothing leaves the
-machine, no API keys, runs offline.
+on **late-interaction retrieval, with generation only for local summaries** —
+nothing leaves the machine, no API keys, runs offline.
 
 This document owns the architecture and the target end-state, and marks what is
 already built. `roadmap.md` owns the sequence to get there. `eval_report.md`
@@ -17,9 +17,11 @@ records the validation of the kernel on real data.
 
 ## Principles
 
-- **No generative model.** Embeddings (ColBERT late-interaction) + deterministic
-  logic + extractive summarization. For a tool that ingests dev transcripts,
-  "your data never leaves the machine" is the feature.
+- **Nothing leaves the machine.** The core — retrieval (ColBERT late-interaction),
+  clustering, and keyphrases — is deterministic and embedding-only, never an LLM.
+  Session summaries are the one exception: a small local model (Qwen3-0.6B on
+  candle, the `llm` feature) generates them offline. No data leaves the machine
+  either way; that is the actual feature, and a local model preserves it.
 - **Local-first, self-contained.** One static binary. The model downloads once
   and runs offline thereafter. No server, no Python, no Docker required to get
   value.
@@ -84,8 +86,12 @@ runs on CI or a server without a developer machine.
   embeddings are cached next to the index, so a resolution sweep re-runs only
   Louvain (sub-second) and never re-encodes. *Built (Louvain + resolution +
   keyphrase labels).*
-- **Summaries** — extractive. Per session: opening ask, files touched, prompt
-  count, linked PR. Per topic: counts, repos, notable titles. *Built.*
+- **Summaries.** Per session: opening ask, c-TF-IDF keyphrases, files touched,
+  effort, linked PR, and a one-line abstractive summary from a local Qwen3-0.6B
+  (greedy decode, cached by input hash next to the index so the reader never runs
+  the model at view time; falls back to an extractive representative line without
+  the `llm` feature). Per topic: counts, repos, notable titles — extractive.
+  *Built (extractive + local LLM session summaries).*
 
 ## Surfaces
 
@@ -144,8 +150,9 @@ envelope streams, `--bucket` to push), `github` (GraphQL backfill), `ingest`
 bucket backplane (local always, S3/GCS opt-in) gives fleet-wide encode-once and
 build-once-read-many.
 Validated on real data (3,938 docs / 770 K embeddings): retrieval 12/12 relevant
-top-3, agent task-start dogfood 3/3, extractive session summaries specific and
-accurate, all with no generative model. Clustering (M1) is Louvain over the
+top-3, agent task-start dogfood 3/3, session summaries specific and accurate
+(extractive in the core; one-line abstractive from a local Qwen3-0.6B under the
+`llm` feature, with retrieval and clustering staying LLM-free). Clustering (M1) is Louvain over the
 weighted graph: the prior GitHub over-merge (a 710-doc blob) is gone — 22
 recognizable keyphrase-labeled topics, largest 462 docs, modularity 0.75. Full
 results in `eval_report.md`.

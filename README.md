@@ -7,18 +7,19 @@ starting a task, ask *"has anyone touched the OCR adapter?"* or *"what did we
 decide about the queue isolation?"* and get the relevant prior sessions and PRs
 back in seconds.
 
-It runs as a single local binary. **No generative model, no API keys, nothing
-leaves your machine.** For a tool that ingests your dev transcripts, that is the
-whole point.
+It runs as a single local binary. **No API keys, nothing leaves your machine** —
+not even the summaries, which a small model generates locally. For a tool that
+ingests your dev transcripts, that is the whole point.
 
 ## Why synty
 
 - **Private by design.** Retrieval is late-interaction embeddings (ColBERT) plus
-  deterministic logic and extractive summaries — there is no LLM in the loop, so
-  your sessions are never sent anywhere. The model runs offline on your CPU (or
-  Apple GPU).
+  deterministic logic — no LLM in the loop. Session summaries are written by a
+  small local model (Qwen3-0.6B) that runs offline on your CPU, so your sessions
+  are never sent anywhere.
 - **Local-first, one binary.** No server, no Python, no Docker to get value. The
-  embedding model (~127 MB) downloads once and runs offline after.
+  embedding model (~127 MB) downloads once and runs offline after; the optional
+  summarizer (~1.2 GB) downloads on first `summarize`.
 - **Agents are first-class readers.** The main surface is a CLI that prints
   Markdown to stdout — exactly what a coding agent reads before starting, so it
   builds on prior work instead of starting cold.
@@ -67,7 +68,7 @@ cargo run --release -- ingest    # turn events + GitHub into searchable document
 cargo run --release -- index     # encode with ColBERT and build the index
 cargo run --release -- search "<query>" [--filter col=value]
 cargo run --release -- cluster --resolution 2.0   # emergent topics, no taxonomy
-cargo run --release -- summarize                  # extractive session + topic digests
+cargo run --release -- summarize                  # local-LLM session summaries + topic digests
 ```
 
 ## Team mode (optional)

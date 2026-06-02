@@ -39,8 +39,10 @@ fn session_summaries(n: usize) -> Result<()> {
         if !s.keyphrases.is_empty() {
             println!("about: {}", s.keyphrases.join(", "));
         }
-        if !s.gist.is_empty() {
-            println!("gist: {}", s.gist);
+        match &s.summary {
+            Some(sum) => println!("summary: {sum}"),
+            None if !s.gist.is_empty() => println!("gist: {}", s.gist),
+            None => {}
         }
         if !s.files.is_empty() {
             println!("files: {}", s.files.iter().take(8).cloned().collect::<Vec<_>>().join(", "));

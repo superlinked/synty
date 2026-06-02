@@ -536,8 +536,10 @@ impl App {
         if !s.keyphrases.is_empty() {
             o.push_str(&format!("about: {}\n", s.keyphrases.join(", ")));
         }
-        if !s.gist.is_empty() {
-            o.push_str(&format!("gist: {}\n", s.gist));
+        match &s.summary {
+            Some(sum) => o.push_str(&format!("summary: {sum}\n")),
+            None if !s.gist.is_empty() => o.push_str(&format!("gist: {}\n", s.gist)),
+            None => {}
         }
         if let Some(pr) = &s.linked_pr {
             o.push_str(&format!("linked PR: {pr}\n"));
@@ -747,6 +749,7 @@ mod tests {
             struggle: 0.6,
             keyphrases: vec!["ocr".into(), "adapter".into()],
             gist: "add OCR adapter".into(),
+            summary: Some("Added an OCR adapter to the sie pipeline.".into()),
         };
         let work = vec![
             Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), topic: Some(0), struggle: 0.6, doc_id: None, session_id: Some("S1".into()) },
