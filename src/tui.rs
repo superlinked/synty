@@ -19,6 +19,7 @@ use std::time::Duration;
 
 mod theme {
     use ratatui::style::Color;
+    pub const BG: Color = Color::Rgb(0x1F, 0x1F, 0x2C);
     pub const FG: Color = Color::Rgb(0xF3, 0xF1, 0xF1);
     pub const ACCENT: Color = Color::Rgb(0xF3, 0x44, 0x1D);
     pub const BORDER: Color = Color::Rgb(0x5D, 0x6C, 0x80);
@@ -255,14 +256,24 @@ impl App {
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
+        // Paint the whole top row as a bar so it reads as navigation.
+        let bar = Style::new().bg(theme::BG).fg(theme::FG);
+        f.render_widget(Block::new().style(bar), area);
+
         let idx = VIEWS.iter().position(|v| *v == self.view).unwrap_or(0);
         let crumb = self.breadcrumb();
-        let [tabs, bc] = Layout::horizontal([Constraint::Length(46), Constraint::Min(0)]).areas(area);
+        // Tabs take the room they need; the breadcrumb gets a small slice on the
+        // right (and nothing on a narrow terminal).
+        let bc_w = (crumb.chars().count() as u16 + 2).min(area.width.saturating_sub(46));
+        let [tabs, bc] = Layout::horizontal([Constraint::Min(0), Constraint::Length(bc_w)]).areas(area);
         f.render_widget(
-            Tabs::new(VIEW_NAMES.to_vec()).select(idx).highlight_style(Style::new().fg(theme::ACCENT).bold()),
+            Tabs::new(VIEW_NAMES.to_vec())
+                .select(idx)
+                .style(bar)
+                .highlight_style(Style::new().bg(theme::BG).fg(theme::ACCENT).bold()),
             tabs,
         );
-        f.render_widget(Line::from(crumb).fg(theme::DIM).right_aligned(), bc);
+        f.render_widget(Line::from(crumb).style(bar).fg(theme::DIM).right_aligned(), bc);
     }
 
     fn breadcrumb(&self) -> String {
@@ -665,6 +676,18 @@ mod tests {
             let mut a = app();
             a.view = v;
             term.draw(|f| a.draw(f)).unwrap();
+        }
+    }
+
+    // The nav bar shows every tab's full label, not a clipped "5".
+    #[test]
+    fn navbar_shows_all_labels() {
+        let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        let mut a = app();
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        for label in ["Overview", "Topics", "Work", "Search", "Status"] {
+            assert!(text.contains(label), "nav missing {label}");
         }
     }
 
