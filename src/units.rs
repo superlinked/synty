@@ -29,6 +29,7 @@ pub struct Session {
     pub topic: Option<i64>,
     pub struggle: f32, // 0..1, normalized across sessions
     pub keyphrases: Vec<String>,
+    pub gist: String, // representative line (most keyphrase coverage)
 }
 
 /// The kind of a unit in a unified list.
@@ -192,6 +193,7 @@ pub fn sessions() -> Result<Vec<Session>> {
                 linked_pr: a.linked_pr.clone(),
                 topic: topic_of.get(id).copied(),
                 struggle: scores[i],
+                gist: best_line(&aggs[id].texts, keyphrases.get(i).map(Vec::as_slice).unwrap_or(&[])),
                 keyphrases: keyphrases.get(i).cloned().unwrap_or_default(),
             }
         })
@@ -292,9 +294,17 @@ fn struggle_scores(raw: &[[f64; 4]]) -> Vec<f32> {
     }
     let sd: [f64; 4] = std::array::from_fn(|k| (var[k] / n).sqrt().max(1e-9));
     let z: Vec<f64> = raw.iter().map(|r| (0..4).map(|k| (r[k] - mean[k]) / sd[k]).sum()).collect();
-    let (lo, hi) = (z.iter().cloned().fold(f64::INFINITY, f64::min), z.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
-    let span = (hi - lo).max(1e-9);
-    z.iter().map(|v| ((v - lo) / span) as f32).collect()
+    // Percentile-rank the summed z-scores rather than min-max: one outlier
+    // session (e.g. left open for days) won't compress everyone else toward
+    // zero, and the result reads directly as "harder than X% of sessions".
+    let mut order: Vec<usize> = (0..z.len()).collect();
+    order.sort_by(|&a, &b| z[a].partial_cmp(&z[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let denom = z.len().saturating_sub(1).max(1) as f32;
+    let mut out = vec![0f32; z.len()];
+    for (rank, &i) in order.iter().enumerate() {
+        out[i] = rank as f32 / denom;
+    }
+    out
 }
 
 // ── topic membership ──────────────────────────────────────────────────────
@@ -363,6 +373,25 @@ fn cluster_mix(topic: i64, by_id: &HashMap<i64, &Doc>) -> (usize, usize, usize) 
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// The session's most representative line: the message covering the most of its
+/// own keyphrases (ties broken toward the more concise one), whitespace-collapsed
+/// and capped. An extractive stand-in for an abstractive summary.
+fn best_line(texts: &[String], kps: &[String]) -> String {
+    if texts.is_empty() {
+        return String::new();
+    }
+    if kps.is_empty() {
+        return crate::excerpt(&texts[0], 160);
+    }
+    let lk: Vec<String> = kps.iter().map(|k| k.to_lowercase()).collect();
+    let best = texts.iter().max_by_key(|t| {
+        let lt = t.to_lowercase();
+        let cov = lk.iter().filter(|k| lt.contains(k.as_str())).count();
+        (cov, usize::MAX - t.len()) // most coverage, then shortest
+    });
+    best.map(|t| crate::excerpt(t, 160)).unwrap_or_default()
+}
 
 fn session_outcome(s: &Session) -> String {
     if let Some(pr) = &s.linked_pr {

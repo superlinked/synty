@@ -1,17 +1,13 @@
 // Extractive summaries, no LLM.
-//  - Sessions: re-parse corpus/local; per session report repo, prompt count,
-//    files touched (Write/Edit attachment_refs), the opening ask, linked PRs.
+//  - Sessions: the `units` view-model — repo, counts, opening ask, c-TF-IDF
+//    keyphrases, the representative line, files touched, effort, linked PR.
 //  - Topics: read clusters.json + docs.jsonl; per cluster report repos,
 //    kind counts, and notable titles. Falls back to per-repo GitHub digests.
 
-use crate::{excerpt, first_line, load_docs, short, Doc};
+use crate::{first_line, load_docs, short, Doc};
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
-
-const LOCAL_DIR: &str = "corpus/local";
-const FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+use std::collections::{BTreeMap, HashMap};
 
 pub fn run(sessions: usize, topics: usize) -> Result<()> {
     session_summaries(sessions)?;
@@ -20,102 +16,37 @@ pub fn run(sessions: usize, topics: usize) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
-struct Session {
-    repo: String,
-    first_ts: String,
-    last_ts: String,
-    prompts: Vec<String>,
-    files: Vec<String>,
-    pr_links: Vec<String>,
-}
-
 fn session_summaries(n: usize) -> Result<()> {
-    let mut files = Vec::new();
-    if Path::new(LOCAL_DIR).is_dir() {
-        collect_jsonl(Path::new(LOCAL_DIR), &mut files)?;
-    }
-    let mut seen_files: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut s: HashMap<String, Session> = HashMap::new();
-    for f in files {
-        let Ok(data) = std::fs::read_to_string(&f) else { continue };
-        for line in data.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
-            let sid = ev["session_id"].as_str().unwrap_or("").to_string();
-            if sid.is_empty() {
-                continue;
-            }
-            let kind = ev["kind"].as_str().unwrap_or("");
-            let ts = ev["ts"].as_str().unwrap_or("").to_string();
-            let e = s.entry(sid.clone()).or_default();
-            if e.first_ts.is_empty() || ts < e.first_ts {
-                e.first_ts = ts.clone();
-            }
-            if ts > e.last_ts {
-                e.last_ts = ts.clone();
-            }
-            match kind {
-                "session_start" => {
-                    if let Some(cwd) = ev["payload"]["cwd"].as_str() {
-                        e.repo = cwd.rsplit('/').next().unwrap_or(cwd).to_string();
-                    }
-                }
-                "user_prompt" => {
-                    if let Some(t) = ev["payload"]["text"].as_str() {
-                        if t.trim().len() >= 12 {
-                            e.prompts.push(t.trim().to_string());
-                        }
-                    }
-                }
-                "attachment_ref" => {
-                    let tool = ev["payload"]["tool_name"].as_str().unwrap_or("");
-                    if FILE_TOOLS.contains(&tool) {
-                        if let Some(p) = ev["payload"]["local_path"].as_str() {
-                            let base = p.rsplit('/').next().unwrap_or(p).to_string();
-                            if seen_files.entry(sid.clone()).or_default().insert(base.clone()) {
-                                e.files.push(base);
-                            }
-                        }
-                    }
-                }
-                "agent_meta" => {
-                    let blob = ev["payload"].to_string();
-                    if let Some(pos) = blob.find("/pull/") {
-                        let tail: String = blob[pos..].chars().take(24).collect();
-                        e.pr_links.push(format!("…{tail}"));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut all: Vec<(String, Session)> = s.into_iter().filter(|(_, v)| !v.prompts.is_empty()).collect();
-    all.sort_by(|a, b| b.1.last_ts.cmp(&a.1.last_ts));
+    let mut all = crate::units::sessions()?;
+    all.sort_by(|a, b| b.ended.cmp(&a.ended));
     println!("# session summaries (most recent {n})\n");
-    for (sid, sess) in all.into_iter().take(n) {
-        let repo = if sess.repo.is_empty() { "?".into() } else { sess.repo };
+    for s in all.into_iter().take(n) {
         println!(
             "## {} · {} · {}",
-            short(&sid),
-            repo,
-            sess.first_ts.split('T').next().unwrap_or("")
+            short(&s.id),
+            if s.repo.is_empty() { "?" } else { &s.repo },
+            s.started.split('T').next().unwrap_or("")
         );
         println!(
-            "{} prompts · {} files touched",
-            sess.prompts.len(),
-            sess.files.len()
+            "{} prompts · {} assistant · {} tools · {} files · effort {}",
+            s.prompts,
+            s.assistant,
+            s.tools,
+            s.files.len(),
+            crate::view::meter(s.struggle)
         );
-        println!("ask: {}", excerpt(&sess.prompts[0], 200));
-        if !sess.files.is_empty() {
-            let shown: Vec<String> = sess.files.iter().take(8).cloned().collect();
-            println!("files: {}", shown.join(", "));
+        println!("ask: {}", s.ask);
+        if !s.keyphrases.is_empty() {
+            println!("about: {}", s.keyphrases.join(", "));
         }
-        if !sess.pr_links.is_empty() {
-            println!("linked: {}", sess.pr_links.join(" "));
+        if !s.gist.is_empty() {
+            println!("gist: {}", s.gist);
+        }
+        if !s.files.is_empty() {
+            println!("files: {}", s.files.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
+        }
+        if let Some(pr) = &s.linked_pr {
+            println!("linked: {pr}");
         }
         println!();
     }
@@ -192,16 +123,4 @@ fn digest_one(label: &str, ids: &[i64], by_id: &HashMap<i64, &Doc>) {
         );
     }
     println!();
-}
-
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for e in std::fs::read_dir(dir)? {
-        let p = e?.path();
-        if p.is_dir() {
-            collect_jsonl(&p, out)?;
-        } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            out.push(p);
-        }
-    }
-    Ok(())
 }
