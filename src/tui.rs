@@ -417,7 +417,7 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let [facets, units] = Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(inner);
+        let [facets, units] = Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).areas(inner);
         f.render_widget(Paragraph::new(self.topic_facets(t)).wrap(Wrap { trim: false }), facets);
 
         let dim = Style::new().fg(theme::DIM);
@@ -444,19 +444,26 @@ impl App {
         f.render_stateful_widget(table, units, &mut ts);
     }
 
-    /// Facets for a topic overlay: counts, repos, authors, activity, type mix.
+    /// Facets for a topic overlay: the reduced summary, then counts, repos,
+    /// authors, activity, type mix.
     fn topic_facets(&self, t: &TopicUnits) -> String {
         let (gh, asst, prompt) = t.mix;
         let a = last3(&t.activity);
         let join = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.iter().take(6).cloned().collect::<Vec<_>>().join(", ") };
-        format!(
+        let mut o = String::new();
+        if let Some(s) = &t.summary {
+            o.push_str(s);
+            o.push_str("\n\n");
+        }
+        o.push_str(&format!(
             "{} units · last active {}\nrepos: {}\nauthors: {}\nactivity prior/last/this wk: {} / {} / {}\nmix: {gh} github · {asst} assistant · {prompt} prompt",
             t.units.len(),
             t.last_active,
             join(&t.repos),
             join(&t.authors),
             a[0], a[1], a[2],
-        )
+        ));
+        o
     }
 
     /// Timeline: a gantt — each topic a row of weekly cells, shaded by activity,
@@ -510,10 +517,11 @@ impl App {
                     .topics
                     .iter()
                     .map(|t| {
-                        // keyphrase label on top, the latest session summary in the topic below
-                        let latest = t.units.iter().find_map(|u| u.summary.clone()).unwrap_or_default();
+                        // keyphrase label on top; the reduced topic summary below
+                        // (falling back to the latest member's summary)
+                        let line = t.summary.clone().or_else(|| t.units.iter().find_map(|u| u.summary.clone())).unwrap_or_default();
                         Row::new(vec![
-                            two_line(t.label.clone(), latest, theme::FG),
+                            two_line(t.label.clone(), line, theme::FG),
                             activity_cell(last3(&t.activity), gmax),
                             Cell::from(t.units.len().to_string()).style(dim),
                             Cell::from(t.last_active.clone()).style(dim),
@@ -842,7 +850,7 @@ mod tests {
             Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), struggle: 0.6, doc_id: None, session_id: Some("S1".into()) },
             Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), summary: None, topic: Some(0), struggle: 0.0, doc_id: Some(0), session_id: None },
         ];
-        let topics = vec![TopicUnits { id: 0, label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()] }];
+        let topics = vec![TopicUnits { id: 0, label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()) }];
         App {
             docs,
             doc_by_id,

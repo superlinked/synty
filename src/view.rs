@@ -69,6 +69,9 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
             wk(2),
             wk(3),
         ));
+        if let Some(s) = &t.summary {
+            o.push_str(&format!("{s}\n"));
+        }
         if !t.repos.is_empty() {
             o.push_str(&format!("repos: {}\n", t.repos.iter().take(6).cloned().collect::<Vec<_>>().join(", ")));
         }

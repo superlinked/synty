@@ -124,6 +124,22 @@ Repo: {}\nTitle: {}\nBody:\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</th
     )
 }
 
+/// Reduce a topic's member summaries into one description of the theme.
+fn prompt_for_topic(label: &str, members: &[String]) -> String {
+    let mut items = String::new();
+    for m in members {
+        items.push_str("- ");
+        items.push_str(m);
+        items.push('\n');
+    }
+    format!(
+        "<|im_start|>user\nYou are describing a work theme for an index, from the one-line summaries of its items. \
+Write ONE self-contained sentence (max 28 words) capturing what this theme is about and what was done across it. \
+Name concrete subjects; do not just list the items. No preamble, no quotes, no lists.\n\n\
+Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    )
+}
+
 /// Strip any reasoning block, surrounding quotes, and extra lines; collapse to
 /// one capped line.
 fn clean(s: &str) -> String {
@@ -171,25 +187,51 @@ struct Job {
     label: String,
 }
 
-/// Generate and cache one-line summaries for every work unit (session, PR, or
-/// issue) whose inputs changed. `SYNTY_LLM_ONLY=<substr,...>` restricts to
-/// matching keys and `SYNTY_LLM_LIMIT=N` caps the count — both for quick checks.
-pub fn summarize_all() -> Result<()> {
+/// Salt for the topic (reduce) prompt; bump to regenerate topic summaries only.
+const TOPIC_PROMPT_VERSION: &str = "t1";
+
+/// Unit jobs: one per session and per PR/issue.
+fn unit_jobs() -> Result<Vec<Job>> {
     let sessions = units::session_inputs()?;
     let docs = units::doc_inputs()?;
-    let mut jobs: Vec<Job> = Vec::with_capacity(sessions.len() + docs.len());
+    let mut jobs = Vec::with_capacity(sessions.len() + docs.len());
     for s in &sessions {
         jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id) });
     }
     for d in &docs {
         jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone() });
     }
+    Ok(jobs)
+}
 
-    let mut cache = units::load_summary_cache();
-    let mut todo: Vec<&Job> = jobs
-        .iter()
-        .filter(|j| cache.get(&j.key).map(|c| c.hash != j.hash).unwrap_or(true))
-        .collect();
+/// Topic jobs, reduced from the members' (now current) summaries. The hash is
+/// over the label + sorted member summaries, so a topic regenerates exactly when
+/// its membership or any member summary changes.
+fn topic_jobs() -> Result<Vec<Job>> {
+    let mut jobs = Vec::new();
+    for t in units::topic_units(12)? {
+        let members: Vec<String> = t.units.iter().filter_map(|u| u.summary.clone()).take(24).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let mut sorted: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+        sorted.sort_unstable();
+        let mut parts = vec![TOPIC_PROMPT_VERSION, t.label.as_str()];
+        parts.extend(sorted);
+        jobs.push(Job {
+            key: units::topic_key(t.id),
+            hash: hash_parts(&parts),
+            prompt: prompt_for_topic(&t.label, &members),
+            label: format!("topic:{}", t.id),
+        });
+    }
+    Ok(jobs)
+}
+
+/// Jobs whose cached hash is missing or stale, narrowed by the debug knobs
+/// `SYNTY_LLM_ONLY=<substr,...>` and `SYNTY_LLM_LIMIT=N`.
+fn pending<'a>(jobs: &'a [Job], cache: &units::SummaryCache) -> Vec<&'a Job> {
+    let mut todo: Vec<&Job> = jobs.iter().filter(|j| cache.get(&j.key).map(|c| c.hash != j.hash).unwrap_or(true)).collect();
     if let Ok(only) = std::env::var("SYNTY_LLM_ONLY") {
         let want: Vec<String> = only.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         todo.retain(|j| want.iter().any(|w| j.key.contains(w.as_str())));
@@ -199,16 +241,11 @@ pub fn summarize_all() -> Result<()> {
             todo.truncate(n);
         }
     }
-    if todo.is_empty() {
-        eprintln!("summaries up to date ({} items)", jobs.len());
-        return Ok(());
-    }
-    eprintln!("summarizing {} item(s) with {REPO}…", todo.len());
-    let t_load = std::time::Instant::now();
-    let mut llm = Summarizer::load()?;
-    eprintln!("model loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+    todo
+}
 
-    let t_gen = std::time::Instant::now();
+/// Generate `todo`, updating and periodically persisting the cache.
+fn run_jobs(todo: &[&Job], cache: &mut units::SummaryCache, llm: &mut Summarizer, kind: &str) -> Result<(usize, usize)> {
     let (mut in_tok, mut out_tok) = (0usize, 0usize);
     for (n, j) in todo.iter().enumerate() {
         let (summary, pt, ot) = match llm.generate(&j.prompt) {
@@ -220,24 +257,54 @@ pub fn summarize_all() -> Result<()> {
         };
         in_tok += pt;
         out_tok += ot;
-        eprintln!("  [{}/{}] {} — {}", n + 1, todo.len(), j.label, summary);
+        eprintln!("  [{kind} {}/{}] {} — {}", n + 1, todo.len(), j.label, summary);
         cache.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
-        // Persist periodically so a long pass is resumable.
         if (n + 1) % 10 == 0 {
-            units::save_summary_cache(&cache)?;
+            units::save_summary_cache(cache)?;
         }
+    }
+    Ok((in_tok, out_tok))
+}
+
+/// Refresh summaries in two passes: units (sessions, PRs, issues) first, then
+/// topics map-reduced from the now-current member summaries. The model loads
+/// once, lazily, only if there is work.
+pub fn summarize_all() -> Result<()> {
+    let mut cache = units::load_summary_cache();
+    let mut llm: Option<Summarizer> = None;
+    let t = std::time::Instant::now();
+    let (mut in_tok, mut out_tok) = (0usize, 0usize);
+
+    // Pass 1: units.
+    let ujobs = unit_jobs()?;
+    let utodo = pending(&ujobs, &cache);
+    if !utodo.is_empty() {
+        eprintln!("summarizing {} unit(s) with {REPO}…", utodo.len());
+        llm = Some(Summarizer::load()?);
+        let (i, o) = run_jobs(&utodo, &mut cache, llm.as_mut().unwrap(), "unit")?;
+        (in_tok, out_tok) = (in_tok + i, out_tok + o);
+        units::save_summary_cache(&cache)?; // so the topic pass reads fresh members
+    }
+
+    // Pass 2: topics, reduced from the fresh member summaries.
+    let tjobs = topic_jobs()?;
+    let ttodo = pending(&tjobs, &cache);
+    if !ttodo.is_empty() {
+        eprintln!("summarizing {} topic(s)…", ttodo.len());
+        if llm.is_none() {
+            llm = Some(Summarizer::load()?);
+        }
+        let (i, o) = run_jobs(&ttodo, &mut cache, llm.as_mut().unwrap(), "topic")?;
+        (in_tok, out_tok) = (in_tok + i, out_tok + o);
     }
     units::save_summary_cache(&cache)?;
 
-    let secs = t_gen.elapsed().as_secs_f64();
-    eprintln!(
-        "done: {} items in {:.1}s — {:.2} s/item, {:.1} output tok/s ({} prompt + {} output tok)",
-        todo.len(),
-        secs,
-        secs / todo.len() as f64,
-        out_tok as f64 / secs,
-        in_tok,
-        out_tok,
-    );
+    let n = utodo.len() + ttodo.len();
+    if n == 0 {
+        eprintln!("summaries up to date ({} units, {} topics)", ujobs.len(), tjobs.len());
+    } else {
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!("done: {n} items in {:.1}s — {:.1} output tok/s ({in_tok} prompt + {out_tok} output tok)", secs, out_tok as f64 / secs);
+    }
     Ok(())
 }

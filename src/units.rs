@@ -105,6 +105,12 @@ pub struct TopicUnits {
     pub mix: (usize, usize, usize), // (github, assistant, prompt) doc counts
     pub repos: Vec<String>,   // repos involved, most frequent first
     pub authors: Vec<String>, // authors involved, most frequent first
+    pub summary: Option<String>, // map-reduced topic summary (local LLM), if cached
+}
+
+/// Cache key for a topic's reduced summary.
+pub fn topic_key(id: i64) -> String {
+    format!("topic:{id}")
 }
 
 #[derive(Default)]
@@ -303,6 +309,7 @@ pub fn units() -> Result<Vec<Unit>> {
 pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
     let all = units()?;
     let labels = topic_labels()?;
+    let cache = load_summary_cache();
     let docs = load_docs(DOCS_PATH).unwrap_or_default();
     let by_id: HashMap<i64, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
 
@@ -321,7 +328,8 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
             let activity = weekly_buckets(&ts, weeks);
             let mix = cluster_mix(id, &by_id);
             let (repos, authors) = cluster_facets(id, &by_id);
-            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors }
+            let summary = cache.get(&topic_key(id)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
+            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors, summary }
         })
         .collect();
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));
