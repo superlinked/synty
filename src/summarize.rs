@@ -16,6 +16,21 @@ pub fn run(sessions: usize, topics: usize) -> Result<()> {
     Ok(())
 }
 
+/// Print the exact summarizer inputs (ask, keyphrases, selected turns with their
+/// lengths) for every session — to inspect input quality without running the model.
+pub fn dump_inputs() -> Result<()> {
+    for s in crate::units::session_inputs()? {
+        println!("## {} · {}", short(&s.id), s.repo);
+        println!("ask [{} chars]: {}", s.ask.len(), s.ask);
+        println!("keyphrases: {}", s.keyphrases.join(", "));
+        for (i, t) in s.turns.iter().enumerate() {
+            println!("  turn{i} [{} chars]: {}", t.len(), t);
+        }
+        println!();
+    }
+    Ok(())
+}
+
 fn session_summaries(n: usize) -> Result<()> {
     let mut all = crate::units::sessions()?;
     all.sort_by(|a, b| b.ended.cmp(&a.ended));

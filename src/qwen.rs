@@ -16,7 +16,7 @@ const REPO: &str = "Qwen/Qwen3-0.6B";
 const FILES: &[&str] = &["tokenizer.json", "config.json", "model.safetensors"];
 const MAX_NEW: usize = 64;
 // Bump when the prompt changes so cached summaries regenerate.
-const PROMPT_VERSION: &str = "v2";
+const PROMPT_VERSION: &str = "v3";
 
 struct Summarizer {
     model: ModelForCausalLM,
@@ -30,7 +30,7 @@ impl Summarizer {
     fn load() -> Result<Self> {
         let spec = std::env::var("SYNTY_LLM").unwrap_or_else(|_| REPO.to_string());
         let dir = crate::model::ensure_repo(&spec, FILES)?;
-        let device = Device::Cpu;
+        let device = select_device();
         let tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
         let cfg: Config = serde_json::from_reader(std::fs::File::open(dir.join("config.json"))?)
             .context("parse qwen config")?;
@@ -45,13 +45,13 @@ impl Summarizer {
     }
 
     /// Greedy-decode a single completion for `prompt`, stopping at the chat
-    /// end-of-turn token.
-    fn generate(&mut self, prompt: &str) -> Result<String> {
+    /// end-of-turn token. Returns the cleaned text and (prompt, output) token counts.
+    fn generate(&mut self, prompt: &str) -> Result<(String, usize, usize)> {
         self.model.clear_kv_cache();
         let enc = self.tok.encode(prompt, false).map_err(|e| anyhow!("encode: {e}"))?;
         let ids = enc.get_ids();
         if ids.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), 0, 0));
         }
         let mut input = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
         let mut pos = 0usize;
@@ -67,25 +67,44 @@ impl Summarizer {
             input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
         }
         let text = self.tok.decode(&out, true).map_err(|e| anyhow!("decode: {e}"))?;
-        Ok(clean(&text))
+        Ok((clean(&text), ids.len(), out.len()))
     }
+}
+
+/// Run the summarizer on the Apple GPU when built with `--features metal`,
+/// falling back to CPU; otherwise CPU. Mirrors the encoder's device choice.
+fn select_device() -> Device {
+    #[cfg(feature = "metal")]
+    {
+        match Device::new_metal(0) {
+            Ok(d) => {
+                eprintln!("summarize: device = Metal (Apple GPU)");
+                return d;
+            }
+            Err(e) => eprintln!("summarize: Metal unavailable ({e}); using CPU"),
+        }
+    }
+    eprintln!("summarize: device = CPU");
+    Device::Cpu
 }
 
 /// One-line instruction prompt in Qwen's chat format, fed the extractive signals
 /// (ask, keyphrases, on-topic turns) for the model to synthesize.
 fn prompt_for(s: &SessionInput) -> String {
     let mut turns = String::new();
-    for t in &s.turns {
-        turns.push_str("- ");
-        turns.push_str(t);
-        turns.push('\n');
+    for (i, t) in s.turns.iter().enumerate() {
+        turns.push_str(&format!("{}. {}\n", i + 1, t));
     }
+    let files = if s.files.is_empty() { "(none recorded)".into() } else { s.files.join(", ") };
     format!(
         "<|im_start|>user\nYou are labeling a developer's coding session for a work-memory index. \
-Write ONE concise past-tense sentence (max 22 words) describing what was done. \
+From the request and the messages below, write ONE concise past-tense sentence (max 24 words) \
+describing what was actually built, changed, investigated, or decided. \
+Ignore greetings, status preambles, and meta-commentary; focus on the substance. \
 No preamble, no quotes, no lists.\n\n\
-Repo: {}\nInitial request: {}\nKey terms: {}\nMessages:\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+Repo: {}\nFiles changed: {}\nInitial request: {}\nKey terms: {}\nMessages (chronological):\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
         s.repo,
+        files,
         s.ask,
         s.keyphrases.join(", "),
         turns,
@@ -109,6 +128,8 @@ fn input_hash(s: &SessionInput) -> String {
     h.update(b"\0");
     h.update(s.keyphrases.join(",").as_bytes());
     h.update(b"\0");
+    h.update(s.files.join(",").as_bytes());
+    h.update(b"\0");
     for t in &s.turns {
         h.update(t.as_bytes());
         h.update(b"\0");
@@ -125,6 +146,11 @@ pub fn summarize_all() -> Result<()> {
         .iter()
         .filter(|s| cache.get(&s.id).map(|c| c.hash != input_hash(s)).unwrap_or(true))
         .collect();
+    // Restrict to specific sessions (comma-separated id prefixes) for fast A/B.
+    if let Ok(only) = std::env::var("SYNTY_LLM_ONLY") {
+        let want: Vec<String> = only.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        todo.retain(|s| want.iter().any(|w| s.id.starts_with(w) || crate::short(&s.id) == *w));
+    }
     if let Ok(n) = std::env::var("SYNTY_LLM_LIMIT") {
         if let Ok(n) = n.parse::<usize>() {
             todo.truncate(n);
@@ -135,15 +161,22 @@ pub fn summarize_all() -> Result<()> {
         return Ok(());
     }
     eprintln!("summarizing {} session(s) with {REPO} (CPU)…", todo.len());
+    let t_load = std::time::Instant::now();
     let mut llm = Summarizer::load()?;
+    eprintln!("model loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+
+    let t_gen = std::time::Instant::now();
+    let (mut in_tok, mut out_tok) = (0usize, 0usize);
     for (n, s) in todo.iter().enumerate() {
-        let summary = match llm.generate(&prompt_for(s)) {
-            Ok(t) => t,
+        let (summary, pt, ot) = match llm.generate(&prompt_for(s)) {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("  {} failed: {e}", crate::short(&s.id));
-                String::new()
+                (String::new(), 0, 0)
             }
         };
+        in_tok += pt;
+        out_tok += ot;
         eprintln!("  [{}/{}] {} — {}", n + 1, todo.len(), crate::short(&s.id), summary);
         cache.insert(s.id.clone(), CachedSummary { hash: input_hash(s), summary });
         // Persist periodically so a long CPU pass is resumable.
@@ -152,5 +185,16 @@ pub fn summarize_all() -> Result<()> {
         }
     }
     units::save_summary_cache(&cache)?;
+
+    let secs = t_gen.elapsed().as_secs_f64();
+    eprintln!(
+        "done: {} sessions in {:.1}s — {:.2} s/session, {:.1} output tok/s ({} prompt + {} output tok)",
+        todo.len(),
+        secs,
+        secs / todo.len() as f64,
+        out_tok as f64 / secs,
+        in_tok,
+        out_tok,
+    );
     Ok(())
 }

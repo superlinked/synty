@@ -170,6 +170,9 @@ enum Cmd {
         /// Skip LLM generation; show cached/extractive summaries only.
         #[arg(long)]
         cached: bool,
+        /// Print the raw summarizer inputs (ask/keyphrases/turns) and exit.
+        #[arg(long)]
+        dump: bool,
     },
     /// Run the probe query set and write eval_report.md
     Eval,
@@ -265,15 +268,19 @@ fn main() -> Result<()> {
         }
         Cmd::Status => print!("{}", view::status_md(&view::status()?)),
         Cmd::Tui => tui::run(model_id())?,
-        Cmd::Summarize { sessions, topics, cached } => {
+        Cmd::Summarize { sessions, topics, cached, dump } => {
             let _ = cached;
-            #[cfg(feature = "llm")]
-            if !cached {
-                if let Err(e) = qwen::summarize_all() {
-                    eprintln!("llm summarize skipped: {e}");
+            if dump {
+                summarize::dump_inputs()?;
+            } else {
+                #[cfg(feature = "llm")]
+                if !cached {
+                    if let Err(e) = qwen::summarize_all() {
+                        eprintln!("llm summarize skipped: {e}");
+                    }
                 }
+                summarize::run(sessions, topics)?
             }
-            summarize::run(sessions, topics)?
         }
         Cmd::Eval => eval::run(&model_id())?,
         Cmd::Track { source, out, max_age_days, machine, watch, poll, install, cursors, bucket } => {

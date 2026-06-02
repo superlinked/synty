@@ -69,6 +69,7 @@ pub struct SessionInput {
     pub repo: String,
     pub ask: String,
     pub keyphrases: Vec<String>,
+    pub files: Vec<String>,
     pub turns: Vec<String>,
 }
 
@@ -439,26 +440,33 @@ pub fn session_inputs() -> Result<Vec<SessionInput>> {
                 id: id.clone(),
                 repo: if a.repo.is_empty() { "local".into() } else { a.repo.clone() },
                 ask: a.ask.clone(),
-                turns: top_turns(&a.texts, &kps, 5),
+                files: a.files.iter().take(12).cloned().collect(),
+                turns: top_turns(&a.texts, &kps, 8),
                 keyphrases: kps,
             }
         })
         .collect())
 }
 
-/// The k messages with the most keyphrase coverage (ties toward concision),
-/// each whitespace-collapsed and capped — the material a summarizer reads.
+/// The k messages with the most keyphrase coverage, returned in chronological
+/// order and each capped generously (so the substance after a preamble survives,
+/// not just the generic opener). The material a summarizer reads.
 fn top_turns(texts: &[String], kps: &[String], k: usize) -> Vec<String> {
     let lk: Vec<String> = kps.iter().map(|s| s.to_lowercase()).collect();
-    let mut scored: Vec<(usize, &String)> = texts
+    let mut scored: Vec<(usize, usize, &String)> = texts
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let lt = t.to_lowercase();
-            (lk.iter().filter(|k| lt.contains(k.as_str())).count(), t)
+            (lk.iter().filter(|k| lt.contains(k.as_str())).count(), i, t)
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())));
-    scored.into_iter().take(k).map(|(_, t)| crate::excerpt(t, 240)).collect()
+    // most coverage first; ties toward earlier turns
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut picked: Vec<(usize, &String)> = scored.into_iter().take(k).map(|(_, i, t)| (i, t)).collect();
+    // restore chronological order so the model reads the session in sequence
+    picked.sort_by_key(|(i, _)| *i);
+    picked.into_iter().map(|(_, t)| crate::excerpt(t, 600)).collect()
 }
 
 /// The session's most representative line: the message covering the most of its
