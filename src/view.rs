@@ -69,6 +69,12 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
             wk(2),
             wk(3),
         ));
+        if !t.repos.is_empty() {
+            o.push_str(&format!("repos: {}\n", t.repos.iter().take(6).cloned().collect::<Vec<_>>().join(", ")));
+        }
+        if !t.authors.is_empty() {
+            o.push_str(&format!("authors: {}\n", t.authors.iter().take(6).cloned().collect::<Vec<_>>().join(", ")));
+        }
         for u in t.units.iter().take(6) {
             let tag = match u.kind {
                 Kind::Session => "session",

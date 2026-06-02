@@ -12,7 +12,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -34,12 +34,13 @@ mod theme {
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Topics,
+    Timeline,
     Work,
     Search,
     Status,
 }
-const VIEWS: [View; 4] = [View::Topics, View::Work, View::Search, View::Status];
-const VIEW_NAMES: [&str; 4] = ["1 Topics", "2 Work", "3 Search", "4 Status"];
+const VIEWS: [View; 5] = [View::Topics, View::Timeline, View::Work, View::Search, View::Status];
+const VIEW_NAMES: [&str; 5] = ["1 Topics", "2 Timeline", "3 Work", "4 Search", "5 Status"];
 
 enum SearchMsg {
     Ready,
@@ -205,6 +206,7 @@ impl App {
                 None => self.topics.len(),
                 Some(t) => self.topics.get(t).map(|t| t.units.len()).unwrap_or(0),
             },
+            View::Timeline => self.topics.len(),
             View::Work => self.work.len(),
             View::Search => self.results.len(),
             View::Status => 0,
@@ -215,7 +217,7 @@ impl App {
         match code {
             KeyCode::Tab => return self.cycle(1),
             KeyCode::BackTab => return self.cycle(-1),
-            KeyCode::Char(c @ '1'..='4') => return self.set_view(VIEWS[c as usize - '1' as usize]),
+            KeyCode::Char(c @ '1'..='5') => return self.set_view(VIEWS[c as usize - '1' as usize]),
             _ => {}
         }
         if self.view == View::Search {
@@ -223,9 +225,8 @@ impl App {
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                if self.drill_topic.is_some() {
-                    self.drill_topic = None;
-                    self.sel = 0;
+                if let Some(ti) = self.drill_topic.take() {
+                    self.sel = ti; // back to the topic we drilled
                 } else {
                     self.quit = true;
                 }
@@ -241,9 +242,8 @@ impl App {
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.drill_topic.is_some() {
-                    self.drill_topic = None;
-                    self.sel = 0;
+                if let Some(ti) = self.drill_topic.take() {
+                    self.sel = ti;
                 }
             }
             _ => {}
@@ -294,7 +294,9 @@ impl App {
         self.draw_header(f, top);
         match self.view {
             View::Status => f.render_widget(self.status_para(), body),
-            View::Topics | View::Work | View::Search => self.draw_master_detail(f, body),
+            View::Topics => self.draw_topics(f, body),
+            View::Timeline => self.draw_timeline(f, body),
+            View::Work | View::Search => self.draw_master_detail(f, body),
         }
         // footer: contextual keys (left) · autostart status (right)
         let auto = if self.autostart { " autostart ✓ " } else { " autostart ✗ " };
@@ -332,6 +334,7 @@ impl App {
         match (self.view, self.drill_topic) {
             (View::Topics, Some(t)) => format!("synty › Topics › {}", self.topics.get(t).map(|x| x.label.as_str()).unwrap_or("")),
             (View::Topics, None) => format!("synty › Topics ({})", self.topics.len()),
+            (View::Timeline, _) => format!("synty › Timeline ({})", self.topics.len()),
             (View::Work, _) => format!("synty › Work ({})", self.work.len()),
             (View::Search, _) => format!("synty › Search ({})", self.results.len()),
             (View::Status, _) => "synty › Status".to_string(),
@@ -378,57 +381,152 @@ impl App {
         );
     }
 
+    /// Topics: a full-width list; when drilled, a responsive overlay on top.
+    fn draw_topics(&self, f: &mut Frame, area: Rect) {
+        let (header, widths, rows) = self.build_table();
+        let mut ts = TableState::default();
+        let sel = self.drill_topic.unwrap_or(self.sel);
+        if !rows.is_empty() {
+            ts.select(Some(sel.min(rows.len() - 1)));
+        }
+        let table = Table::new(rows, widths)
+            .header(Row::new(header).style(Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD)))
+            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▌")
+            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)));
+        f.render_stateful_widget(table, area, &mut ts);
+
+        if let Some(ti) = self.drill_topic {
+            if let Some(t) = self.topics.get(ti) {
+                self.draw_topic_overlay(f, area, t);
+            }
+        }
+    }
+
+    /// The drill-down: full-screen on a narrow terminal, else an overlay over the
+    /// right two-thirds of the list.
+    fn draw_topic_overlay(&self, f: &mut Frame, full: Rect, t: &TopicUnits) {
+        let area = if full.width < 100 {
+            full
+        } else {
+            let [_, r] = Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).areas(full);
+            r
+        };
+        f.render_widget(Clear, area);
+        let block = Block::bordered().border_style(Style::new().fg(theme::ACCENT)).title(format!(" {} ", t.label));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let [facets, units] = Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(inner);
+        f.render_widget(Paragraph::new(self.topic_facets(t)).wrap(Wrap { trim: false }), facets);
+
+        let dim = Style::new().fg(theme::DIM);
+        let rows: Vec<Row> = t
+            .units
+            .iter()
+            .map(|u| {
+                let (primary, secondary) = unit_lines(u);
+                Row::new(vec![
+                    Cell::from(u.when.clone()).style(dim),
+                    type_cell(u.kind),
+                    two_line(primary, secondary, kind_color(u.kind)),
+                ])
+                .height(2)
+            })
+            .collect();
+        let mut ts = TableState::default();
+        if !t.units.is_empty() {
+            ts.select(Some(self.sel.min(t.units.len() - 1)));
+        }
+        let table = Table::new(rows, [Constraint::Length(11), Constraint::Length(8), Constraint::Min(20)])
+            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▌");
+        f.render_stateful_widget(table, units, &mut ts);
+    }
+
+    /// Facets for a topic overlay: counts, repos, authors, activity, type mix.
+    fn topic_facets(&self, t: &TopicUnits) -> String {
+        let (gh, asst, prompt) = t.mix;
+        let a = last3(&t.activity);
+        let join = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.iter().take(6).cloned().collect::<Vec<_>>().join(", ") };
+        format!(
+            "{} units · last active {}\nrepos: {}\nauthors: {}\nactivity prior/last/this wk: {} / {} / {}\nmix: {gh} github · {asst} assistant · {prompt} prompt",
+            t.units.len(),
+            t.last_active,
+            join(&t.repos),
+            join(&t.authors),
+            a[0], a[1], a[2],
+        )
+    }
+
+    /// Timeline: a gantt — each topic a row of weekly cells, shaded by activity,
+    /// so you see when each theme was alive and how they overlap. Newest week at
+    /// the right.
+    fn draw_timeline(&self, f: &mut Frame, area: Rect) {
+        let weeks = self.topics.iter().map(|t| t.activity.len()).max().unwrap_or(0);
+        let gmax = self.topics.iter().flat_map(|t| t.activity.iter().copied()).max().unwrap_or(0);
+        let rows: Vec<Row> = self
+            .topics
+            .iter()
+            .map(|t| {
+                let track: Vec<Span> = (0..weeks)
+                    .map(|w| {
+                        let c = t.activity.get(w).copied().unwrap_or(0);
+                        if c == 0 {
+                            Span::styled("·", Style::new().fg(theme::HILITE))
+                        } else {
+                            Span::styled("█", Style::new().fg(shade(c, gmax)))
+                        }
+                    })
+                    .collect();
+                Row::new(vec![
+                    Cell::from(t.label.clone()).style(Style::new().fg(theme::FG)),
+                    Cell::from(Line::from(track)),
+                ])
+            })
+            .collect();
+        let mut ts = TableState::default();
+        if !self.topics.is_empty() {
+            ts.select(Some(self.sel.min(self.topics.len() - 1)));
+        }
+        let axis = format!("◄ older · {weeks} weeks · newer ►");
+        let table = Table::new(rows, [Constraint::Length(22), Constraint::Min(0)])
+            .header(Row::new(vec![Cell::from(""), Cell::from(axis)]).style(Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD)))
+            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▌")
+            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)));
+        f.render_stateful_widget(table, area, &mut ts);
+    }
+
     /// (header, column widths, rows) for the current view's table.
     fn build_table(&self) -> (Vec<&'static str>, Vec<Constraint>, Vec<Row<'static>>) {
         let dim = Style::new().fg(theme::DIM);
         match self.view {
-            View::Topics => match self.drill_topic {
-                None => {
-                    // Shade the 3-week activity on a global scale so topics compare.
-                    let gmax = self.topics.iter().map(|t| last3(&t.activity).into_iter().max().unwrap_or(0)).max().unwrap_or(0);
-                    let rows = self
-                        .topics
-                        .iter()
-                        .map(|t| {
-                            // keyphrase label on top, the latest session summary in the topic below
-                            let latest = t.units.iter().find_map(|u| u.summary.clone()).unwrap_or_default();
-                            Row::new(vec![
-                                two_line(t.label.clone(), latest, theme::FG),
-                                activity_cell(last3(&t.activity), gmax),
-                                Cell::from(t.units.len().to_string()).style(dim),
-                                Cell::from(t.last_active.clone()).style(dim),
-                            ])
-                            .height(2)
-                        })
-                        .collect();
-                    (
-                        vec!["", "ACTIVITY", "UNITS", "LAST"],
-                        vec![Constraint::Min(20), Constraint::Length(8), Constraint::Length(5), Constraint::Length(11)],
-                        rows,
-                    )
-                }
-                Some(ti) => {
-                    let rows = self
-                        .topics
-                        .get(ti)
-                        .map(|t| {
-                            t.units
-                                .iter()
-                                .map(|u| {
-                                    let (primary, secondary) = unit_lines(u);
-                                    Row::new(vec![
-                                        Cell::from(u.when.clone()).style(dim),
-                                        type_cell(u.kind),
-                                        two_line(primary, secondary, kind_color(u.kind)),
-                                    ])
-                                    .height(2)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (vec!["WHEN", "TYPE", ""], vec![Constraint::Length(11), Constraint::Length(8), Constraint::Min(20)], rows)
-                }
-            },
+            // Topics always renders the topic list; its units live in the overlay.
+            View::Topics => {
+                // Shade the 3-week activity on a global scale so topics compare.
+                let gmax = self.topics.iter().map(|t| last3(&t.activity).into_iter().max().unwrap_or(0)).max().unwrap_or(0);
+                let rows = self
+                    .topics
+                    .iter()
+                    .map(|t| {
+                        // keyphrase label on top, the latest session summary in the topic below
+                        let latest = t.units.iter().find_map(|u| u.summary.clone()).unwrap_or_default();
+                        Row::new(vec![
+                            two_line(t.label.clone(), latest, theme::FG),
+                            activity_cell(last3(&t.activity), gmax),
+                            Cell::from(t.units.len().to_string()).style(dim),
+                            Cell::from(t.last_active.clone()).style(dim),
+                        ])
+                        .height(2)
+                    })
+                    .collect();
+                (
+                    vec!["", "ACTIVITY", "UNITS", "LAST"],
+                    vec![Constraint::Min(20), Constraint::Length(8), Constraint::Length(5), Constraint::Length(11)],
+                    rows,
+                )
+            }
             View::Work => {
                 let rows = self
                     .work
@@ -468,52 +566,14 @@ impl App {
                     .collect();
                 (vec!["TYPE", "REPO", ""], vec![Constraint::Length(8), Constraint::Length(12), Constraint::Min(20)], rows)
             }
-            View::Status => (vec![], vec![], vec![]),
+            View::Status | View::Timeline => (vec![], vec![], vec![]),
         }
     }
 
     fn detail_lines(&self) -> String {
         match self.view {
-            View::Topics => match self.drill_topic {
-                None => self.topics.get(self.sel).map(|t| self.topic_detail(t)).unwrap_or_default(),
-                Some(ti) => self
-                    .topics
-                    .get(ti)
-                    .and_then(|t| t.units.get(self.sel))
-                    .map(|u| self.unit_detail(u))
-                    .unwrap_or_default(),
-            },
             View::Work => self.work.get(self.sel).map(|u| self.unit_detail(u)).unwrap_or_default(),
             View::Search => self.results.get(self.sel).and_then(|id| self.doc_by_id.get(id)).map(|&i| doc_detail(&self.docs[i])).unwrap_or_default(),
-            _ => String::new(),
-        }
-    }
-
-    fn topic_detail(&self, t: &TopicUnits) -> String {
-        let (gh, asst, prompt) = t.mix;
-        let n = t.activity.len();
-        let wk = |i: usize| n.checked_sub(i).and_then(|x| t.activity.get(x)).copied().unwrap_or(0);
-        let (this, last, prior) = (wk(1), wk(2), wk(3));
-        let mx = this.max(last).max(prior).max(1);
-        let bar = |c: u64| "█".repeat(((c * 16) / mx) as usize);
-        let mut o = format!(
-            "{}\n\n{} units · last active {}\n\nactivity (docs/week)\n  this   {:<16} {}\n  last   {:<16} {}\n  prior  {:<16} {}\n\nmix: github {gh} · assistant {asst} · prompt {prompt}\n\nunits:\n",
-            t.label, t.units.len(), t.last_active,
-            bar(this), this, bar(last), last, bar(prior), prior,
-        );
-        for u in t.units.iter().take(30) {
-            o.push_str(&format!("· {} {:<7} {}{}\n", u.when, kind_tag(u.kind), u.title, self.unit_keyphrases(u)));
-        }
-        o
-    }
-
-    /// Compact session keyphrases for a unit row (empty for PRs/issues).
-    fn unit_keyphrases(&self, u: &Unit) -> String {
-        if u.kind != Kind::Session {
-            return String::new();
-        }
-        match u.session_id.as_ref().and_then(|s| self.sess_by_id.get(s)).map(|&i| &self.sessions[i].keyphrases) {
-            Some(k) if !k.is_empty() => format!("  [{}]", k.join(", ")),
             _ => String::new(),
         }
     }
@@ -583,12 +643,13 @@ impl App {
                 Engine::Loading => "loading model…",
                 Engine::Searching => "searching…",
                 Engine::Err(e) => return format!("  {e}"),
-                Engine::Ready => "type · Enter search · ↑↓ results · 1-4 views · Esc quit",
+                Engine::Ready => "type · Enter search · ↑↓ results · 1-5 views · Esc quit",
             },
-            View::Topics if self.drill_topic.is_some() => "↑↓ move · h back · 1-4 views · q quit",
-            View::Topics => "↑↓ move · Enter drill · 1-4 views · q quit",
-            View::Status => "1-4 views · Tab cycle · q quit",
-            View::Work => "↑↓ move · 1-4 views · Tab cycle · q quit",
+            View::Topics if self.drill_topic.is_some() => "↑↓ units · h back · 1-5 views · q quit",
+            View::Topics => "↑↓ move · Enter drill · 1-5 views · q quit",
+            View::Timeline => "↑↓ move · 1-5 views · Tab cycle · q quit",
+            View::Status => "1-5 views · Tab cycle · q quit",
+            View::Work => "↑↓ move · 1-5 views · Tab cycle · q quit",
         };
         format!("  {keys}")
     }
@@ -634,23 +695,24 @@ fn last3(activity: &[u64]) -> [u64; 3] {
     [g(3), g(2), g(1)]
 }
 
-/// 3 boxes shaded on a grayscale ramp by each week's activity (vs the global
-/// max), so topics are comparable at a glance.
+/// Grayscale activity ramp, darkest (idle) → brightest (busiest week).
+const SHADES: [Color; 5] = [
+    Color::Rgb(0x33, 0x35, 0x3e),
+    Color::Rgb(0x60, 0x62, 0x6e),
+    Color::Rgb(0x95, 0x97, 0xa4),
+    Color::Rgb(0xc6, 0xc8, 0xd2),
+    Color::Rgb(0xf0, 0xf1, 0xf5),
+];
+
+/// Shade level 0..4 for a week's count against the global max.
+fn shade(count: u64, gmax: u64) -> Color {
+    let lvl = if gmax == 0 || count == 0 { 0 } else { (((count * 4) + gmax - 1) / gmax).min(4) as usize };
+    SHADES[lvl]
+}
+
+/// 3 boxes shaded on the activity ramp (vs the global max), so topics compare.
 fn activity_cell(weeks: [u64; 3], gmax: u64) -> Cell<'static> {
-    const SHADES: [Color; 5] = [
-        Color::Rgb(0x33, 0x35, 0x3e),
-        Color::Rgb(0x60, 0x62, 0x6e),
-        Color::Rgb(0x95, 0x97, 0xa4),
-        Color::Rgb(0xc6, 0xc8, 0xd2),
-        Color::Rgb(0xf0, 0xf1, 0xf5),
-    ];
-    let spans: Vec<Span> = weeks
-        .iter()
-        .map(|&c| {
-            let lvl = if gmax == 0 || c == 0 { 0 } else { (((c * 4) + gmax - 1) / gmax).min(4) as usize };
-            Span::styled("██", Style::new().fg(SHADES[lvl]))
-        })
-        .collect();
+    let spans: Vec<Span> = weeks.iter().map(|&c| Span::styled("██", Style::new().fg(shade(c, gmax)))).collect();
     Cell::from(Line::from(spans))
 }
 
@@ -780,7 +842,7 @@ mod tests {
             Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), struggle: 0.6, doc_id: None, session_id: Some("S1".into()) },
             Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), summary: None, topic: Some(0), struggle: 0.0, doc_id: Some(0), session_id: None },
         ];
-        let topics = vec![TopicUnits { id: 0, label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3) }];
+        let topics = vec![TopicUnits { id: 0, label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()] }];
         App {
             docs,
             doc_by_id,
@@ -823,7 +885,7 @@ mod tests {
         let mut a = app();
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        for label in ["Topics", "Work", "Search", "Status"] {
+        for label in ["Topics", "Timeline", "Work", "Search", "Status"] {
             assert!(text.contains(label), "nav missing {label}");
         }
         assert!(text.contains("autostart"), "footer missing autostart status");
@@ -834,27 +896,47 @@ mod tests {
     }
 
     #[test]
-    fn topic_drill_shows_units_then_session_detail() {
+    fn topic_drill_opens_overlay_with_units_and_facets() {
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
         let mut a = app();
         a.view = View::Topics;
         assert_eq!(a.list_len(), 1); // one topic
         a.on_key(KeyCode::Enter); // drill
         assert_eq!(a.drill_topic, Some(0));
-        assert_eq!(a.list_len(), 2); // its two units
-        // session unit detail mentions effort + counts
-        let d = a.detail_lines();
-        assert!(d.contains("effort"), "detail: {d}");
+        assert_eq!(a.list_len(), 2); // navigation now moves over its two units
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        // overlay shows facets (repos/authors) and a member unit's summary
+        assert!(text.contains("repos:") && text.contains("authors:"), "overlay missing facets: {text}");
+        assert!(text.contains("OCR adapter to the sie"), "overlay missing unit summary");
+        // h restores selection to the drilled topic
         a.on_key(KeyCode::Char('h'));
         assert!(a.drill_topic.is_none());
+        assert_eq!(a.sel, 0);
     }
 
     #[test]
     fn view_switch_by_number() {
         let mut a = app();
         a.on_key(KeyCode::Char('2'));
+        assert!(matches!(a.view, View::Timeline));
+        a.on_key(KeyCode::Char('3'));
         assert!(matches!(a.view, View::Work));
-        a.on_key(KeyCode::Char('4'));
+        a.on_key(KeyCode::Char('5'));
         assert!(matches!(a.view, View::Status));
+    }
+
+    // The timeline shows each topic as a labelled track with a week axis.
+    #[test]
+    fn timeline_renders_topic_tracks() {
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let mut a = app();
+        a.view = View::Timeline;
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("synty › Timeline"), "timeline breadcrumb missing");
+        assert!(text.contains("weeks"), "timeline axis missing");
+        assert!(text.contains("ocr"), "timeline topic label missing");
     }
 
     // Work rows surface the session's one-line summary, not just the ask.

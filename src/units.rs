@@ -103,6 +103,8 @@ pub struct TopicUnits {
     pub last_active: String,
     pub activity: Vec<u64>, // weekly buckets, oldest→newest
     pub mix: (usize, usize, usize), // (github, assistant, prompt) doc counts
+    pub repos: Vec<String>,   // repos involved, most frequent first
+    pub authors: Vec<String>, // authors involved, most frequent first
 }
 
 #[derive(Default)]
@@ -318,7 +320,8 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
             let ts: Vec<String> = cluster_doc_ts(id, &by_id);
             let activity = weekly_buckets(&ts, weeks);
             let mix = cluster_mix(id, &by_id);
-            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix }
+            let (repos, authors) = cluster_facets(id, &by_id);
+            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors }
         })
         .collect();
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));
@@ -404,6 +407,32 @@ fn session_topics() -> Result<HashMap<String, i64>> {
 fn cluster_doc_ts(topic: i64, by_id: &HashMap<i64, &Doc>) -> Vec<String> {
     let dt = doc_topics().unwrap_or_default();
     dt.iter().filter(|(_, t)| **t == topic).filter_map(|(id, _)| by_id.get(id).map(|d| d.meta.ts.clone())).collect()
+}
+
+/// Distinct repos and authors in a cluster, most frequent first.
+fn cluster_facets(topic: i64, by_id: &HashMap<i64, &Doc>) -> (Vec<String>, Vec<String>) {
+    let dt = doc_topics().unwrap_or_default();
+    let (mut repos, mut authors): (HashMap<String, usize>, HashMap<String, usize>) = Default::default();
+    for (id, t) in &dt {
+        if *t != topic {
+            continue;
+        }
+        if let Some(d) = by_id.get(id) {
+            if !d.meta.repo.is_empty() {
+                *repos.entry(d.meta.repo.clone()).or_default() += 1;
+            }
+            if !d.meta.author.is_empty() {
+                *authors.entry(d.meta.author.clone()).or_default() += 1;
+            }
+        }
+    }
+    (by_count(repos), by_count(authors))
+}
+
+fn by_count(m: HashMap<String, usize>) -> Vec<String> {
+    let mut v: Vec<(String, usize)> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.into_iter().map(|(k, _)| k).collect()
 }
 
 fn cluster_mix(topic: i64, by_id: &HashMap<i64, &Doc>) -> (usize, usize, usize) {
