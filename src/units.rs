@@ -28,6 +28,7 @@ pub struct Session {
     pub linked_pr: Option<String>,
     pub topic: Option<i64>,
     pub struggle: f32, // 0..1, normalized across sessions
+    pub keyphrases: Vec<String>,
 }
 
 /// The kind of a unit in a unified list.
@@ -74,6 +75,7 @@ struct Agg {
     files: Vec<String>,
     seen_files: std::collections::HashSet<String>,
     linked_pr: Option<String>,
+    texts: Vec<String>, // message texts for keyphrase extraction
 }
 
 /// Build session units from the raw envelopes, with topic membership and a
@@ -114,13 +116,21 @@ pub fn sessions() -> Result<Vec<Session>> {
                         let t = t.trim();
                         if t.len() >= 12 && !crate::ingest::is_noise(t) {
                             a.prompts += 1;
+                            a.texts.push(t.to_string());
                             if a.ask.is_empty() {
                                 a.ask = crate::excerpt(t, 200);
                             }
                         }
                     }
                 }
-                "assistant_message" => a.assistant += 1,
+                "assistant_message" => {
+                    a.assistant += 1;
+                    if let Some(t) = ev["payload"]["text"].as_str() {
+                        if t.trim().len() >= 12 {
+                            a.texts.push(t.trim().to_string());
+                        }
+                    }
+                }
                 "thinking" => a.thinking += 1,
                 "tool_call" => a.tools += 1,
                 "attachment_ref" => {
@@ -158,6 +168,10 @@ pub fn sessions() -> Result<Vec<Session>> {
     let raw: Vec<[f64; 4]> = ids.iter().map(|id| sig(&aggs[id])).collect();
     let scores = struggle_scores(&raw);
 
+    // c-TF-IDF keyphrases per session, the same extractive labeling as topics.
+    let text_refs: Vec<Vec<&str>> = ids.iter().map(|id| aggs[id].texts.iter().map(String::as_str).collect()).collect();
+    let keyphrases = crate::keyphrase::labels(&text_refs, 4);
+
     let mut out: Vec<Session> = ids
         .iter()
         .enumerate()
@@ -178,6 +192,7 @@ pub fn sessions() -> Result<Vec<Session>> {
                 linked_pr: a.linked_pr.clone(),
                 topic: topic_of.get(id).copied(),
                 struggle: scores[i],
+                keyphrases: keyphrases.get(i).cloned().unwrap_or_default(),
             }
         })
         .collect();
@@ -374,25 +389,6 @@ pub fn weekly_buckets(timestamps: &[String], weeks: usize) -> Vec<u64> {
         }
     }
     out
-}
-
-/// A unicode block sparkline for activity buckets (shared by CLI + TUI text).
-pub fn sparkline(buckets: &[u64]) -> String {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let max = buckets.iter().copied().max().unwrap_or(0);
-    if max == 0 {
-        return " ".repeat(buckets.len());
-    }
-    buckets
-        .iter()
-        .map(|&v| {
-            if v == 0 {
-                ' '
-            } else {
-                BARS[((v as usize * (BARS.len() - 1)) / max as usize).min(BARS.len() - 1)]
-            }
-        })
-        .collect()
 }
 
 fn epoch_day(ts: &str) -> Option<i64> {

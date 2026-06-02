@@ -319,6 +319,17 @@ fn unix_ms(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Whether a login-time autostart unit has been installed (launchd or systemd).
+pub fn autostart_enabled() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    [
+        format!("{home}/Library/LaunchAgents/com.superlinked.synty.plist"),
+        format!("{home}/.config/systemd/user/synty.service"),
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists())
+}
+
 /// Write a login-time autostart unit running `synty track --watch`.
 fn install(kind: &str, o: &Opts) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();

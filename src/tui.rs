@@ -27,6 +27,7 @@ mod theme {
     pub const GITHUB: Color = Color::Rgb(0x86, 0xA1, 0xBC); // sky
     pub const SESSION: Color = Color::Rgb(0xCE, 0xBC, 0xAA); // sand
     pub const PROMPT: Color = Color::Rgb(0xFE, 0xCC, 0xBE); // peach
+    pub const SAGE: Color = Color::Rgb(0x86, 0x95, 0x82); // "on" / open
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -69,6 +70,7 @@ struct App {
     query: String,
     results: Vec<i64>, // doc ids
     engine: Engine,
+    autostart: bool,
     qtx: Option<Sender<String>>,
     rrx: Option<Receiver<SearchMsg>>,
     quit: bool,
@@ -157,6 +159,7 @@ impl App {
             query: String::new(),
             results: vec![],
             engine: Engine::Loading,
+            autostart: crate::track::autostart_enabled(),
             qtx: Some(qtx),
             rrx: Some(rrx),
             quit: false,
@@ -294,7 +297,15 @@ impl App {
             View::Status => f.render_widget(self.status_para(), body),
             View::Topics | View::Work | View::Search => self.draw_master_detail(f, body),
         }
-        f.render_widget(Line::from(self.footer()).fg(theme::DIM), footer);
+        // footer: contextual keys (left) · autostart status (right)
+        let auto = if self.autostart { " autostart ✓ " } else { " autostart ✗ " };
+        let [fkeys, fauto] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(auto.chars().count() as u16)]).areas(footer);
+        f.render_widget(Line::from(self.footer()).fg(theme::DIM), fkeys);
+        f.render_widget(
+            Line::from(auto).fg(if self.autostart { theme::SAGE } else { theme::DIM }).right_aligned(),
+            fauto,
+        );
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -374,7 +385,7 @@ impl App {
 
     fn list_title(&self) -> String {
         match self.view {
-            View::Topics if self.drill_topic.is_none() => format!("topics ({})", self.topics.len()),
+            View::Topics if self.drill_topic.is_none() => format!("topics · recent first ({})", self.topics.len()),
             View::Topics => "units".into(),
             View::Work => format!("work ({})", self.work.len()),
             View::Search => format!("results ({})", self.results.len()),
@@ -401,17 +412,31 @@ impl App {
 
     fn topic_detail(&self, t: &TopicUnits) -> String {
         let (gh, asst, prompt) = t.mix;
+        let n = t.activity.len();
+        let wk = |i: usize| n.checked_sub(i).and_then(|x| t.activity.get(x)).copied().unwrap_or(0);
+        let (this, last, prior) = (wk(1), wk(2), wk(3));
+        let mx = this.max(last).max(prior).max(1);
+        let bar = |c: u64| "█".repeat(((c * 16) / mx) as usize);
         let mut o = format!(
-            "{}\n\n{} units · last active {}\nactivity (12w): {}\nmix: github {gh} · assistant {asst} · prompt {prompt}\n\nunits:\n",
-            t.label,
-            t.units.len(),
-            t.last_active,
-            units::sparkline(&t.activity),
+            "{}\n\n{} units · last active {}\n\nactivity (docs/week)\n  this   {:<16} {}\n  last   {:<16} {}\n  prior  {:<16} {}\n\nmix: github {gh} · assistant {asst} · prompt {prompt}\n\nunits:\n",
+            t.label, t.units.len(), t.last_active,
+            bar(this), this, bar(last), last, bar(prior), prior,
         );
         for u in t.units.iter().take(30) {
-            o.push_str(&format!("· {} {} — {}\n", u.when, kind_tag(u.kind), u.title));
+            o.push_str(&format!("· {} {:<7} {}{}\n", u.when, kind_tag(u.kind), u.title, self.unit_keyphrases(u)));
         }
         o
+    }
+
+    /// Compact session keyphrases for a unit row (empty for PRs/issues).
+    fn unit_keyphrases(&self, u: &Unit) -> String {
+        if u.kind != Kind::Session {
+            return String::new();
+        }
+        match u.session_id.as_ref().and_then(|s| self.sess_by_id.get(s)).map(|&i| &self.sessions[i].keyphrases) {
+            Some(k) if !k.is_empty() => format!("  [{}]", k.join(", ")),
+            _ => String::new(),
+        }
     }
 
     fn unit_detail(&self, u: &Unit) -> String {
@@ -437,6 +462,9 @@ impl App {
             s.thinking,
             s.tools,
         );
+        if !s.keyphrases.is_empty() {
+            o.push_str(&format!("about: {}\n", s.keyphrases.join(", ")));
+        }
         if let Some(pr) = &s.linked_pr {
             o.push_str(&format!("linked PR: {pr}\n"));
         }
@@ -460,45 +488,30 @@ impl App {
     }
 
     fn draw_overview(&self, f: &mut Frame, area: Rect) {
-        let [topics, rest] = Layout::vertical([Constraint::Percentage(55), Constraint::Min(0)]).areas(area);
-        // top active topics with sparklines
+        let [topics, recent] = Layout::vertical([Constraint::Percentage(55), Constraint::Min(0)]).areas(area);
+        // top active topics: label, this-week count, total units, last active
         let rows: Vec<Line> = self
             .topics
             .iter()
             .take(topics.height.saturating_sub(2) as usize)
             .map(|t| {
+                let this = t.activity.last().copied().unwrap_or(0);
                 Line::from(vec![
-                    Span::styled(format!("{:<34} ", trunc(&t.label, 34)), Style::new().fg(theme::FG)),
-                    Span::styled(units::sparkline(&t.activity), Style::new().fg(theme::ACCENT)),
-                    Span::styled(format!("  {} units · {}", t.units.len(), t.last_active), Style::new().fg(theme::DIM)),
+                    Span::styled(format!("{:<38}", trunc(&t.label, 38)), Style::new().fg(theme::FG)),
+                    Span::styled(format!("  {this:>3} this wk", ), Style::new().fg(theme::ACCENT)),
+                    Span::styled(format!("  ·  {} units · {}", t.units.len(), t.last_active), Style::new().fg(theme::DIM)),
                 ])
             })
             .collect();
         f.render_widget(
-            Paragraph::new(rows).block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("active topics")),
+            Paragraph::new(rows).block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("active topics (most recent first)")),
             topics,
         );
 
-        let [recent, spark] = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(rest);
         let recent_rows: Vec<Line> = self.work.iter().take(recent.height.saturating_sub(2) as usize).map(|u| unit_row(u, recent.width as usize)).collect();
         f.render_widget(
             Paragraph::new(recent_rows).block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("recent work")),
             recent,
-        );
-        // overall activity sparkline across all topics
-        let mut total = vec![0u64; 12];
-        for t in &self.topics {
-            for (i, v) in t.activity.iter().enumerate() {
-                if i < 12 {
-                    total[i] += v;
-                }
-            }
-        }
-        f.render_widget(
-            Paragraph::new(units::sparkline(&total))
-                .style(Style::new().fg(theme::ACCENT))
-                .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("activity (12w)")),
-            spark,
         );
     }
 
@@ -553,11 +566,11 @@ fn unit_row(u: &Unit, w: usize) -> Line<'static> {
 }
 
 fn topic_row(t: &TopicUnits, w: usize) -> Line<'static> {
-    let label = trunc(&t.label, w.saturating_sub(24));
+    let meta = format!("  {:>3} units · {}", t.units.len(), t.last_active);
+    let label = trunc(&t.label, w.saturating_sub(meta.chars().count()));
     Line::from(vec![
-        Span::styled(format!("{label:<width$} ", width = w.saturating_sub(24)), Style::new().fg(theme::FG)),
-        Span::styled(units::sparkline(&t.activity), Style::new().fg(theme::ACCENT)),
-        Span::styled(format!(" {:>3}", t.units.len()), Style::new().fg(theme::DIM)),
+        Span::styled(format!("{label:<width$}", width = w.saturating_sub(meta.chars().count())), Style::new().fg(theme::FG)),
+        Span::styled(meta, Style::new().fg(theme::DIM)),
     ])
 }
 
@@ -681,6 +694,7 @@ mod tests {
             linked_pr: None,
             topic: Some(0),
             struggle: 0.6,
+            keyphrases: vec!["ocr".into(), "adapter".into()],
         };
         let work = vec![
             Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), topic: Some(0), struggle: 0.6, doc_id: None, session_id: Some("S1".into()) },
@@ -701,6 +715,7 @@ mod tests {
             query: String::new(),
             results: vec![],
             engine: Engine::Loading,
+            autostart: false,
             qtx: None,
             rrx: None,
             quit: false,
@@ -731,6 +746,7 @@ mod tests {
         for label in ["Overview", "Topics", "Work", "Search", "Status"] {
             assert!(text.contains(label), "nav missing {label}");
         }
+        assert!(text.contains("autostart"), "footer missing autostart status");
     }
 
     #[test]

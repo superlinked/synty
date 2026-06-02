@@ -2,7 +2,7 @@
 // index/tracker status. The TUI renders the same view-models as widgets, so the
 // two surfaces stay at parity.
 
-use crate::units::{self, Kind, TopicUnits, Unit};
+use crate::units::{Kind, TopicUnits, Unit};
 use crate::{load_docs, DOCS_PATH};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -56,13 +56,17 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
     let mut o = format!("# topics ({})\n\n", topics.len());
     for t in topics {
         let (gh, asst, prompt) = t.mix;
+        let n = t.activity.len();
+        let wk = |i: usize| n.checked_sub(i).and_then(|x| t.activity.get(x)).copied().unwrap_or(0);
         o.push_str(&format!(
-            "## {} — {}\n{} units · last active {} · {}  · gh {gh} / asst {asst} / prompt {prompt}\n",
+            "## {} — {}\n{} units · last active {} · activity this/last/prior wk: {}/{}/{} · gh {gh} / asst {asst} / prompt {prompt}\n",
             t.id,
             t.label,
             t.units.len(),
             t.last_active,
-            units::sparkline(&t.activity),
+            wk(1),
+            wk(2),
+            wk(3),
         ));
         for u in t.units.iter().take(6) {
             let tag = match u.kind {
