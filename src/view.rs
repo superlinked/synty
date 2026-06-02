@@ -46,7 +46,8 @@ pub fn work_md(units: &[Unit]) -> String {
             Kind::Issue => "issue",
         };
         let st = if matches!(u.kind, Kind::Session) { format!(" {}", meter(u.struggle)) } else { String::new() };
-        o.push_str(&format!("- `{}` {:<7} _{}_ — {} · {}{}\n", u.when, tag, u.repo, u.title, u.outcome, st));
+        let what = u.summary.as_deref().unwrap_or(&u.title);
+        o.push_str(&format!("- `{}` {:<7} _{}_ — {} · {}{}\n", u.when, tag, u.repo, what, u.outcome, st));
     }
     o
 }

@@ -1,8 +1,9 @@
 // The human surface, built to design_tui.md: a header breadcrumb, a
-// master/detail body, and a context footer; five views (Overview, Topics, Work,
-// Search, Status) over units of work, with activity sparklines and the brand
-// palette. The embedding model loads on a background thread (a search actor) so
-// the first query is instant and the UI never blocks.
+// master/detail body, and a context footer; four views (Topics, Work, Search,
+// Status) over units of work, with a comparable activity column and the brand
+// palette. Session rows are two lines tall: the one-line summary on top, context
+// below. The embedding model loads on a background thread (a search actor) so the
+// first query is instant and the UI never blocks.
 
 use crate::units::{self, Kind, Session, TopicUnits, Unit};
 use crate::{first_line, load_docs, short, Doc, DOCS_PATH, INDEX_PATH};
@@ -10,7 +11,7 @@ use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
@@ -379,12 +380,15 @@ impl App {
                         .topics
                         .iter()
                         .map(|t| {
+                            // keyphrase label on top, the latest session summary in the topic below
+                            let latest = t.units.iter().find_map(|u| u.summary.clone()).unwrap_or_default();
                             Row::new(vec![
-                                Cell::from(t.label.clone()).style(Style::new().fg(theme::FG)),
+                                two_line(t.label.clone(), latest, theme::FG),
                                 activity_cell(last3(&t.activity), gmax),
                                 Cell::from(t.units.len().to_string()).style(dim),
                                 Cell::from(t.last_active.clone()).style(dim),
                             ])
+                            .height(2)
                         })
                         .collect();
                     (
@@ -401,16 +405,18 @@ impl App {
                             t.units
                                 .iter()
                                 .map(|u| {
+                                    let (primary, secondary) = unit_lines(u);
                                     Row::new(vec![
                                         Cell::from(u.when.clone()).style(dim),
                                         type_cell(u.kind),
-                                        Cell::from(format!("{}{}", u.title, self.unit_keyphrases(u))).style(Style::new().fg(kind_color(u.kind))),
+                                        two_line(primary, secondary, kind_color(u.kind)),
                                     ])
+                                    .height(2)
                                 })
                                 .collect()
                         })
                         .unwrap_or_default();
-                    (vec!["WHEN", "TYPE", "TITLE"], vec![Constraint::Length(11), Constraint::Length(8), Constraint::Min(20)], rows)
+                    (vec!["WHEN", "TYPE", "SUMMARY"], vec![Constraint::Length(11), Constraint::Length(8), Constraint::Min(20)], rows)
                 }
             },
             View::Work => {
@@ -418,17 +424,19 @@ impl App {
                     .work
                     .iter()
                     .map(|u| {
+                        let (primary, secondary) = unit_lines(u);
                         Row::new(vec![
                             Cell::from(u.when.clone()).style(dim),
                             type_cell(u.kind),
                             Cell::from(u.repo.clone()).style(dim),
-                            Cell::from(u.title.clone()).style(Style::new().fg(theme::FG)),
+                            two_line(primary, secondary, theme::FG),
                             effort_cell(u),
                         ])
+                        .height(2)
                     })
                     .collect();
                 (
-                    vec!["WHEN", "TYPE", "REPO", "TITLE", "EFFORT"],
+                    vec!["WHEN", "TYPE", "REPO", "SUMMARY", "EFFORT"],
                     vec![Constraint::Length(11), Constraint::Length(8), Constraint::Length(12), Constraint::Min(20), Constraint::Length(6)],
                     rows,
                 )
@@ -602,6 +610,23 @@ fn kind_color(k: Kind) -> Color {
     }
 }
 
+/// A two-line table cell: `primary` in `color` on top, `secondary` dimmed below.
+fn two_line(primary: String, secondary: String, color: Color) -> Cell<'static> {
+    Cell::from(Text::from(vec![
+        Line::from(Span::styled(primary, Style::new().fg(color))),
+        Line::from(Span::styled(secondary, Style::new().fg(theme::DIM))),
+    ]))
+}
+
+/// (primary, secondary) text for a unit row: the one-line summary on top when
+/// present, with the original ask (or PR/issue state) as context below.
+fn unit_lines(u: &Unit) -> (String, String) {
+    match (u.kind, &u.summary) {
+        (Kind::Session, Some(s)) => (s.clone(), u.title.clone()),
+        _ => (u.title.clone(), u.outcome.clone()),
+    }
+}
+
 /// The three most recent weekly buckets as [prior, last, this].
 fn last3(activity: &[u64]) -> [u64; 3] {
     let n = activity.len();
@@ -752,8 +777,8 @@ mod tests {
             summary: Some("Added an OCR adapter to the sie pipeline.".into()),
         };
         let work = vec![
-            Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), topic: Some(0), struggle: 0.6, doc_id: None, session_id: Some("S1".into()) },
-            Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), topic: Some(0), struggle: 0.0, doc_id: Some(0), session_id: None },
+            Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), struggle: 0.6, doc_id: None, session_id: Some("S1".into()) },
+            Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), summary: None, topic: Some(0), struggle: 0.0, doc_id: Some(0), session_id: None },
         ];
         let topics = vec![TopicUnits { id: 0, label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3) }];
         App {
@@ -778,7 +803,7 @@ mod tests {
     }
 
     fn clone_unit(u: &Unit) -> Unit {
-        Unit { kind: u.kind, when: u.when.clone(), repo: u.repo.clone(), title: u.title.clone(), outcome: u.outcome.clone(), topic: u.topic, struggle: u.struggle, doc_id: u.doc_id, session_id: u.session_id.clone() }
+        Unit { kind: u.kind, when: u.when.clone(), repo: u.repo.clone(), title: u.title.clone(), outcome: u.outcome.clone(), summary: u.summary.clone(), topic: u.topic, struggle: u.struggle, doc_id: u.doc_id, session_id: u.session_id.clone() }
     }
 
     #[test]
@@ -827,5 +852,17 @@ mod tests {
         assert!(matches!(a.view, View::Work));
         a.on_key(KeyCode::Char('4'));
         assert!(matches!(a.view, View::Status));
+    }
+
+    // Work rows surface the session's one-line summary, not just the ask.
+    #[test]
+    fn work_rows_show_summary() {
+        let mut term = Terminal::new(TestBackend::new(160, 32)).unwrap();
+        let mut a = app();
+        a.view = View::Work;
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("SUMMARY"), "work header missing SUMMARY");
+        assert!(text.contains("OCR adapter to the sie"), "work row missing summary text: {text}");
     }
 }

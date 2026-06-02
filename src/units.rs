@@ -88,6 +88,7 @@ pub struct Unit {
     pub repo: String,
     pub title: String,
     pub outcome: String, // PR state, or session file/PR summary
+    pub summary: Option<String>, // session's one-line LLM summary, if cached
     pub topic: Option<i64>,
     pub struggle: f32,
     pub doc_id: Option<i64>,    // for PR/issue → docs.jsonl
@@ -260,6 +261,7 @@ pub fn units() -> Result<Vec<Unit>> {
             repo: s.repo.clone(),
             title: if s.ask.is_empty() { format!("session {}", crate::short(&s.id)) } else { s.ask.clone() },
             outcome: session_outcome(&s),
+            summary: s.summary.clone(),
             topic: s.topic,
             struggle: s.struggle,
             doc_id: None,
@@ -281,6 +283,7 @@ pub fn units() -> Result<Vec<Unit>> {
                 repo: d.meta.repo.clone(),
                 title: format!("{}#{} {}", d.meta.repo, d.meta.number.unwrap_or(0), first_line(&d.text)),
                 outcome: d.meta.state.clone().unwrap_or_default(),
+                summary: None,
                 topic: topic_of.get(&d.id).copied(),
                 struggle: 0.0,
                 doc_id: Some(d.id),
