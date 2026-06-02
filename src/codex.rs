@@ -159,7 +159,13 @@ fn handle_response_item(
             }
         }
         "reasoning" => {
-            let text = message_text(p); // same content[].text join
+            // The full reasoning is encrypted; the human-readable `summary[]` is
+            // what survives (on some items). `content[]` is empty in practice.
+            let text = join_texts(p.get("summary")).or_else(|| {
+                let c = message_text(p);
+                (!c.is_empty()).then_some(c)
+            });
+            let text = text.unwrap_or_default();
             vec![ec.event(ts_ms, ts, kind::THINKING, sid, json!({"text": text, "preview": preview(&text)}))]
         }
         "function_call" => {
@@ -208,17 +214,19 @@ fn handle_response_item(
 
 /// Join the non-empty `content[].text` parts of a message payload.
 fn message_text(p: &Value) -> String {
-    let mut parts = Vec::new();
-    if let Some(arr) = p.get("content").and_then(Value::as_array) {
-        for c in arr {
-            if let Some(t) = c.get("text").and_then(Value::as_str) {
-                if !t.is_empty() {
-                    parts.push(t);
-                }
-            }
-        }
-    }
-    parts.join("\n\n")
+    join_texts(p.get("content")).unwrap_or_default()
+}
+
+/// Join the non-empty `text` fields of a `[{..., text}]` array; None if the
+/// array is absent or has no text.
+fn join_texts(v: Option<&Value>) -> Option<String> {
+    let arr = v?.as_array()?;
+    let parts: Vec<&str> = arr
+        .iter()
+        .filter_map(|c| c.get("text").and_then(Value::as_str))
+        .filter(|t| !t.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// A file path from a function_call's JSON-encoded arguments string.

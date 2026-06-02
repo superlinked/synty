@@ -21,6 +21,7 @@ mod sync;
 mod tail;
 mod track;
 mod tui;
+mod units;
 mod up;
 mod view;
 mod index;
@@ -238,18 +239,23 @@ fn main() -> Result<()> {
         }
         Cmd::Cluster { resolution } => cluster::run(resolution)?,
         Cmd::Topic { query } => {
-            let mut topics = view::topics()?;
+            let mut topics = units::topic_units(12)?;
             if let Some(q) = query {
                 let ql = q.to_lowercase();
                 topics.retain(|t| {
                     t.label.to_lowercase().contains(&ql)
-                        || t.members.iter().any(|m| m.to_lowercase().contains(&ql))
+                        || t.units.iter().any(|u| u.title.to_lowercase().contains(&ql))
                 });
             }
             print!("{}", view::topics_md(&topics));
         }
         Cmd::Recent { repo, limit } => {
-            print!("{}", view::recent_md(&view::recent(repo.as_deref(), limit)?));
+            let mut us = units::units()?;
+            if let Some(r) = repo {
+                us.retain(|u| u.repo == r);
+            }
+            us.truncate(limit);
+            print!("{}", view::work_md(&us));
         }
         Cmd::Status => print!("{}", view::status_md(&view::status()?)),
         Cmd::Tui => tui::run(model_id())?,

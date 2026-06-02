@@ -189,7 +189,7 @@ pub fn cap_by_recency(mut docs: Vec<Doc>, cap: usize) -> (Vec<Doc>, usize) {
 
 /// System-injected pseudo-prompts (hook echoes, tool output, reminders) carry
 /// no user intent and pollute retrieval/clustering.
-fn is_noise(t: &str) -> bool {
+pub(crate) fn is_noise(t: &str) -> bool {
     const MARKERS: &[&str] = &[
         "<task-notification", "<bash-input", "<bash-stdout", "<bash-stderr",
         "<command-", "<local-command", "<system-reminder", "<user-prompt-submit-hook",
