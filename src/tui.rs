@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -26,20 +26,18 @@ mod theme {
     pub const DIM: Color = Color::Rgb(0xA0, 0xB4, 0xC1);
     pub const GITHUB: Color = Color::Rgb(0x86, 0xA1, 0xBC); // sky
     pub const SESSION: Color = Color::Rgb(0xCE, 0xBC, 0xAA); // sand
-    pub const PROMPT: Color = Color::Rgb(0xFE, 0xCC, 0xBE); // peach
     pub const SAGE: Color = Color::Rgb(0x86, 0x95, 0x82); // "on" / open
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
-    Overview,
     Topics,
     Work,
     Search,
     Status,
 }
-const VIEWS: [View; 5] = [View::Overview, View::Topics, View::Work, View::Search, View::Status];
-const VIEW_NAMES: [&str; 5] = ["1 Overview", "2 Topics", "3 Work", "4 Search", "5 Status"];
+const VIEWS: [View; 4] = [View::Topics, View::Work, View::Search, View::Status];
+const VIEW_NAMES: [&str; 4] = ["1 Topics", "2 Work", "3 Search", "4 Status"];
 
 enum SearchMsg {
     Ready,
@@ -153,7 +151,7 @@ impl App {
             work,
             topics,
             status,
-            view: View::Overview,
+            view: View::Topics,
             sel: 0,
             drill_topic: None,
             query: String::new(),
@@ -207,7 +205,7 @@ impl App {
             },
             View::Work => self.work.len(),
             View::Search => self.results.len(),
-            View::Overview | View::Status => 0,
+            View::Status => 0,
         }
     }
 
@@ -215,7 +213,7 @@ impl App {
         match code {
             KeyCode::Tab => return self.cycle(1),
             KeyCode::BackTab => return self.cycle(-1),
-            KeyCode::Char(c @ '1'..='5') => return self.set_view(VIEWS[c as usize - '1' as usize]),
+            KeyCode::Char(c @ '1'..='4') => return self.set_view(VIEWS[c as usize - '1' as usize]),
             _ => {}
         }
         if self.view == View::Search {
@@ -293,7 +291,6 @@ impl App {
             Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
         self.draw_header(f, top);
         match self.view {
-            View::Overview => self.draw_overview(f, body),
             View::Status => f.render_widget(self.status_para(), body),
             View::Topics | View::Work | View::Search => self.draw_master_detail(f, body),
         }
@@ -349,20 +346,19 @@ impl App {
         } else {
             area
         };
-        let [left, right] = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(split);
+        let [left, right] = Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).areas(split);
 
-        let items = self.list_items(left.width.saturating_sub(2) as usize);
-        let mut st = ListState::default();
-        if !items.is_empty() {
-            st.select(Some(self.sel.min(items.len() - 1)));
+        let (header, widths, rows) = self.build_table();
+        let mut ts = TableState::default();
+        if !rows.is_empty() {
+            ts.select(Some(self.sel.min(rows.len() - 1)));
         }
-        f.render_stateful_widget(
-            List::new(items)
-                .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(self.list_title()))
-                .highlight_style(Style::new().add_modifier(Modifier::REVERSED).fg(theme::ACCENT)),
-            left,
-            &mut st,
-        );
+        let table = Table::new(rows, widths)
+            .header(Row::new(header).style(Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD)))
+            .row_highlight_style(Style::new().fg(theme::ACCENT).add_modifier(Modifier::REVERSED))
+            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(self.list_title()));
+        f.render_stateful_widget(table, left, &mut ts);
+
         f.render_widget(
             Paragraph::new(self.detail_lines())
                 .wrap(Wrap { trim: false })
@@ -371,15 +367,90 @@ impl App {
         );
     }
 
-    fn list_items(&self, w: usize) -> Vec<Line<'static>> {
+    /// (header, column widths, rows) for the current view's table.
+    fn build_table(&self) -> (Vec<&'static str>, Vec<Constraint>, Vec<Row<'static>>) {
+        let dim = Style::new().fg(theme::DIM);
         match self.view {
             View::Topics => match self.drill_topic {
-                None => self.topics.iter().map(|t| topic_row(t, w)).collect(),
-                Some(ti) => self.topics.get(ti).map(|t| t.units.iter().map(|u| unit_row(u, w)).collect()).unwrap_or_default(),
+                None => {
+                    // Shade the 3-week activity on a global scale so topics compare.
+                    let gmax = self.topics.iter().map(|t| last3(&t.activity).into_iter().max().unwrap_or(0)).max().unwrap_or(0);
+                    let rows = self
+                        .topics
+                        .iter()
+                        .map(|t| {
+                            Row::new(vec![
+                                Cell::from(t.label.clone()).style(Style::new().fg(theme::FG)),
+                                activity_cell(last3(&t.activity), gmax),
+                                Cell::from(t.units.len().to_string()).style(dim),
+                                Cell::from(t.last_active.clone()).style(dim),
+                            ])
+                        })
+                        .collect();
+                    (
+                        vec!["TOPIC", "ACTIVITY", "UNITS", "LAST"],
+                        vec![Constraint::Min(20), Constraint::Length(8), Constraint::Length(5), Constraint::Length(11)],
+                        rows,
+                    )
+                }
+                Some(ti) => {
+                    let rows = self
+                        .topics
+                        .get(ti)
+                        .map(|t| {
+                            t.units
+                                .iter()
+                                .map(|u| {
+                                    Row::new(vec![
+                                        Cell::from(u.when.clone()).style(dim),
+                                        type_cell(u.kind),
+                                        Cell::from(format!("{}{}", u.title, self.unit_keyphrases(u))).style(Style::new().fg(kind_color(u.kind))),
+                                    ])
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (vec!["WHEN", "TYPE", "TITLE"], vec![Constraint::Length(11), Constraint::Length(8), Constraint::Min(20)], rows)
+                }
             },
-            View::Work => self.work.iter().map(|u| unit_row(u, w)).collect(),
-            View::Search => self.results.iter().filter_map(|id| self.doc_by_id.get(id)).map(|&i| doc_row(&self.docs[i], w)).collect(),
-            _ => vec![],
+            View::Work => {
+                let rows = self
+                    .work
+                    .iter()
+                    .map(|u| {
+                        Row::new(vec![
+                            Cell::from(u.when.clone()).style(dim),
+                            type_cell(u.kind),
+                            Cell::from(u.repo.clone()).style(dim),
+                            Cell::from(u.title.clone()).style(Style::new().fg(theme::FG)),
+                            effort_cell(u),
+                        ])
+                    })
+                    .collect();
+                (
+                    vec!["WHEN", "TYPE", "REPO", "TITLE", "EFFORT"],
+                    vec![Constraint::Length(11), Constraint::Length(8), Constraint::Length(12), Constraint::Min(20), Constraint::Length(6)],
+                    rows,
+                )
+            }
+            View::Search => {
+                let rows = self
+                    .results
+                    .iter()
+                    .filter_map(|id| self.doc_by_id.get(id))
+                    .map(|&i| {
+                        let d = &self.docs[i];
+                        let (k, title) = doc_kind_title(d);
+                        Row::new(vec![
+                            type_cell(k),
+                            Cell::from(if d.meta.repo.is_empty() { "local".into() } else { d.meta.repo.clone() }).style(dim),
+                            Cell::from(title).style(Style::new().fg(kind_color(k))),
+                        ])
+                    })
+                    .collect();
+                (vec!["TYPE", "REPO", "TITLE"], vec![Constraint::Length(8), Constraint::Length(12), Constraint::Min(20)], rows)
+            }
+            View::Status => (vec![], vec![], vec![]),
         }
     }
 
@@ -487,34 +558,6 @@ impl App {
         o
     }
 
-    fn draw_overview(&self, f: &mut Frame, area: Rect) {
-        let [topics, recent] = Layout::vertical([Constraint::Percentage(55), Constraint::Min(0)]).areas(area);
-        // top active topics: label, this-week count, total units, last active
-        let rows: Vec<Line> = self
-            .topics
-            .iter()
-            .take(topics.height.saturating_sub(2) as usize)
-            .map(|t| {
-                let this = t.activity.last().copied().unwrap_or(0);
-                Line::from(vec![
-                    Span::styled(format!("{:<38}", trunc(&t.label, 38)), Style::new().fg(theme::FG)),
-                    Span::styled(format!("  {this:>3} this wk", ), Style::new().fg(theme::ACCENT)),
-                    Span::styled(format!("  ·  {} units · {}", t.units.len(), t.last_active), Style::new().fg(theme::DIM)),
-                ])
-            })
-            .collect();
-        f.render_widget(
-            Paragraph::new(rows).block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("active topics (most recent first)")),
-            topics,
-        );
-
-        let recent_rows: Vec<Line> = self.work.iter().take(recent.height.saturating_sub(2) as usize).map(|u| unit_row(u, recent.width as usize)).collect();
-        f.render_widget(
-            Paragraph::new(recent_rows).block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title("recent work")),
-            recent,
-        );
-    }
-
     fn status_para(&self) -> Paragraph<'static> {
         Paragraph::new(crate::view::status_md(&self.status))
             .wrap(Wrap { trim: false })
@@ -527,12 +570,12 @@ impl App {
                 Engine::Loading => "loading model…",
                 Engine::Searching => "searching…",
                 Engine::Err(e) => return format!("  {e}"),
-                Engine::Ready => "type · Enter search · ↑↓ results · 1-5 views · Esc quit",
+                Engine::Ready => "type · Enter search · ↑↓ results · 1-4 views · Esc quit",
             },
-            View::Topics if self.drill_topic.is_some() => "↑↓ move · h back · 1-5 views · q quit",
-            View::Topics => "↑↓ move · Enter drill · 1-5 views · q quit",
-            View::Overview | View::Status => "1-5 views · Tab cycle · q quit",
-            View::Work => "↑↓ move · 1-5 views · Tab cycle · q quit",
+            View::Topics if self.drill_topic.is_some() => "↑↓ move · h back · 1-4 views · q quit",
+            View::Topics => "↑↓ move · Enter drill · 1-4 views · q quit",
+            View::Status => "1-4 views · Tab cycle · q quit",
+            View::Work => "↑↓ move · 1-4 views · Tab cycle · q quit",
         };
         format!("  {keys}")
     }
@@ -554,33 +597,52 @@ fn kind_color(k: Kind) -> Color {
     }
 }
 
-fn unit_row(u: &Unit, w: usize) -> Line<'static> {
-    let head = format!("{} {:<7} ", u.when, kind_tag(u.kind));
-    let body = trunc(&format!("{}: {}", u.repo, u.title), w.saturating_sub(head.len() + 6));
-    let strug = if matches!(u.kind, Kind::Session) { format!(" {}", heat(u.struggle)) } else { String::new() };
-    Line::from(vec![
-        Span::styled(head, Style::new().fg(theme::DIM)),
-        Span::styled(body, Style::new().fg(kind_color(u.kind))),
-        Span::styled(strug, Style::new().fg(theme::ACCENT)),
-    ])
+/// The three most recent weekly buckets as [prior, last, this].
+fn last3(activity: &[u64]) -> [u64; 3] {
+    let n = activity.len();
+    let g = |i: usize| n.checked_sub(i).and_then(|x| activity.get(x)).copied().unwrap_or(0);
+    [g(3), g(2), g(1)]
 }
 
-fn topic_row(t: &TopicUnits, w: usize) -> Line<'static> {
-    let meta = format!("  {:>3} units · {}", t.units.len(), t.last_active);
-    let label = trunc(&t.label, w.saturating_sub(meta.chars().count()));
-    Line::from(vec![
-        Span::styled(format!("{label:<width$}", width = w.saturating_sub(meta.chars().count())), Style::new().fg(theme::FG)),
-        Span::styled(meta, Style::new().fg(theme::DIM)),
-    ])
+/// 3 boxes shaded on a grayscale ramp by each week's activity (vs the global
+/// max), so topics are comparable at a glance.
+fn activity_cell(weeks: [u64; 3], gmax: u64) -> Cell<'static> {
+    const SHADES: [Color; 5] = [
+        Color::Rgb(0x33, 0x35, 0x3e),
+        Color::Rgb(0x60, 0x62, 0x6e),
+        Color::Rgb(0x95, 0x97, 0xa4),
+        Color::Rgb(0xc6, 0xc8, 0xd2),
+        Color::Rgb(0xf0, 0xf1, 0xf5),
+    ];
+    let spans: Vec<Span> = weeks
+        .iter()
+        .map(|&c| {
+            let lvl = if gmax == 0 || c == 0 { 0 } else { (((c * 4) + gmax - 1) / gmax).min(4) as usize };
+            Span::styled("██", Style::new().fg(SHADES[lvl]))
+        })
+        .collect();
+    Cell::from(Line::from(spans))
 }
 
-fn doc_row(d: &Doc, w: usize) -> Line<'static> {
-    let (color, title) = match d.meta.kind.as_str() {
-        "pull_request" | "issue" => (theme::GITHUB, format!("{}#{} {}", d.meta.repo, d.meta.number.unwrap_or(0), first_line(&d.text))),
-        "user_prompt" => (theme::PROMPT, format!("prompt {} {}", short(&d.meta.session_id), first_line(&d.text))),
-        _ => (theme::SESSION, format!("{} {}", short(&d.meta.session_id), first_line(&d.text))),
-    };
-    Line::from(Span::styled(trunc(&title, w), Style::new().fg(color)))
+fn type_cell(k: Kind) -> Cell<'static> {
+    Cell::from(kind_tag(k)).style(Style::new().fg(kind_color(k)))
+}
+
+/// A 3-cell effort bar from a session's struggle score; empty for PR/issue.
+fn effort_cell(u: &Unit) -> Cell<'static> {
+    if u.kind != Kind::Session {
+        return Cell::from("");
+    }
+    let filled = (u.struggle * 3.0).round().clamp(0.0, 3.0) as usize;
+    Cell::from(format!("{}{}", "▰".repeat(filled), "▱".repeat(3 - filled))).style(Style::new().fg(theme::ACCENT))
+}
+
+fn doc_kind_title(d: &Doc) -> (Kind, String) {
+    match d.meta.kind.as_str() {
+        "pull_request" => (Kind::Pr, format!("{}#{} {}", d.meta.repo, d.meta.number.unwrap_or(0), first_line(&d.text))),
+        "issue" => (Kind::Issue, format!("{}#{} {}", d.meta.repo, d.meta.number.unwrap_or(0), first_line(&d.text))),
+        _ => (Kind::Session, format!("{} {}", short(&d.meta.session_id), first_line(&d.text))),
+    }
 }
 
 fn doc_detail(d: &Doc) -> String {
@@ -595,22 +657,8 @@ fn doc_detail(d: &Doc) -> String {
     o
 }
 
-/// One block char whose shade tracks the struggle score.
-fn heat(score: f32) -> char {
-    const BARS: [char; 5] = ['▁', '▂', '▄', '▆', '█'];
-    BARS[((score * 4.0).round().clamp(0.0, 4.0)) as usize]
-}
-
 fn day(ts: &str) -> String {
     ts.split('T').next().unwrap_or("").to_string()
-}
-
-fn trunc(s: &str, w: usize) -> String {
-    if w == 0 || s.chars().count() <= w {
-        s.to_string()
-    } else {
-        s.chars().take(w.saturating_sub(1)).collect::<String>() + "…"
-    }
 }
 
 fn spawn_search(model_id: String) -> (Sender<String>, Receiver<SearchMsg>) {
@@ -709,7 +757,7 @@ mod tests {
             work,
             topics,
             status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![], by_repo: vec![], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None },
-            view: View::Overview,
+            view: View::Topics,
             sel: 0,
             drill_topic: None,
             query: String::new(),
@@ -743,10 +791,11 @@ mod tests {
         let mut a = app();
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        for label in ["Overview", "Topics", "Work", "Search", "Status"] {
+        for label in ["Topics", "Work", "Search", "Status"] {
             assert!(text.contains(label), "nav missing {label}");
         }
         assert!(text.contains("autostart"), "footer missing autostart status");
+        assert!(text.contains("TOPIC") && text.contains("ACTIVITY"), "topics table missing headers");
     }
 
     #[test]
@@ -767,9 +816,9 @@ mod tests {
     #[test]
     fn view_switch_by_number() {
         let mut a = app();
-        a.on_key(KeyCode::Char('3'));
+        a.on_key(KeyCode::Char('2'));
         assert!(matches!(a.view, View::Work));
-        a.on_key(KeyCode::Char('5'));
+        a.on_key(KeyCode::Char('4'));
         assert!(matches!(a.view, View::Status));
     }
 }
