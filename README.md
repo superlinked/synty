@@ -45,6 +45,17 @@ cargo run --release -- search "docs search fix" --filter repo=sie-web
 Results are ranked Markdown cards — PRs, issues, and session moments — that you
 or an agent can read directly. No accounts, no network calls.
 
+Prefer to browse? `cargo run --release -- tui` opens an interactive terminal UI:
+tabs for **status**, **topics**, **recent**, and **search**, with drill-down
+from a topic into its sessions and the full document text. The CLI has the same
+surface for agents and scripts:
+
+```sh
+cargo run --release -- topic            # emergent topics (or `topic ocr` to filter)
+cargo run --release -- recent           # latest PRs, issues, and prompts
+cargo run --release -- status           # what's indexed and how fresh it is
+```
+
 ### Or run the steps yourself
 
 `up` is just a loop over these (handy for one-off use or scripting):
