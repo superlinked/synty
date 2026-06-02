@@ -28,6 +28,7 @@ mod theme {
     pub const GITHUB: Color = Color::Rgb(0x86, 0xA1, 0xBC); // sky
     pub const SESSION: Color = Color::Rgb(0xCE, 0xBC, 0xAA); // sand
     pub const SAGE: Color = Color::Rgb(0x86, 0x95, 0x82); // "on" / open
+    pub const HILITE: Color = Color::Rgb(0x35, 0x3A, 0x4E); // selected-row background
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -356,7 +357,8 @@ impl App {
         }
         let table = Table::new(rows, widths)
             .header(Row::new(header).style(Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD)))
-            .row_highlight_style(Style::new().fg(theme::ACCENT).add_modifier(Modifier::REVERSED))
+            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▌")
             .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(self.list_title()));
         f.render_stateful_widget(table, left, &mut ts);
 

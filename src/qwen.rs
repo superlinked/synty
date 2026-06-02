@@ -16,7 +16,7 @@ const REPO: &str = "Qwen/Qwen3-0.6B";
 const FILES: &[&str] = &["tokenizer.json", "config.json", "model.safetensors"];
 const MAX_NEW: usize = 64;
 // Bump when the prompt changes so cached summaries regenerate.
-const PROMPT_VERSION: &str = "v3";
+const PROMPT_VERSION: &str = "v5";
 
 struct Summarizer {
     model: ModelForCausalLM,
@@ -97,11 +97,12 @@ fn prompt_for(s: &SessionInput) -> String {
     }
     let files = if s.files.is_empty() { "(none recorded)".into() } else { s.files.join(", ") };
     format!(
-        "<|im_start|>user\nYou are labeling a developer's coding session for a work-memory index. \
-From the request and the messages below, write ONE concise past-tense sentence (max 24 words) \
-describing what was actually built, changed, investigated, or decided. \
-Ignore greetings, status preambles, and meta-commentary; focus on the substance. \
-No preamble, no quotes, no lists.\n\n\
+        "<|im_start|>user\nYou are writing a one-line memory of a developer's coding session for a searchable index. \
+Write ONE self-contained past-tense sentence (max 26 words) that a teammate with NO prior context can fully understand. \
+Name the concrete subject — the feature, file, component, repo, or system worked on — instead of vague references like \"the slide\", \"the model\", or \"it\". \
+Say what was built, changed, investigated, or decided, with the key specifics. \
+Skip greetings, status preambles, and meta-commentary. \
+Never echo a field label or output the repository name by itself. No preamble, no quotes, no lists.\n\n\
 Repo: {}\nFiles changed: {}\nInitial request: {}\nKey terms: {}\nMessages (chronological):\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
         s.repo,
         files,
@@ -117,7 +118,17 @@ fn clean(s: &str) -> String {
     let s = s.rsplit("</think>").next().unwrap_or(s);
     let s = s.trim().trim_matches('"').trim();
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s);
-    crate::excerpt(line, 200)
+    let line = crate::excerpt(line, 220);
+    // Reject degenerate outputs that just echo a prompt field; the caller then
+    // falls back to the extractive line.
+    let low = line.to_lowercase();
+    let echo = ["repo:", "files changed:", "initial request:", "key terms:", "messages"]
+        .iter()
+        .any(|p| low.starts_with(p));
+    if line.len() < 15 || echo {
+        return String::new();
+    }
+    line
 }
 
 fn input_hash(s: &SessionInput) -> String {
