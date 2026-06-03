@@ -524,7 +524,7 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
             if let Some(c) = cache.get(&key).filter(|c| !c.summary.is_empty()) {
                 // summary + title + body, capped so units stay comparable in length
                 // (MaxSim is length-biased — long bodies would otherwise hub).
-                let embed = crate::excerpt(&format!("{} {}", c.summary, d.text), 320);
+                let embed = crate::excerpt(&format!("{} {}", c.summary, d.text), 500);
                 out.push(UnitClusterInput { key, summary: c.summary.clone(), embed });
             }
         }
