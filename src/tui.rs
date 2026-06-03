@@ -32,15 +32,6 @@ mod theme {
     pub const HILITE: Color = Color::Rgb(0x35, 0x3A, 0x4E); // selected-row background
     pub const MERGED: Color = Color::Rgb(0xA9, 0x8E, 0xDB); // PR merged (violet)
     pub const CLOSED: Color = Color::Rgb(0xC4, 0x6A, 0x6A); // PR/issue closed (muted red)
-    // Pastels for timeline cards; dark text reads on all of them.
-    pub const BAR_COLORS: [Color; 6] = [
-        Color::Rgb(0xFE, 0xCC, 0xBE), // peach
-        Color::Rgb(0x86, 0xA1, 0xBC), // sky
-        Color::Rgb(0xCE, 0xBC, 0xAA), // sand
-        Color::Rgb(0x86, 0x95, 0x82), // sage
-        Color::Rgb(0xA0, 0xB4, 0xC1), // mist
-        Color::Rgb(0xFD, 0xE4, 0xDD), // blush
-    ];
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -53,6 +44,8 @@ enum View {
 }
 const VIEWS: [View; 5] = [View::Topics, View::Timeline, View::Work, View::Search, View::Status];
 const VIEW_NAMES: [&str; 5] = ["1 Topics", "2 Timeline", "3 Work", "4 Search", "5 Status"];
+const TL_WEEKS: usize = 4; // timeline window: current + 3 prior calendar weeks
+const TL_LABEL_W: u16 = 20; // timeline topic-label column width
 
 enum SearchMsg {
     Ready,
@@ -468,10 +461,10 @@ impl App {
             o.push_str(s);
             o.push_str("\n\n");
         }
+        let when = t.span.as_ref().map(|(x, y)| format!("active {x} → {y}")).unwrap_or_else(|| format!("last active {}", t.last_active));
         o.push_str(&format!(
-            "{} units · last active {}\nrepos: {}\nauthors: {}\nactivity prior/last/this wk: {} / {} / {}\nmix: {sess} sessions · {prs} PRs · {issues} issues",
+            "{} units · {when}\nrepos: {}\npeople: {}\nactivity prior/last/this wk: {} / {} / {}\nmix: {sess} sessions · {prs} PRs · {issues} issues",
             t.units.len(),
-            t.last_active,
             join(&t.repos),
             join(&t.authors),
             a[0], a[1], a[2],
@@ -479,66 +472,75 @@ impl App {
         o
     }
 
-    /// Timeline: a day-level gantt. Each topic is a coloured card positioned and
-    /// sized by its active span, so overlapping themes are visible at a glance.
-    /// ↑↓ selects (details in the status strip); Enter opens the drill overlay.
+    /// Timeline: per-topic activity over the current + last 3 calendar weeks,
+    /// in clearly separated week columns, beside a bigger card for the selected
+    /// topic (description, repos, people). ↑↓ selects; Enter drills into units.
     fn draw_timeline(&self, f: &mut Frame, area: Rect) {
         let block = Block::bordered().border_style(Style::new().fg(theme::BORDER));
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let [axis_a, body_a, status_a] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(3)]).areas(inner);
-
-        // Global day range across all dated topics.
-        let mut lo = i32::MAX;
-        let mut hi = i32::MIN;
-        for t in &self.topics {
-            if let Some((a, b)) = &t.span {
-                if let (Some(x), Some(y)) = (day_num(a), day_num(b)) {
-                    lo = lo.min(x);
-                    hi = hi.max(y);
-                }
-            }
-        }
-        if lo > hi {
-            f.render_widget(Paragraph::new("no dated activity yet").fg(theme::DIM), body_a);
-            return;
-        }
-        let total = (hi - lo + 1) as u32;
-        let w = body_a.width.max(1) as u32;
-        let col = |d: i32| ((d - lo).max(0) as u32 * w / total).min(w - 1) as usize;
         let sel = self.drill_topic.unwrap_or(self.sel);
 
-        let lines: Vec<Line> = self
+        // Shared week grid anchored on the most recent activity across all topics.
+        let Some(gmax) = self.topics.iter().flat_map(|t| &t.units).filter_map(|u| day_num(&u.when)).max() else {
+            f.render_widget(Paragraph::new("no dated activity yet").fg(theme::DIM), inner);
+            return;
+        };
+        let weeks: Vec<[u64; TL_WEEKS]> = self.topics.iter().map(|t| weekly4(t, gmax)).collect();
+        let cap = weeks.iter().flat_map(|w| w.iter().copied()).max().unwrap_or(0);
+
+        let [grid, card] = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(inner);
+        let [head_a, rows_a] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(grid);
+
+        // Week-start labels aligned over the 8-wide blocks (past the label column).
+        let fmt = |n: i32| NaiveDate::from_num_days_from_ce_opt(n).map(|d| d.format("%b %d").to_string()).unwrap_or_default();
+        let mut hdr: Vec<Span> = vec![Span::raw(" ".repeat(TL_LABEL_W as usize + 1))];
+        for c in 0..TL_WEEKS {
+            let start = gmax - 7 * (TL_WEEKS as i32 - 1 - c as i32) - 6;
+            hdr.push(Span::styled(format!("{:<8}", fmt(start)), Style::new().fg(theme::DIM)));
+            if c + 1 < TL_WEEKS {
+                hdr.push(Span::styled(" │ ", Style::new().fg(theme::BORDER)));
+            }
+        }
+        f.render_widget(Paragraph::new(Line::from(hdr)), head_a);
+
+        let rows: Vec<Row> = self
             .topics
             .iter()
             .enumerate()
-            .map(|(i, t)| {
-                let Some((a, b)) = &t.span else { return Line::from("") };
-                let (Some(da), Some(db)) = (day_num(a), day_num(b)) else { return Line::from("") };
-                let x0 = col(da);
-                let x1 = (col(db) + 1).min(w as usize); // inclusive end day
-                let bar_w = x1.saturating_sub(x0).max(1);
-                let style = if i == sel {
-                    Style::new().bg(theme::ACCENT).fg(theme::BG).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::new().bg(theme::BAR_COLORS[i % theme::BAR_COLORS.len()]).fg(theme::BG)
-                };
-                Line::from(vec![Span::raw(" ".repeat(x0)), Span::styled(pad_trunc(&t.label, bar_w), style)])
+            .map(|(i, _)| {
+                let mut strip: Vec<Span> = Vec::new();
+                for c in 0..TL_WEEKS {
+                    let n = weeks[i][c];
+                    strip.push(if n == 0 {
+                        Span::styled("········", Style::new().fg(theme::HILITE))
+                    } else {
+                        Span::styled("████████", Style::new().fg(shade(n, cap)))
+                    });
+                    if c + 1 < TL_WEEKS {
+                        strip.push(Span::styled(" │ ", Style::new().fg(theme::BORDER)));
+                    }
+                }
+                Row::new(vec![
+                    Cell::from(self.topics[i].label.clone()).style(Style::new().fg(theme::FG)),
+                    Cell::from(Line::from(strip)),
+                ])
             })
             .collect();
-        f.render_widget(Paragraph::new(lines), body_a);
-        f.render_widget(Paragraph::new(day_axis(lo, hi, w as usize)).fg(theme::DIM), axis_a);
+        let mut ts = TableState::default();
+        if !self.topics.is_empty() {
+            ts.select(Some(sel.min(self.topics.len() - 1)));
+        }
+        let table = Table::new(rows, [Constraint::Length(TL_LABEL_W), Constraint::Min(0)])
+            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD));
+        f.render_stateful_widget(table, rows_a, &mut ts);
 
-        // Status strip: the selected topic in full (cards truncate).
+        // Bigger card for the selected topic: description, repos, people, mix.
         if let Some(t) = self.topics.get(sel) {
-            let span = t.span.as_ref().map(|(a, b)| format!("{a} → {b}")).unwrap_or_default();
-            let sum = t.summary.clone().unwrap_or_else(|| t.label.clone());
-            let head = Line::from(vec![
-                Span::styled(format!("▸ {}", t.label), Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("   {span} · {} units", t.units.len()), Style::new().fg(theme::DIM)),
-            ]);
-            f.render_widget(Paragraph::new(vec![head, Line::from(sum).fg(theme::FG)]).wrap(Wrap { trim: false }), status_a);
+            let cb = Block::bordered().border_style(Style::new().fg(theme::ACCENT)).title(format!(" {} ", t.label));
+            let ci = cb.inner(card);
+            f.render_widget(cb, card);
+            f.render_widget(Paragraph::new(self.topic_facets(t)).wrap(Wrap { trim: false }), ci);
         }
 
         if let Some(ti) = self.drill_topic {
@@ -762,37 +764,24 @@ fn shade(count: u64, gmax: u64) -> Color {
     SHADES[lvl]
 }
 
-/// Days from the CE epoch for a YYYY-MM-DD day, for positioning on the axis.
+/// Days from the CE epoch for a YYYY-MM-DD day.
 fn day_num(day: &str) -> Option<i32> {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").ok().map(|d| d.num_days_from_ce())
 }
 
-/// A one-row date axis spanning [lo, hi] over `w` columns: start left, end
-/// right, midpoint in between when there is room.
-fn day_axis(lo: i32, hi: i32, w: usize) -> String {
-    let fmt = |n: i32| NaiveDate::from_num_days_from_ce_opt(n).map(|d| d.format("%b %d").to_string()).unwrap_or_default();
-    let (a, b) = (fmt(lo), fmt(hi));
-    if w <= a.len() + b.len() + 1 {
-        return a;
+/// A topic's unit counts in the current + 3 prior weeks on a shared anchor
+/// (`gmax`, days from CE), oldest column first.
+fn weekly4(t: &TopicUnits, gmax: i32) -> [u64; TL_WEEKS] {
+    let mut w = [0u64; TL_WEEKS];
+    for u in &t.units {
+        if let Some(d) = day_num(&u.when) {
+            let ago = (gmax - d).max(0) as usize / 7;
+            if ago < TL_WEEKS {
+                w[TL_WEEKS - 1 - ago] += 1;
+            }
+        }
     }
-    let mid = fmt(lo + (hi - lo) / 2);
-    let gap = w - a.len() - b.len();
-    if gap > mid.len() + 2 {
-        let left = (gap - mid.len()) / 2;
-        format!("{a}{}{mid}{}{b}", " ".repeat(left), " ".repeat(gap - mid.len() - left))
-    } else {
-        format!("{a}{}{b}", " ".repeat(gap))
-    }
-}
-
-/// Truncate to `w` chars and pad to a solid `w`-wide block (a timeline card).
-fn pad_trunc(s: &str, w: usize) -> String {
-    let mut o: String = s.chars().take(w).collect();
-    let n = o.chars().count();
-    if n < w {
-        o.push_str(&" ".repeat(w - n));
-    }
-    o
+    w
 }
 
 /// 3 boxes shaded on the activity ramp (vs the global max), so topics compare.
@@ -1001,7 +990,7 @@ mod tests {
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         // overlay shows facets (repos/authors) and a member unit's summary
-        assert!(text.contains("repos:") && text.contains("authors:"), "overlay missing facets: {text}");
+        assert!(text.contains("repos:") && text.contains("people:"), "overlay missing facets: {text}");
         assert!(text.contains("OCR adapter to the sie"), "overlay missing unit summary");
         // h restores selection to the drilled topic
         a.on_key(KeyCode::Char('h'));
