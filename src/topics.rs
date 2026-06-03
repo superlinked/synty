@@ -79,11 +79,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let mut clusters: Vec<Vec<usize>> = groups.into_values().filter(|v| v.len() >= MIN_CLUSTER).collect();
     clusters.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
 
-    // c-TF-IDF labels over the member summaries.
-    let texts: Vec<Vec<&str>> = clusters.iter().map(|c| c.iter().map(|&m| units[m].summary.as_str()).collect()).collect();
-    let phrases = crate::keyphrase::labels(&texts, 4);
-
-    // unit → cluster index (None if its community was below MIN_CLUSTER).
+    // unit → cluster index from Louvain (None if its community was < MIN_CLUSTER).
     let mut of: Vec<Option<usize>> = vec![None; n];
     for (ci, c) in clusters.iter().enumerate() {
         for &m in c {
@@ -91,18 +87,34 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         }
     }
 
+    // Outlier reassignment: move each unit that's nearer another cluster into it
+    // (one simultaneous pass over the Louvain assignment — no oscillation).
+    let moved = reassign(&results, &mut of);
+    if moved > 0 {
+        eprintln!("topics: reassigned {moved} outlier units to their nearest cluster");
+    }
+
+    // Member lists + c-TF-IDF labels over the *reassigned* membership.
+    let ncl = clusters.len();
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); ncl];
+    for (i, o) in of.iter().enumerate() {
+        if let Some(ci) = o {
+            members[*ci].push(i);
+        }
+    }
+    let texts: Vec<Vec<&str>> = members.iter().map(|c| c.iter().map(|&m| units[m].summary.as_str()).collect()).collect();
+    let phrases = crate::keyphrase::labels(&texts, 4);
+
     let mut assign: Vec<serde_json::Value> = Vec::new();
-    for (ci, c) in clusters.iter().enumerate() {
-        let label = phrases[ci].join(", ");
-        for &m in c {
-            assign.push(serde_json::json!({"key": units[m].key, "cluster": ci, "label": label}));
+    for (i, o) in of.iter().enumerate() {
+        if let Some(ci) = o {
+            assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "label": phrases[*ci].join(", ")}));
         }
     }
     std::fs::write("unit_clusters.json", serde_json::to_string(&assign)?)?;
     eprintln!(
-        "topics: {} units in {} clusters (resolution {resolution}, modularity {q:.3}) → unit_clusters.json",
+        "topics: {} units in {ncl} clusters (resolution {resolution}, modularity {q:.3}) → unit_clusters.json",
         assign.len(),
-        clusters.len()
     );
     report_quality(&results, &of, &phrases, &units);
     Ok(())
@@ -133,6 +145,58 @@ fn build_edges(results: &[next_plaid::QueryResult]) -> HashMap<(usize, usize), f
         }
     }
     edges
+}
+
+/// Reassign outliers to their nearest cluster, iterating a few simultaneous
+/// passes so units left stranded when their neighbors move get cleaned up too.
+/// Capped, so it always terminates. Returns how many units ended up moved.
+fn reassign(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) -> usize {
+    let orig = of.to_vec();
+    for _ in 0..5 {
+        if reassign_once(results, of) == 0 {
+            break;
+        }
+    }
+    (0..of.len()).filter(|&i| of[i] != orig[i]).count()
+}
+
+/// One simultaneous pass: a unit whose best other-cluster neighbor outscores its
+/// best same-cluster neighbor moves into that other cluster. Decisions read the
+/// current assignment and apply at once. Returns how many moved this pass.
+fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) -> usize {
+    let orig = of.to_vec();
+    let mut moved = 0;
+    for (i, r) in results.iter().enumerate() {
+        let Some(ci) = orig[i] else { continue };
+        let (mut a, mut b, mut other) = (0.0f32, 0.0f32, None);
+        for (id, s) in r.passage_ids.iter().zip(r.scores.iter()) {
+            let j = *id as usize;
+            if j == i {
+                continue;
+            }
+            match orig[j] {
+                Some(cj) if cj == ci => {
+                    if a == 0.0 {
+                        a = *s; // first same-cluster neighbor is the best (sorted)
+                    }
+                }
+                Some(cj) => {
+                    if other.is_none() {
+                        b = *s;
+                        other = Some(cj);
+                    }
+                }
+                None => {}
+            }
+        }
+        if let Some(o) = other {
+            if b > a {
+                of[i] = Some(o);
+                moved += 1;
+            }
+        }
+    }
+    moved
 }
 
 /// Cluster-quality report. For each clustered unit, silhouette = (a − b)/max(a,b)
