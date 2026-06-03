@@ -123,7 +123,10 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
 /// kNN edges from MaxSim: normalized per-unit (÷ best neighbor), floored, summed
 /// over both directions so mutual neighbors weigh more. Top-K per unit.
 fn build_edges(results: &[next_plaid::QueryResult]) -> HashMap<(usize, usize), f64> {
-    let mut edges: HashMap<(usize, usize), f64> = HashMap::new();
+    let n = results.len();
+    // Directed normalized weights + each unit's top-K neighbor set.
+    let mut dir: HashMap<(usize, usize), f64> = HashMap::new();
+    let mut topset: Vec<std::collections::HashSet<usize>> = vec![std::collections::HashSet::new(); n];
     for (i, r) in results.iter().enumerate() {
         let pairs: Vec<(usize, f32)> = r
             .passage_ids
@@ -141,7 +144,17 @@ fn build_edges(results: &[next_plaid::QueryResult]) -> HashMap<(usize, usize), f
             if d < FLOOR {
                 continue;
             }
-            *edges.entry((i.min(j), i.max(j))).or_insert(0.0) += d;
+            dir.insert((i, j), d);
+            topset[i].insert(j);
+        }
+    }
+    // Mutual k-NN: keep an edge only if each is in the other's top-K — symmetric
+    // by construction, and it strips the one-way hub/spurious edges MaxSim's
+    // asymmetry produces. Weight is both directions summed.
+    let mut edges: HashMap<(usize, usize), f64> = HashMap::new();
+    for (&(i, j), &w) in &dir {
+        if topset[j].contains(&i) {
+            *edges.entry((i.min(j), i.max(j))).or_insert(0.0) += w;
         }
     }
     edges
@@ -160,14 +173,14 @@ fn reassign(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) -> us
     (0..of.len()).filter(|&i| of[i] != orig[i]).count()
 }
 
-/// One simultaneous pass: a unit whose best other-cluster neighbor outscores its
-/// best same-cluster neighbor moves into that other cluster. Decisions read the
-/// current assignment and apply at once. Returns how many moved this pass.
+/// One simultaneous pass. A *clustered* unit nearer another cluster moves there;
+/// an *orphan* (left unplaced by the mutual-kNN graph) joins its single nearest
+/// cluster — so the tight core is kept while coverage is restored. Decisions
+/// read the current assignment and apply at once. Returns how many changed.
 fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) -> usize {
     let orig = of.to_vec();
     let mut moved = 0;
     for (i, r) in results.iter().enumerate() {
-        let Some(ci) = orig[i] else { continue };
         let (mut a, mut b, mut other) = (0.0f32, 0.0f32, None);
         for (id, s) in r.passage_ids.iter().zip(r.scores.iter()) {
             let j = *id as usize;
@@ -175,7 +188,7 @@ fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) 
                 continue;
             }
             match orig[j] {
-                Some(cj) if cj == ci => {
+                Some(cj) if Some(cj) == orig[i] => {
                     if a == 0.0 {
                         a = *s; // first same-cluster neighbor is the best (sorted)
                     }
@@ -189,8 +202,9 @@ fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) 
                 None => {}
             }
         }
+        // orphan with a placeable neighbor, or a member nearer another cluster
         if let Some(o) = other {
-            if b > a {
+            if (orig[i].is_none() || b > a) && of[i] != Some(o) {
                 of[i] = Some(o);
                 moved += 1;
             }
