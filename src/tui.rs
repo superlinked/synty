@@ -373,7 +373,7 @@ impl App {
         }
         let table = Table::new(rows, widths)
             .header(Row::new(header).style(Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD)))
-            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
+            .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD))
             .highlight_symbol("▌")
             .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)));
         f.render_stateful_widget(table, left, &mut ts);
@@ -396,7 +396,7 @@ impl App {
         }
         let table = Table::new(rows, widths)
             .header(Row::new(header).style(Style::new().fg(theme::DIM).add_modifier(Modifier::BOLD)))
-            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
+            .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD))
             .highlight_symbol("▌")
             .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)));
         f.render_stateful_widget(table, area, &mut ts);
@@ -445,7 +445,7 @@ impl App {
             ts.select(Some(self.sel.min(t.units.len() - 1)));
         }
         let table = Table::new(rows, [Constraint::Length(11), Constraint::Length(8), Constraint::Min(20), Constraint::Length(8)])
-            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
+            .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD))
             .highlight_symbol("▌");
         f.render_stateful_widget(table, units, &mut ts);
     }
@@ -532,7 +532,7 @@ impl App {
             ts.select(Some(sel.min(self.topics.len() - 1)));
         }
         let table = Table::new(rows, [Constraint::Length(TL_LABEL_W), Constraint::Min(0)])
-            .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD));
+            .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD));
         f.render_stateful_widget(table, rows_a, &mut ts);
 
         // Bigger card for the selected topic: description, repos, people, mix.
