@@ -82,6 +82,7 @@ pub enum Kind {
 }
 
 /// A row in the unified Work list / search results / topic membership.
+#[derive(Clone)]
 pub struct Unit {
     pub kind: Kind,
     pub when: String, // day
@@ -314,9 +315,17 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
     let docs = load_docs(DOCS_PATH).unwrap_or_default();
     let by_id: HashMap<i64, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
 
+    // A session appears under every topic it meaningfully contributed to (not
+    // just its majority), so the drill matches the facets; PRs/issues stay in
+    // their single doc cluster.
+    let participation = session_participation().unwrap_or_default();
     let mut by_topic: HashMap<i64, Vec<Unit>> = HashMap::new();
     for u in all {
-        if let Some(t) = u.topic {
+        if let Some(sid) = u.session_id.clone() {
+            for &t in participation.get(&sid).map(Vec::as_slice).unwrap_or_default() {
+                by_topic.entry(t).or_default().push(u.clone());
+            }
+        } else if let Some(t) = u.topic {
             by_topic.entry(t).or_default().push(u);
         }
     }
@@ -411,6 +420,36 @@ fn session_topics() -> Result<HashMap<String, i64>> {
     Ok(tally
         .into_iter()
         .filter_map(|(sid, m)| m.into_iter().max_by_key(|(_, n)| *n).map(|(t, _)| (sid, t)))
+        .collect())
+}
+
+/// session id → every topic it meaningfully contributed to (≥2 of its docs in
+/// that cluster), falling back to its single dominant topic. So a session that
+/// spans themes shows up under each, matching the doc-level facets.
+fn session_participation() -> Result<HashMap<String, Vec<i64>>> {
+    let docs = load_docs(DOCS_PATH).unwrap_or_default();
+    let dt = doc_topics().unwrap_or_default();
+    let mut tally: HashMap<String, HashMap<i64, usize>> = HashMap::new();
+    for d in &docs {
+        if d.meta.session_id.is_empty() {
+            continue;
+        }
+        if let Some(&t) = dt.get(&d.id) {
+            *tally.entry(d.meta.session_id.clone()).or_default().entry(t).or_default() += 1;
+        }
+    }
+    Ok(tally
+        .into_iter()
+        .map(|(sid, m)| {
+            let mut topics: Vec<i64> = m.iter().filter(|(_, n)| **n >= 2).map(|(t, _)| *t).collect();
+            if topics.is_empty() {
+                if let Some((&t, _)) = m.iter().max_by_key(|(_, n)| **n) {
+                    topics.push(t);
+                }
+            }
+            topics.sort_unstable();
+            (sid, topics)
+        })
         .collect())
 }
 
