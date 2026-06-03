@@ -30,6 +30,8 @@ mod theme {
     pub const SESSION: Color = Color::Rgb(0xCE, 0xBC, 0xAA); // sand
     pub const SAGE: Color = Color::Rgb(0x86, 0x95, 0x82); // "on" / open
     pub const HILITE: Color = Color::Rgb(0x35, 0x3A, 0x4E); // selected-row background
+    pub const MERGED: Color = Color::Rgb(0xA9, 0x8E, 0xDB); // PR merged (violet)
+    pub const CLOSED: Color = Color::Rgb(0xC4, 0x6A, 0x6A); // PR/issue closed (muted red)
     // Pastels for timeline cards; dark text reads on all of them.
     pub const BAR_COLORS: [Color; 6] = [
         Color::Rgb(0xFE, 0xCC, 0xBE), // peach
@@ -440,6 +442,7 @@ impl App {
                     Cell::from(u.when.clone()).style(dim),
                     type_cell(u.kind),
                     two_line(primary, secondary, kind_color(u.kind)),
+                    state_cell(u),
                 ])
                 .height(2)
             })
@@ -448,7 +451,7 @@ impl App {
         if !t.units.is_empty() {
             ts.select(Some(self.sel.min(t.units.len() - 1)));
         }
-        let table = Table::new(rows, [Constraint::Length(11), Constraint::Length(8), Constraint::Min(20)])
+        let table = Table::new(rows, [Constraint::Length(11), Constraint::Length(8), Constraint::Min(20), Constraint::Length(8)])
             .row_highlight_style(Style::new().fg(theme::ACCENT).bg(theme::HILITE).add_modifier(Modifier::BOLD))
             .highlight_symbol("▌");
         f.render_stateful_widget(table, units, &mut ts);
@@ -586,14 +589,14 @@ impl App {
                             type_cell(u.kind),
                             Cell::from(u.repo.clone()).style(dim),
                             two_line(primary, secondary, theme::FG),
-                            effort_cell(u),
+                            state_cell(u),
                         ])
                         .height(2)
                     })
                     .collect();
                 (
-                    vec!["WHEN", "TYPE", "REPO", "", "EFFORT"],
-                    vec![Constraint::Length(11), Constraint::Length(8), Constraint::Length(12), Constraint::Min(20), Constraint::Length(7)],
+                    vec!["WHEN", "TYPE", "REPO", "", "STATE"],
+                    vec![Constraint::Length(11), Constraint::Length(8), Constraint::Length(12), Constraint::Min(20), Constraint::Length(8)],
                     rows,
                 )
             }
@@ -728,11 +731,12 @@ fn two_line(primary: String, secondary: String, color: Color) -> Cell<'static> {
 }
 
 /// (primary, secondary) text for a unit row: the one-line summary on top when
-/// present, with the original ask (or PR/issue state) as context below.
+/// present (for sessions, PRs, and issues alike), with the title/ask as context
+/// below. PR/issue status moves to its own column, so it's not a line here.
 fn unit_lines(u: &Unit) -> (String, String) {
-    match (u.kind, &u.summary) {
-        (Kind::Session, Some(s)) => (s.clone(), u.title.clone()),
-        _ => (u.title.clone(), u.outcome.clone()),
+    match &u.summary {
+        Some(s) => (s.clone(), u.title.clone()),
+        None => (u.title.clone(), u.outcome.clone()),
     }
 }
 
@@ -801,13 +805,22 @@ fn type_cell(k: Kind) -> Cell<'static> {
     Cell::from(kind_tag(k)).style(Style::new().fg(kind_color(k)))
 }
 
-/// The shared 5-dot effort meter from a session's struggle score; empty for
-/// PR/issue. Same representation as the CLI and the detail pane.
-fn effort_cell(u: &Unit) -> Cell<'static> {
-    if u.kind != Kind::Session {
-        return Cell::from("");
+/// The per-unit state column: a session's 5-dot effort meter, or a PR/issue's
+/// status (OPEN/MERGED/CLOSED) colored. One column carries both.
+fn state_cell(u: &Unit) -> Cell<'static> {
+    match u.kind {
+        Kind::Session => Cell::from(crate::view::meter(u.struggle)).style(Style::new().fg(theme::ACCENT)),
+        _ => {
+            let st = u.outcome.to_uppercase();
+            let color = match st.as_str() {
+                "OPEN" => theme::SAGE,
+                "MERGED" => theme::MERGED,
+                "CLOSED" => theme::CLOSED,
+                _ => theme::DIM,
+            };
+            Cell::from(st).style(Style::new().fg(color))
+        }
     }
-    Cell::from(crate::view::meter(u.struggle)).style(Style::new().fg(theme::ACCENT))
 }
 
 fn doc_kind_title(d: &Doc) -> (Kind, String) {
