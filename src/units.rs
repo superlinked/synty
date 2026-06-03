@@ -575,6 +575,62 @@ pub fn doc_inputs() -> Result<Vec<DocInput>> {
         .collect())
 }
 
+/// A topic as summarizer input: its label plus excerpts of its most on-theme
+/// documents (so the summary describes the cluster's own content — the same
+/// source as the label — not the unrelated main work of sessions that merely
+/// touched it).
+pub struct TopicInput {
+    pub id: i64,
+    pub label: String,
+    pub texts: Vec<String>,
+}
+
+/// Per-topic inputs for the reduce: the cluster's docs ranked by how many of the
+/// label's keyphrases they contain, top-k excerpted.
+pub fn topic_inputs() -> Result<Vec<TopicInput>> {
+    let docs = load_docs(DOCS_PATH).unwrap_or_default();
+    let dt = doc_topics().unwrap_or_default();
+    let labels = topic_labels()?;
+    let mut by_cluster: HashMap<i64, Vec<&Doc>> = HashMap::new();
+    for d in &docs {
+        if let Some(&c) = dt.get(&d.id) {
+            by_cluster.entry(c).or_default().push(d);
+        }
+    }
+    Ok(by_cluster
+        .into_iter()
+        .map(|(id, ds)| {
+            let label = labels.get(&id).cloned().unwrap_or_default();
+            let kps: Vec<&str> = label.split(", ").collect();
+            let texts = top_docs_by_coverage(&ds, &kps, 10);
+            TopicInput { id, label, texts }
+        })
+        .collect())
+}
+
+/// The k docs containing the most of the given keyphrases (ties toward the more
+/// concise), each excerpted. Docs matching none are dropped.
+fn top_docs_by_coverage(docs: &[&Doc], kps: &[&str], k: usize) -> Vec<String> {
+    let lk: Vec<String> = kps.iter().filter(|w| !w.is_empty()).map(|s| s.to_lowercase()).collect();
+    let mut scored: Vec<(usize, &&Doc)> = docs
+        .iter()
+        .map(|d| {
+            let lt = d.text.to_lowercase();
+            (lk.iter().filter(|w| lt.contains(w.as_str())).count(), d)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.text.len().cmp(&b.1.text.len())));
+    let covered: Vec<String> = scored.iter().filter(|(c, _)| *c > 0).take(k).map(|(_, d)| crate::excerpt(&d.text, 300)).collect();
+    if !covered.is_empty() {
+        return covered;
+    }
+    // Fallback (keyphrases not literal in the text): the k most substantial docs,
+    // so every cluster still gets summarized rather than skipped.
+    let mut by_len: Vec<&&Doc> = docs.iter().collect();
+    by_len.sort_by_key(|d| std::cmp::Reverse(d.text.len()));
+    by_len.into_iter().take(k).map(|d| crate::excerpt(&d.text, 300)).collect()
+}
+
 /// The k messages with the most keyphrase coverage, returned in chronological
 /// order and each capped generously (so the substance after a preamble survives,
 /// not just the generic opener). The material a summarizer reads.

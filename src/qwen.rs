@@ -124,19 +124,19 @@ Repo: {}\nTitle: {}\nBody:\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</th
     )
 }
 
-/// Reduce a topic's member summaries into one description of the theme.
-fn prompt_for_topic(label: &str, members: &[String]) -> String {
+/// Reduce a cluster's representative document excerpts into one theme summary.
+fn prompt_for_topic(label: &str, texts: &[String]) -> String {
     let mut items = String::new();
-    for m in members {
+    for t in texts {
         items.push_str("- ");
-        items.push_str(m);
+        items.push_str(t);
         items.push('\n');
     }
     format!(
-        "<|im_start|>user\nYou are describing a work theme for an index, from the one-line summaries of its items. \
-Write ONE self-contained sentence (max 26 words) capturing what this theme is about and what was done across it. \
-Name concrete subjects; do not just list the items. No preamble, no quotes, no lists.\n\n\
-Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        "<|im_start|>user\nYou are describing a cluster of related engineering work for an index. \
+From the keyphrases and the excerpts below, write ONE self-contained sentence (max 26 words) naming what this area is about and what was done across it. \
+Name concrete subjects; do not quote the excerpts. No preamble, no quotes, no lists.\n\n\
+Keyphrases: {label}\nExcerpts:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
 }
 
@@ -152,18 +152,24 @@ fn strip_opener(s: &str) -> String {
         "the theme focuses on ", "the theme is about ", "the theme is ",
         "the theme includes ", "the theme involves ", "the theme covers ",
         "the theme explores ", "the theme describes ",
-        "this work focuses on ", "this area focuses on ", "this area is ", "the area is ",
-        "this focuses on ", "this involves ", "this covers ", "this describes ",
+        "this cluster focuses on ", "this cluster is about ", "this cluster is ",
+        "this cluster involves ", "this cluster covers ", "this cluster includes ", "this cluster describes ",
+        "this area focuses on ", "this area is about ", "this area is ",
+        "this area involves ", "this area covers ", "this area includes ", "the area is ",
+        "this work focuses on ", "this focuses on ", "this involves ", "this covers ", "this describes ",
+        "about ",
     ];
-    let low = s.to_lowercase();
-    for op in OPENERS {
-        if low.starts_with(op) {
-            let rest = s[op.len()..].trim_start();
-            let mut c = rest.chars();
-            return c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
-        }
+    // Iterate: the model stacks openers ("The area is about developing …"), so
+    // strip up to a few in a row. Capped to avoid eating real leading words.
+    let mut s = s.to_string();
+    for _ in 0..3 {
+        let low = s.to_lowercase();
+        let Some(op) = OPENERS.iter().find(|op| low.starts_with(**op)) else { break };
+        let rest = s[op.len()..].trim_start();
+        let mut c = rest.chars();
+        s = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
     }
-    s.to_string()
+    s
 }
 
 /// Strip any reasoning block, surrounding quotes, and extra lines; collapse to
@@ -214,7 +220,7 @@ struct Job {
 }
 
 /// Salt for the topic (reduce) prompt; bump to regenerate topic summaries only.
-const TOPIC_PROMPT_VERSION: &str = "t3";
+const TOPIC_PROMPT_VERSION: &str = "t5";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -230,24 +236,23 @@ fn unit_jobs() -> Result<Vec<Job>> {
     Ok(jobs)
 }
 
-/// Topic jobs, reduced from the members' (now current) summaries. The hash is
-/// over the label + sorted member summaries, so a topic regenerates exactly when
-/// its membership or any member summary changes.
+/// Topic jobs, reduced from the cluster's most on-theme document excerpts. The
+/// hash is over the label + those excerpts, so a topic regenerates when its
+/// content changes.
 fn topic_jobs() -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
-    for t in units::topic_units(12)? {
-        let members: Vec<String> = t.units.iter().filter_map(|u| u.summary.clone()).take(24).collect();
-        if members.is_empty() {
+    for t in units::topic_inputs()? {
+        if t.texts.is_empty() {
             continue;
         }
-        let mut sorted: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+        let mut sorted: Vec<&str> = t.texts.iter().map(|s| s.as_str()).collect();
         sorted.sort_unstable();
         let mut parts = vec![TOPIC_PROMPT_VERSION, t.label.as_str()];
         parts.extend(sorted);
         jobs.push(Job {
             key: units::topic_key(t.id),
             hash: hash_parts(&parts),
-            prompt: prompt_for_topic(&t.label, &members),
+            prompt: prompt_for_topic(&t.label, &t.texts),
             label: format!("topic:{}", t.id),
         });
     }
@@ -307,6 +312,10 @@ mod tests {
         assert_eq!(strip_opener("This theme focuses on enhancing OCR adapters."), "Enhancing OCR adapters.");
         assert_eq!(strip_opener("The theme includes updating trends and a binary."), "Updating trends and a binary.");
         assert_eq!(strip_opener("The theme is the implementation of a cache."), "The implementation of a cache.");
+        assert_eq!(strip_opener("This cluster focuses on sandbox provisioning."), "Sandbox provisioning.");
+        assert_eq!(strip_opener("This area involves Terraform state locking."), "Terraform state locking.");
+        assert_eq!(strip_opener("About designing the inference deck."), "Designing the inference deck.");
+        assert_eq!(strip_opener("The area is about developing an RLM in a box."), "Developing an RLM in a box.");
         assert_eq!(strip_opener("Integrated MinerU into SIE."), "Integrated MinerU into SIE.");
     }
 }
@@ -333,9 +342,9 @@ pub fn sample(n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Refresh summaries in two passes: units (sessions, PRs, issues) first, then
-/// topics map-reduced from the now-current member summaries. The model loads
-/// once, lazily, only if there is work.
+/// Refresh summaries in two passes — units (sessions, PRs, issues), then topics
+/// reduced from each cluster's representative documents. The model loads once,
+/// lazily, only if there is work.
 pub fn summarize_all() -> Result<()> {
     let mut cache = units::load_summary_cache();
     let mut llm: Option<Summarizer> = None;
@@ -350,10 +359,10 @@ pub fn summarize_all() -> Result<()> {
         llm = Some(Summarizer::load()?);
         let (i, o) = run_jobs(&utodo, &mut cache, llm.as_mut().unwrap(), "unit")?;
         (in_tok, out_tok) = (in_tok + i, out_tok + o);
-        units::save_summary_cache(&cache)?; // so the topic pass reads fresh members
+        units::save_summary_cache(&cache)?;
     }
 
-    // Pass 2: topics, reduced from the fresh member summaries.
+    // Pass 2: topics, reduced from each cluster's representative documents.
     let tjobs = topic_jobs()?;
     let ttodo = pending(&tjobs, &cache);
     if !ttodo.is_empty() {
