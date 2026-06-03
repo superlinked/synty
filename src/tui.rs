@@ -37,15 +37,13 @@ mod theme {
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Topics,
-    Timeline,
     Work,
     Search,
     Status,
 }
-const VIEWS: [View; 5] = [View::Topics, View::Timeline, View::Work, View::Search, View::Status];
-const VIEW_NAMES: [&str; 5] = ["1 Topics", "2 Timeline", "3 Work", "4 Search", "5 Status"];
-const TL_WEEKS: usize = 4; // timeline window: current + 3 prior calendar weeks
-const TL_LABEL_W: u16 = 20; // timeline topic-label column width
+const VIEWS: [View; 4] = [View::Topics, View::Work, View::Search, View::Status];
+const VIEW_NAMES: [&str; 4] = ["1 Topics", "2 Work", "3 Search", "4 Status"];
+const TL_DAYS: usize = 28; // topic activity strip: current + 3 prior weeks, by day
 
 enum SearchMsg {
     Ready,
@@ -207,7 +205,7 @@ impl App {
 
     fn list_len(&self) -> usize {
         match self.view {
-            View::Topics | View::Timeline => match self.drill_topic {
+            View::Topics => match self.drill_topic {
                 None => self.topics.len(),
                 Some(t) => self.topics.get(t).map(|t| t.units.len()).unwrap_or(0),
             },
@@ -221,7 +219,7 @@ impl App {
         match code {
             KeyCode::Tab => return self.cycle(1),
             KeyCode::BackTab => return self.cycle(-1),
-            KeyCode::Char(c @ '1'..='5') => return self.set_view(VIEWS[c as usize - '1' as usize]),
+            KeyCode::Char(c @ '1'..='4') => return self.set_view(VIEWS[c as usize - '1' as usize]),
             _ => {}
         }
         if self.view == View::Search {
@@ -240,7 +238,7 @@ impl App {
             KeyCode::Char('g') => self.sel = 0,
             KeyCode::Char('G') => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if matches!(self.view, View::Topics | View::Timeline) && self.drill_topic.is_none() && !self.topics.is_empty() {
+                if self.view == View::Topics && self.drill_topic.is_none() && !self.topics.is_empty() {
                     self.drill_topic = Some(self.sel);
                     self.sel = 0;
                 }
@@ -299,7 +297,6 @@ impl App {
         match self.view {
             View::Status => f.render_widget(self.status_para(), body),
             View::Topics => self.draw_topics(f, body),
-            View::Timeline => self.draw_timeline(f, body),
             View::Work | View::Search => self.draw_master_detail(f, body),
         }
         // footer: contextual keys (left) · autostart status (right)
@@ -338,8 +335,6 @@ impl App {
         match (self.view, self.drill_topic) {
             (View::Topics, Some(t)) => format!("synty › Topics › {}", self.topics.get(t).map(|x| x.label.as_str()).unwrap_or("")),
             (View::Topics, None) => format!("synty › Topics ({})", self.topics.len()),
-            (View::Timeline, Some(t)) => format!("synty › Timeline › {}", self.topics.get(t).map(|x| x.label.as_str()).unwrap_or("")),
-            (View::Timeline, None) => format!("synty › Timeline ({})", self.topics.len()),
             (View::Work, _) => format!("synty › Work ({})", self.work.len()),
             (View::Search, _) => format!("synty › Search ({})", self.results.len()),
             (View::Status, _) => "synty › Status".to_string(),
@@ -472,83 +467,6 @@ impl App {
         o
     }
 
-    /// Timeline: per-topic activity over the current + last 3 calendar weeks,
-    /// in clearly separated week columns, beside a bigger card for the selected
-    /// topic (description, repos, people). ↑↓ selects; Enter drills into units.
-    fn draw_timeline(&self, f: &mut Frame, area: Rect) {
-        let block = Block::bordered().border_style(Style::new().fg(theme::BORDER));
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let sel = self.drill_topic.unwrap_or(self.sel);
-
-        // Shared week grid anchored on the most recent activity across all topics.
-        let Some(gmax) = self.topics.iter().flat_map(|t| &t.units).filter_map(|u| day_num(&u.when)).max() else {
-            f.render_widget(Paragraph::new("no dated activity yet").fg(theme::DIM), inner);
-            return;
-        };
-        let weeks: Vec<[u64; TL_WEEKS]> = self.topics.iter().map(|t| weekly4(t, gmax)).collect();
-        let cap = weeks.iter().flat_map(|w| w.iter().copied()).max().unwrap_or(0);
-
-        let [grid, card] = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(inner);
-        let [head_a, rows_a] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(grid);
-
-        // Week-start labels aligned over the 8-wide blocks (past the label column).
-        let fmt = |n: i32| NaiveDate::from_num_days_from_ce_opt(n).map(|d| d.format("%b %d").to_string()).unwrap_or_default();
-        let mut hdr: Vec<Span> = vec![Span::raw(" ".repeat(TL_LABEL_W as usize + 1))];
-        for c in 0..TL_WEEKS {
-            let start = gmax - 7 * (TL_WEEKS as i32 - 1 - c as i32) - 6;
-            hdr.push(Span::styled(format!("{:<8}", fmt(start)), Style::new().fg(theme::DIM)));
-            if c + 1 < TL_WEEKS {
-                hdr.push(Span::styled(" │ ", Style::new().fg(theme::BORDER)));
-            }
-        }
-        f.render_widget(Paragraph::new(Line::from(hdr)), head_a);
-
-        let rows: Vec<Row> = self
-            .topics
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let mut strip: Vec<Span> = Vec::new();
-                for c in 0..TL_WEEKS {
-                    let n = weeks[i][c];
-                    strip.push(if n == 0 {
-                        Span::styled("········", Style::new().fg(theme::HILITE))
-                    } else {
-                        Span::styled("████████", Style::new().fg(shade(n, cap)))
-                    });
-                    if c + 1 < TL_WEEKS {
-                        strip.push(Span::styled(" │ ", Style::new().fg(theme::BORDER)));
-                    }
-                }
-                Row::new(vec![
-                    Cell::from(self.topics[i].label.clone()).style(Style::new().fg(theme::FG)),
-                    Cell::from(Line::from(strip)),
-                ])
-            })
-            .collect();
-        let mut ts = TableState::default();
-        if !self.topics.is_empty() {
-            ts.select(Some(sel.min(self.topics.len() - 1)));
-        }
-        let table = Table::new(rows, [Constraint::Length(TL_LABEL_W), Constraint::Min(0)])
-            .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD));
-        f.render_stateful_widget(table, rows_a, &mut ts);
-
-        // Bigger card for the selected topic: description, repos, people, mix.
-        if let Some(t) = self.topics.get(sel) {
-            let cb = Block::bordered().border_style(Style::new().fg(theme::ACCENT)).title(format!(" {} ", t.label));
-            let ci = cb.inner(card);
-            f.render_widget(cb, card);
-            f.render_widget(Paragraph::new(self.topic_facets(t)).wrap(Wrap { trim: false }), ci);
-        }
-
-        if let Some(ti) = self.drill_topic {
-            if let Some(t) = self.topics.get(ti) {
-                self.draw_topic_overlay(f, area, t);
-            }
-        }
-    }
 
     /// (header, column widths, rows) for the current view's table.
     fn build_table(&self) -> (Vec<&'static str>, Vec<Constraint>, Vec<Row<'static>>) {
@@ -556,18 +474,21 @@ impl App {
         match self.view {
             // Topics always renders the topic list; its units live in the overlay.
             View::Topics => {
-                // Shade the 3-week activity on a global scale so topics compare.
-                let gmax = self.topics.iter().map(|t| last3(&t.activity).into_iter().max().unwrap_or(0)).max().unwrap_or(0);
+                // Per-day activity over the last 4 weeks, shaded on a shared scale.
+                let gmax = self.topics.iter().flat_map(|t| &t.units).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
+                let dailies: Vec<[u64; TL_DAYS]> = self.topics.iter().map(|t| daily(t, gmax)).collect();
+                let cap = dailies.iter().flat_map(|d| d.iter().copied()).max().unwrap_or(0);
                 let rows = self
                     .topics
                     .iter()
-                    .map(|t| {
+                    .enumerate()
+                    .map(|(i, t)| {
                         // keyphrase label on top; the reduced topic summary below
                         // (falling back to the latest member's summary)
                         let line = t.summary.clone().or_else(|| t.units.iter().find_map(|u| u.summary.clone())).unwrap_or_default();
                         Row::new(vec![
                             two_line(t.label.clone(), line, theme::FG),
-                            activity_cell(last3(&t.activity), gmax),
+                            day_strip(&dailies[i], cap),
                             Cell::from(t.units.len().to_string()).style(dim),
                             Cell::from(t.last_active.clone()).style(dim),
                         ])
@@ -575,8 +496,8 @@ impl App {
                     })
                     .collect();
                 (
-                    vec!["", "ACTIVITY", "UNITS", "LAST"],
-                    vec![Constraint::Min(20), Constraint::Length(8), Constraint::Length(5), Constraint::Length(11)],
+                    vec!["", "ACTIVITY (4wk by day)", "UNITS", "LAST"],
+                    vec![Constraint::Min(20), Constraint::Length(TL_DAYS as u16 + 3), Constraint::Length(5), Constraint::Length(11)],
                     rows,
                 )
             }
@@ -619,7 +540,7 @@ impl App {
                     .collect();
                 (vec!["TYPE", "REPO", ""], vec![Constraint::Length(8), Constraint::Length(12), Constraint::Min(20)], rows)
             }
-            View::Status | View::Timeline => (vec![], vec![], vec![]),
+            View::Status => (vec![], vec![], vec![]),
         }
     }
 
@@ -696,13 +617,12 @@ impl App {
                 Engine::Loading => "loading model…",
                 Engine::Searching => "searching…",
                 Engine::Err(e) => return format!("  {e}"),
-                Engine::Ready => "type · Enter search · ↑↓ results · 1-5 views · Esc quit",
+                Engine::Ready => "type · Enter search · ↑↓ results · 1-4 views · Esc quit",
             },
-            _ if self.drill_topic.is_some() => "↑↓ units · h back · 1-5 views · q quit",
-            View::Topics => "↑↓ move · Enter drill · 1-5 views · q quit",
-            View::Timeline => "↑↓ move · Enter drill · 1-5 views · q quit",
-            View::Status => "1-5 views · Tab cycle · q quit",
-            View::Work => "↑↓ move · 1-5 views · Tab cycle · q quit",
+            _ if self.drill_topic.is_some() => "↑↓ units · h back · 1-4 views · q quit",
+            View::Topics => "↑↓ move · Enter drill · 1-4 views · q quit",
+            View::Status => "1-4 views · Tab cycle · q quit",
+            View::Work => "↑↓ move · 1-4 views · Tab cycle · q quit",
         };
         format!("  {keys}")
     }
@@ -769,24 +689,35 @@ fn day_num(day: &str) -> Option<i32> {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").ok().map(|d| d.num_days_from_ce())
 }
 
-/// A topic's unit counts in the current + 3 prior weeks on a shared anchor
-/// (`gmax`, days from CE), oldest column first.
-fn weekly4(t: &TopicUnits, gmax: i32) -> [u64; TL_WEEKS] {
-    let mut w = [0u64; TL_WEEKS];
+/// A topic's per-day unit counts over the last `TL_DAYS` on a shared anchor
+/// (`gmax`, days from CE), oldest day first.
+fn daily(t: &TopicUnits, gmax: i32) -> [u64; TL_DAYS] {
+    let mut d = [0u64; TL_DAYS];
     for u in &t.units {
-        if let Some(d) = day_num(&u.when) {
-            let ago = (gmax - d).max(0) as usize / 7;
-            if ago < TL_WEEKS {
-                w[TL_WEEKS - 1 - ago] += 1;
+        if let Some(day) = day_num(&u.when) {
+            let ago = (gmax - day).max(0) as usize;
+            if ago < TL_DAYS {
+                d[TL_DAYS - 1 - ago] += 1;
             }
         }
     }
-    w
+    d
 }
 
-/// 3 boxes shaded on the activity ramp (vs the global max), so topics compare.
-fn activity_cell(weeks: [u64; 3], gmax: u64) -> Cell<'static> {
-    let spans: Vec<Span> = weeks.iter().map(|&c| Span::styled("██", Style::new().fg(shade(c, gmax)))).collect();
+/// One block per day, shaded by that day's activity, grouped into weeks with a
+/// thin `│` divider every 7 days. Newest day on the right.
+fn day_strip(days: &[u64; TL_DAYS], cap: u64) -> Cell<'static> {
+    let mut spans: Vec<Span> = Vec::with_capacity(TL_DAYS + TL_DAYS / 7);
+    for (d, &n) in days.iter().enumerate() {
+        if d > 0 && d % 7 == 0 {
+            spans.push(Span::styled("│", Style::new().fg(theme::BORDER)));
+        }
+        spans.push(if n == 0 {
+            Span::styled("·", Style::new().fg(theme::HILITE))
+        } else {
+            Span::styled("█", Style::new().fg(shade(n, cap)))
+        });
+    }
     Cell::from(Line::from(spans))
 }
 
@@ -968,7 +899,7 @@ mod tests {
         let mut a = app();
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        for label in ["Topics", "Timeline", "Work", "Search", "Status"] {
+        for label in ["Topics", "Work", "Search", "Status"] {
             assert!(text.contains(label), "nav missing {label}");
         }
         assert!(text.contains("autostart"), "footer missing autostart status");
@@ -1002,24 +933,21 @@ mod tests {
     fn view_switch_by_number() {
         let mut a = app();
         a.on_key(KeyCode::Char('2'));
-        assert!(matches!(a.view, View::Timeline));
-        a.on_key(KeyCode::Char('3'));
         assert!(matches!(a.view, View::Work));
-        a.on_key(KeyCode::Char('5'));
+        a.on_key(KeyCode::Char('4'));
         assert!(matches!(a.view, View::Status));
     }
 
-    // The timeline shows each topic as a positioned, labelled card with a date axis.
+    // The topics list shows a per-day activity strip with week dividers.
     #[test]
-    fn timeline_renders_topic_cards() {
+    fn topics_show_day_activity_strip() {
         let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
         let mut a = app();
-        a.view = View::Timeline;
+        a.view = View::Topics;
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("synty › Timeline"), "timeline breadcrumb missing");
-        assert!(text.contains("May"), "timeline date axis missing: {text}");
-        assert!(text.contains("ocr"), "timeline topic card label missing");
+        assert!(text.contains("ACTIVITY"), "topics activity header missing");
+        assert!(text.contains('│'), "week divider missing from activity strip");
     }
 
     // Work rows surface the session's one-line summary, not just the ask.

@@ -71,7 +71,10 @@ Truecolor; degrades to the nearest 16-color on terminals without it.
 ```
 
 Master/detail split ~40/60. The detail pane scrolls. A top tab strip names the
-five views and highlights the active one in accent.
+four views (Topics, Work, Search, Status) and highlights the active one in
+accent. The Topics list carries a per-day activity strip (last four weeks, week
+dividers) and drilling a topic opens an overlay with its description, repos,
+people, and member units.
 
 ## Keymap
 
