@@ -134,10 +134,36 @@ fn prompt_for_topic(label: &str, members: &[String]) -> String {
     }
     format!(
         "<|im_start|>user\nYou are describing a work theme for an index, from the one-line summaries of its items. \
-Write ONE self-contained sentence (max 28 words) capturing what this theme is about and what was done across it. \
+Write ONE self-contained sentence (max 26 words) capturing what this theme is about and what was done across it. \
 Name concrete subjects; do not just list the items. No preamble, no quotes, no lists.\n\n\
 Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
+}
+
+/// Drop a *complete* meta-opener clause including its verb ("This theme focuses
+/// on …", "The theme is …") so the remainder stays grammatical, then
+/// re-capitalize. Removing only "This theme " (without the verb) would leave a
+/// dangling "is/includes …", so the whole clause must go.
+fn strip_opener(s: &str) -> String {
+    const OPENERS: &[&str] = &[
+        "this theme focuses on ", "this theme is about ", "this theme is ",
+        "this theme includes ", "this theme involves ", "this theme covers ",
+        "this theme explores ", "this theme describes ",
+        "the theme focuses on ", "the theme is about ", "the theme is ",
+        "the theme includes ", "the theme involves ", "the theme covers ",
+        "the theme explores ", "the theme describes ",
+        "this work focuses on ", "this area focuses on ", "this area is ", "the area is ",
+        "this focuses on ", "this involves ", "this covers ", "this describes ",
+    ];
+    let low = s.to_lowercase();
+    for op in OPENERS {
+        if low.starts_with(op) {
+            let rest = s[op.len()..].trim_start();
+            let mut c = rest.chars();
+            return c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+        }
+    }
+    s.to_string()
 }
 
 /// Strip any reasoning block, surrounding quotes, and extra lines; collapse to
@@ -146,7 +172,7 @@ fn clean(s: &str) -> String {
     let s = s.rsplit("</think>").next().unwrap_or(s);
     let s = s.trim().trim_matches('"').trim();
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s);
-    let line = crate::excerpt(line, 220);
+    let line = strip_opener(&crate::excerpt(line, 240));
     // Reject degenerate outputs that just echo a prompt field; the caller then
     // falls back to the extractive line.
     let low = line.to_lowercase();
@@ -188,7 +214,7 @@ struct Job {
 }
 
 /// Salt for the topic (reduce) prompt; bump to regenerate topic summaries only.
-const TOPIC_PROMPT_VERSION: &str = "t1";
+const TOPIC_PROMPT_VERSION: &str = "t3";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -264,6 +290,47 @@ fn run_jobs(todo: &[&Job], cache: &mut units::SummaryCache, llm: &mut Summarizer
         }
     }
     Ok((in_tok, out_tok))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_drops_field_echoes() {
+        assert_eq!(clean("repo: synty"), ""); // field echo → extractive fallback
+        assert!(clean("Integrated MinerU into the SIE server.").contains("MinerU"));
+    }
+
+    #[test]
+    fn strip_opener_removes_full_clause_grammatically() {
+        assert_eq!(strip_opener("This theme focuses on enhancing OCR adapters."), "Enhancing OCR adapters.");
+        assert_eq!(strip_opener("The theme includes updating trends and a binary."), "Updating trends and a binary.");
+        assert_eq!(strip_opener("The theme is the implementation of a cache."), "The implementation of a cache.");
+        assert_eq!(strip_opener("Integrated MinerU into SIE."), "Integrated MinerU into SIE.");
+    }
+}
+
+/// A dry run for prompt tuning: generate (but do not cache) the first `n` topic
+/// summaries — or those matching `SYNTY_LLM_ONLY` — and print them to stdout.
+pub fn sample(n: usize) -> Result<()> {
+    let all = topic_jobs()?;
+    let mut sel: Vec<&Job> = all.iter().collect();
+    if let Ok(only) = std::env::var("SYNTY_LLM_ONLY") {
+        let want: Vec<String> = only.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        sel.retain(|j| want.iter().any(|w| j.key.contains(w.as_str())));
+    }
+    sel.truncate(n);
+    if sel.is_empty() {
+        eprintln!("no topic jobs to sample");
+        return Ok(());
+    }
+    let mut llm = Summarizer::load()?;
+    for j in &sel {
+        let (s, _, _) = llm.generate(&j.prompt)?;
+        println!("{} — {s}", j.label);
+    }
+    Ok(())
 }
 
 /// Refresh summaries in two passes: units (sessions, PRs, issues) first, then

@@ -173,6 +173,9 @@ enum Cmd {
         /// Print the raw summarizer inputs (ask/keyphrases/turns) and exit.
         #[arg(long)]
         dump: bool,
+        /// Prompt-tuning dry run: generate (don't cache) N topic summaries and print them.
+        #[arg(long)]
+        sample: Option<usize>,
     },
     /// Run the probe query set and write eval_report.md
     Eval,
@@ -268,18 +271,25 @@ fn main() -> Result<()> {
         }
         Cmd::Status => print!("{}", view::status_md(&view::status()?)),
         Cmd::Tui => tui::run(model_id())?,
-        Cmd::Summarize { sessions, topics, cached, dump } => {
-            let _ = cached;
+        Cmd::Summarize { sessions, topics, cached, dump, sample } => {
+            let _ = (cached, sample);
             if dump {
                 summarize::dump_inputs()?;
             } else {
                 #[cfg(feature = "llm")]
-                if !cached {
-                    if let Err(e) = qwen::summarize_all() {
-                        eprintln!("llm summarize skipped: {e}");
+                match sample {
+                    Some(n) => qwen::sample(n)?,
+                    None => {
+                        if !cached {
+                            if let Err(e) = qwen::summarize_all() {
+                                eprintln!("llm summarize skipped: {e}");
+                            }
+                        }
+                        summarize::run(sessions, topics)?;
                     }
                 }
-                summarize::run(sessions, topics)?
+                #[cfg(not(feature = "llm"))]
+                summarize::run(sessions, topics)?;
             }
         }
         Cmd::Eval => eval::run(&model_id())?,
