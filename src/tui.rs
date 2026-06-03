@@ -457,7 +457,7 @@ impl App {
     /// Facets for a topic overlay: the reduced summary, then counts, repos,
     /// authors, activity, type mix.
     fn topic_facets(&self, t: &TopicUnits) -> String {
-        let (gh, asst, prompt) = t.mix;
+        let (sess, prs, issues) = t.mix;
         let a = last3(&t.activity);
         let join = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.iter().take(6).cloned().collect::<Vec<_>>().join(", ") };
         let mut o = String::new();
@@ -466,7 +466,7 @@ impl App {
             o.push_str("\n\n");
         }
         o.push_str(&format!(
-            "{} units · last active {}\nrepos: {}\nauthors: {}\nactivity prior/last/this wk: {} / {} / {}\nmix: {gh} github · {asst} assistant · {prompt} prompt",
+            "{} units · last active {}\nrepos: {}\nauthors: {}\nactivity prior/last/this wk: {} / {} / {}\nmix: {sess} sessions · {prs} PRs · {issues} issues",
             t.units.len(),
             t.last_active,
             join(&t.repos),
@@ -920,8 +920,8 @@ mod tests {
             summary: Some("Added an OCR adapter to the sie pipeline.".into()),
         };
         let work = vec![
-            Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), struggle: 0.6, doc_id: None, session_id: Some("S1".into()) },
-            Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), summary: None, topic: Some(0), struggle: 0.0, doc_id: Some(0), session_id: None },
+            Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), struggle: 0.6, author: String::new(), doc_id: None, session_id: Some("S1".into()) },
+            Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), summary: None, topic: Some(0), struggle: 0.0, author: "alice".into(), doc_id: Some(0), session_id: None },
         ];
         let topics = vec![TopicUnits { id: 0, label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()), span: Some(("2026-05-29".into(), "2026-05-31".into())) }];
         App {
@@ -946,7 +946,7 @@ mod tests {
     }
 
     fn clone_unit(u: &Unit) -> Unit {
-        Unit { kind: u.kind, when: u.when.clone(), repo: u.repo.clone(), title: u.title.clone(), outcome: u.outcome.clone(), summary: u.summary.clone(), topic: u.topic, struggle: u.struggle, doc_id: u.doc_id, session_id: u.session_id.clone() }
+        Unit { kind: u.kind, when: u.when.clone(), repo: u.repo.clone(), title: u.title.clone(), outcome: u.outcome.clone(), summary: u.summary.clone(), topic: u.topic, struggle: u.struggle, author: u.author.clone(), doc_id: u.doc_id, session_id: u.session_id.clone() }
     }
 
     #[test]

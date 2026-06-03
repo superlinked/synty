@@ -12,6 +12,7 @@ models/
 # Derived projections + run outputs (rebuildable).
 index/
 clusters.json
+unit_clusters.json
 clusters.md
 summary.md
 eval_runs.md

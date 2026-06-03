@@ -31,10 +31,11 @@ Rust binary.
   the other opt-in backends. None may become default.
 - The encoder loads the model from `$SYNTY_MODEL` (point it at a local dir for
   offline use; it otherwise downloads the default model on first run).
-- Pipeline: `ingest` → `index` (encode + build + cache per-doc embeddings) →
-  `search` / `cluster [--resolution]` / `summarize` / `eval`. `index` wipes and
-  rebuilds the `index/` dir, which also invalidates the embedding and kNN-graph
-  caches that `cluster` reuses.
+- Pipeline: `ingest` → `index` (encode docs + build) → `summarize` (one-line
+  summary per unit) → `cluster [--resolution]` (group units by their summary
+  embedding → unit_clusters.json) → `summarize` again (reduce each topic from its
+  members) / `search` / `eval`. `cluster` consumes unit summaries; the topic pass
+  of `summarize` consumes the clusters. `index` wipes/rebuilds `index/`.
 
 ## Code
 

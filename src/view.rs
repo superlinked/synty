@@ -56,11 +56,11 @@ pub fn work_md(units: &[Unit]) -> String {
 pub fn topics_md(topics: &[TopicUnits]) -> String {
     let mut o = format!("# topics ({})\n\n", topics.len());
     for t in topics {
-        let (gh, asst, prompt) = t.mix;
+        let (sess, prs, issues) = t.mix;
         let n = t.activity.len();
         let wk = |i: usize| n.checked_sub(i).and_then(|x| t.activity.get(x)).copied().unwrap_or(0);
         o.push_str(&format!(
-            "## {} — {}\n{} units · last active {} · activity this/last/prior wk: {}/{}/{} · gh {gh} / asst {asst} / prompt {prompt}\n",
+            "## {} — {}\n{} units · last active {} · activity this/last/prior wk: {}/{}/{} · {sess} sessions / {prs} PRs / {issues} issues\n",
             t.id,
             t.label,
             t.units.len(),

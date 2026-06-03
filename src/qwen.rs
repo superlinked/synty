@@ -124,19 +124,20 @@ Repo: {}\nTitle: {}\nBody:\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</th
     )
 }
 
-/// Reduce a cluster's representative document excerpts into one theme summary.
-fn prompt_for_topic(label: &str, texts: &[String]) -> String {
+/// Reduce a cluster's member-unit summaries into one theme summary. Clustering
+/// is by summary embedding, so the members are genuinely on-theme.
+fn prompt_for_topic(label: &str, members: &[String]) -> String {
     let mut items = String::new();
-    for t in texts {
+    for m in members {
         items.push_str("- ");
-        items.push_str(t);
+        items.push_str(m);
         items.push('\n');
     }
     format!(
         "<|im_start|>user\nYou are describing a cluster of related engineering work for an index. \
-From the keyphrases and the excerpts below, write ONE self-contained sentence (max 26 words) naming what this area is about and what was done across it. \
-Name concrete subjects; do not quote the excerpts. No preamble, no quotes, no lists.\n\n\
-Keyphrases: {label}\nExcerpts:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+From the keyphrases and the one-line summaries of its items below, write ONE self-contained sentence (max 26 words) naming what this area is about and what was done across it. \
+Name concrete subjects; do not just list the items. No preamble, no quotes, no lists.\n\n\
+Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
 }
 
@@ -236,23 +237,24 @@ fn unit_jobs() -> Result<Vec<Job>> {
     Ok(jobs)
 }
 
-/// Topic jobs, reduced from the cluster's most on-theme document excerpts. The
-/// hash is over the label + those excerpts, so a topic regenerates when its
-/// content changes.
+/// Topic jobs, reduced from the cluster's member-unit summaries. The hash is
+/// over the label + sorted member summaries, so a topic regenerates when its
+/// membership or any member summary changes.
 fn topic_jobs() -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
-    for t in units::topic_inputs()? {
-        if t.texts.is_empty() {
+    for t in units::topic_units(12)? {
+        let members: Vec<String> = t.units.iter().filter_map(|u| u.summary.clone()).take(40).collect();
+        if members.is_empty() {
             continue;
         }
-        let mut sorted: Vec<&str> = t.texts.iter().map(|s| s.as_str()).collect();
+        let mut sorted: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
         sorted.sort_unstable();
         let mut parts = vec![TOPIC_PROMPT_VERSION, t.label.as_str()];
         parts.extend(sorted);
         jobs.push(Job {
             key: units::topic_key(t.id),
             hash: hash_parts(&parts),
-            prompt: prompt_for_topic(&t.label, &t.texts),
+            prompt: prompt_for_topic(&t.label, &members),
             label: format!("topic:{}", t.id),
         });
     }

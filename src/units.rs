@@ -4,7 +4,7 @@
 // clusters.json (for PRs/issues and topic membership). Consumed by both the CLI
 // and the TUI so they stay at parity.
 
-use crate::{first_line, load_docs, Doc, DOCS_PATH};
+use crate::{first_line, load_docs, DOCS_PATH};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -89,9 +89,10 @@ pub struct Unit {
     pub repo: String,
     pub title: String,
     pub outcome: String, // PR state, or session file/PR summary
-    pub summary: Option<String>, // session's one-line LLM summary, if cached
+    pub summary: Option<String>, // one-line LLM summary, if cached
     pub topic: Option<i64>,
     pub struggle: f32,
+    pub author: String,    // PR/issue author; empty for sessions
     pub doc_id: Option<i64>,    // for PR/issue → docs.jsonl
     pub session_id: Option<String>, // for sessions
 }
@@ -219,7 +220,7 @@ fn aggregate() -> HashMap<String, Agg> {
 pub fn sessions() -> Result<Vec<Session>> {
     let aggs = aggregate();
     let cache = load_summary_cache();
-    let topic_of = session_topics().unwrap_or_default();
+    let topic_of = unit_topics();
 
     // Raw struggle signals → z-scores → summed → percentile-ranked to 0..1.
     let ids: Vec<String> = aggs.keys().cloned().collect();
@@ -249,7 +250,7 @@ pub fn sessions() -> Result<Vec<Session>> {
                 tools: a.tools,
                 files: a.files.clone(),
                 linked_pr: a.linked_pr.clone(),
-                topic: topic_of.get(id).copied(),
+                topic: topic_of.get(id).map(|(c, _)| *c),
                 struggle: scores[i],
                 gist: best_line(&aggs[id].texts, keyphrases.get(i).map(Vec::as_slice).unwrap_or(&[])),
                 keyphrases: keyphrases.get(i).cloned().unwrap_or_default(),
@@ -274,13 +275,14 @@ pub fn units() -> Result<Vec<Unit>> {
             summary: s.summary.clone(),
             topic: s.topic,
             struggle: s.struggle,
+            author: String::new(),
             doc_id: None,
             session_id: Some(s.id),
         })
         .collect();
 
     if let Ok(docs) = load_docs(DOCS_PATH) {
-        let topic_of = doc_topics().unwrap_or_default();
+        let topic_of = unit_topics();
         let cache = load_summary_cache();
         for d in &docs {
             let kind = match d.meta.kind.as_str() {
@@ -289,15 +291,17 @@ pub fn units() -> Result<Vec<Unit>> {
                 _ => continue,
             };
             let num = d.meta.number.unwrap_or(0);
+            let key = gh_key(&d.meta.repo, num);
             out.push(Unit {
                 kind,
                 when: day(&d.meta.ts),
                 repo: d.meta.repo.clone(),
                 title: format!("{}#{} {}", d.meta.repo, num, first_line(&d.text)),
                 outcome: d.meta.state.clone().unwrap_or_default(),
-                summary: cache.get(&gh_key(&d.meta.repo, num)).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
-                topic: topic_of.get(&d.id).copied(),
+                summary: cache.get(&key).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
+                topic: topic_of.get(&key).map(|(c, _)| *c),
                 struggle: 0.0,
+                author: d.meta.author.clone(),
                 doc_id: Some(d.id),
                 session_id: None,
             });
@@ -307,25 +311,15 @@ pub fn units() -> Result<Vec<Unit>> {
     Ok(out)
 }
 
-/// Topics with their units, last-active, weekly activity, and type mix.
+/// Topics with their units, last-active, weekly activity, facets, and type mix.
+/// Units are grouped by their single cluster (unit_clusters.json), so a topic is
+/// exactly a set of units and every facet derives from those units.
 pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
-    let all = units()?;
-    let labels = topic_labels()?;
+    let labels = cluster_labels();
     let cache = load_summary_cache();
-    let docs = load_docs(DOCS_PATH).unwrap_or_default();
-    let by_id: HashMap<i64, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
-
-    // A session appears under every topic it meaningfully contributed to (not
-    // just its majority), so the drill matches the facets; PRs/issues stay in
-    // their single doc cluster.
-    let participation = session_participation().unwrap_or_default();
     let mut by_topic: HashMap<i64, Vec<Unit>> = HashMap::new();
-    for u in all {
-        if let Some(sid) = u.session_id.clone() {
-            for &t in participation.get(&sid).map(Vec::as_slice).unwrap_or_default() {
-                by_topic.entry(t).or_default().push(u.clone());
-            }
-        } else if let Some(t) = u.topic {
+    for u in units()? {
+        if let Some(t) = u.topic {
             by_topic.entry(t).or_default().push(u);
         }
     }
@@ -333,12 +327,12 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
         .into_iter()
         .map(|(id, units)| {
             let last_active = units.iter().map(|u| u.when.clone()).max().unwrap_or_default();
-            // activity from the constituent docs' timestamps (clusters are over docs)
-            let ts: Vec<String> = cluster_doc_ts(id, &by_id);
-            let span = day_span(&ts);
-            let activity = weekly_buckets(&ts, weeks);
-            let mix = cluster_mix(id, &by_id);
-            let (repos, authors) = cluster_facets(id, &by_id);
+            let days: Vec<String> = units.iter().map(|u| u.when.clone()).collect();
+            let span = day_span(&days);
+            let activity = weekly_buckets(&days, weeks);
+            let mix = unit_mix(&units);
+            let repos = by_count(units.iter().filter(|u| !u.repo.is_empty()).map(|u| u.repo.clone()));
+            let authors = by_count(units.iter().filter(|u| !u.author.is_empty()).map(|u| u.author.clone()));
             let summary = cache.get(&topic_key(id)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
             TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors, summary, span }
         })
@@ -382,132 +376,60 @@ fn struggle_scores(raw: &[[f64; 4]]) -> Vec<f32> {
     out
 }
 
-// ── topic membership ──────────────────────────────────────────────────────
+// ── topic membership (unit-level) ─────────────────────────────────────────
 
-/// doc id → topic cluster, from clusters.json.
-fn doc_topics() -> Result<HashMap<i64, i64>> {
-    let raw = std::fs::read_to_string("clusters.json")?;
-    let arr: Vec<Value> = serde_json::from_str(&raw)?;
-    Ok(arr.iter().filter_map(|it| Some((it["id"].as_i64()?, it["cluster"].as_i64()?))).collect())
-}
-
-/// topic cluster → label, from clusters.json.
-fn topic_labels() -> Result<HashMap<i64, String>> {
-    let raw = std::fs::read_to_string("clusters.json")?;
-    let arr: Vec<Value> = serde_json::from_str(&raw)?;
-    let mut m = HashMap::new();
-    for it in &arr {
-        if let (Some(c), Some(l)) = (it["cluster"].as_i64(), it["label"].as_str()) {
-            m.entry(c).or_insert_with(|| l.to_string());
-        }
-    }
-    Ok(m)
-}
-
-/// session id → majority topic of its messages.
-fn session_topics() -> Result<HashMap<String, i64>> {
-    let docs = load_docs(DOCS_PATH).unwrap_or_default();
-    let dt = doc_topics().unwrap_or_default();
-    let mut tally: HashMap<String, HashMap<i64, usize>> = HashMap::new();
-    for d in &docs {
-        if d.meta.session_id.is_empty() {
-            continue;
-        }
-        if let Some(&t) = dt.get(&d.id) {
-            *tally.entry(d.meta.session_id.clone()).or_default().entry(t).or_default() += 1;
-        }
-    }
-    Ok(tally
-        .into_iter()
-        .filter_map(|(sid, m)| m.into_iter().max_by_key(|(_, n)| *n).map(|(t, _)| (sid, t)))
-        .collect())
-}
-
-/// session id → every topic it meaningfully contributed to (≥2 of its docs in
-/// that cluster), falling back to its single dominant topic. So a session that
-/// spans themes shows up under each, matching the doc-level facets.
-fn session_participation() -> Result<HashMap<String, Vec<i64>>> {
-    let docs = load_docs(DOCS_PATH).unwrap_or_default();
-    let dt = doc_topics().unwrap_or_default();
-    let mut tally: HashMap<String, HashMap<i64, usize>> = HashMap::new();
-    for d in &docs {
-        if d.meta.session_id.is_empty() {
-            continue;
-        }
-        if let Some(&t) = dt.get(&d.id) {
-            *tally.entry(d.meta.session_id.clone()).or_default().entry(t).or_default() += 1;
-        }
-    }
-    Ok(tally
-        .into_iter()
-        .map(|(sid, m)| {
-            let mut topics: Vec<i64> = m.iter().filter(|(_, n)| **n >= 2).map(|(t, _)| *t).collect();
-            if topics.is_empty() {
-                if let Some((&t, _)) = m.iter().max_by_key(|(_, n)| **n) {
-                    topics.push(t);
-                }
-            }
-            topics.sort_unstable();
-            (sid, topics)
+/// unit key → (cluster, label), from unit_clusters.json (written by `cluster`).
+/// Empty until clustering has run.
+fn unit_topics() -> HashMap<String, (i64, String)> {
+    let Ok(raw) = std::fs::read_to_string("unit_clusters.json") else { return HashMap::new() };
+    let arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    arr.iter()
+        .filter_map(|it| {
+            let key = it["key"].as_str()?.to_string();
+            let cluster = it["cluster"].as_i64()?;
+            Some((key, (cluster, it["label"].as_str().unwrap_or("").to_string())))
         })
-        .collect())
+        .collect()
 }
 
-/// First and last active day (YYYY-MM-DD) across a set of ISO timestamps.
-/// Lexicographic min/max works because the day prefix is zero-padded.
+/// cluster → label.
+fn cluster_labels() -> HashMap<i64, String> {
+    let mut m = HashMap::new();
+    for (_, (c, l)) in unit_topics() {
+        m.entry(c).or_insert(l);
+    }
+    m
+}
+
+/// First and last day across day-or-timestamp strings (lexicographic works
+/// because the zero-padded day prefix sorts chronologically).
 fn day_span(ts: &[String]) -> Option<(String, String)> {
     let days: Vec<&str> = ts.iter().filter_map(|t| t.split('T').next()).filter(|d| d.len() == 10).collect();
     Some((days.iter().min()?.to_string(), days.iter().max()?.to_string()))
 }
 
-fn cluster_doc_ts(topic: i64, by_id: &HashMap<i64, &Doc>) -> Vec<String> {
-    let dt = doc_topics().unwrap_or_default();
-    dt.iter().filter(|(_, t)| **t == topic).filter_map(|(id, _)| by_id.get(id).map(|d| d.meta.ts.clone())).collect()
-}
-
-/// Distinct repos and authors in a cluster, most frequent first.
-fn cluster_facets(topic: i64, by_id: &HashMap<i64, &Doc>) -> (Vec<String>, Vec<String>) {
-    let dt = doc_topics().unwrap_or_default();
-    let (mut repos, mut authors): (HashMap<String, usize>, HashMap<String, usize>) = Default::default();
-    for (id, t) in &dt {
-        if *t != topic {
-            continue;
-        }
-        if let Some(d) = by_id.get(id) {
-            if !d.meta.repo.is_empty() {
-                *repos.entry(d.meta.repo.clone()).or_default() += 1;
-            }
-            if !d.meta.author.is_empty() {
-                *authors.entry(d.meta.author.clone()).or_default() += 1;
-            }
-        }
+/// Distinct values, most frequent first.
+fn by_count(it: impl Iterator<Item = String>) -> Vec<String> {
+    let mut m: HashMap<String, usize> = HashMap::new();
+    for x in it {
+        *m.entry(x).or_default() += 1;
     }
-    (by_count(repos), by_count(authors))
-}
-
-fn by_count(m: HashMap<String, usize>) -> Vec<String> {
     let mut v: Vec<(String, usize)> = m.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     v.into_iter().map(|(k, _)| k).collect()
 }
 
-fn cluster_mix(topic: i64, by_id: &HashMap<i64, &Doc>) -> (usize, usize, usize) {
-    let dt = doc_topics().unwrap_or_default();
-    let (mut gh, mut asst, mut prompt) = (0, 0, 0);
-    for (id, t) in &dt {
-        if *t != topic {
-            continue;
-        }
-        if let Some(d) = by_id.get(id) {
-            match d.meta.kind.as_str() {
-                "pull_request" | "issue" => gh += 1,
-                "assistant_message" | "thinking" => asst += 1,
-                "user_prompt" => prompt += 1,
-                _ => {}
-            }
+/// (sessions, PRs, issues) counts among a topic's units.
+fn unit_mix(units: &[Unit]) -> (usize, usize, usize) {
+    let mut m = (0usize, 0usize, 0usize);
+    for u in units {
+        match u.kind {
+            Kind::Session => m.0 += 1,
+            Kind::Pr => m.1 += 1,
+            Kind::Issue => m.2 += 1,
         }
     }
-    (gh, asst, prompt)
+    m
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -575,60 +497,32 @@ pub fn doc_inputs() -> Result<Vec<DocInput>> {
         .collect())
 }
 
-/// A topic as summarizer input: its label plus excerpts of its most on-theme
-/// documents (so the summary describes the cluster's own content — the same
-/// source as the label — not the unrelated main work of sessions that merely
-/// touched it).
-pub struct TopicInput {
-    pub id: i64,
-    pub label: String,
-    pub texts: Vec<String>,
+/// A unit (session/PR/issue) as clustering input: a stable key, its one-line
+/// summary (the thing we cluster on), and repo. Units without a summary are
+/// omitted — they can't be placed by summary.
+pub struct UnitClusterInput {
+    pub key: String,
+    pub summary: String,
 }
 
-/// Per-topic inputs for the reduce: the cluster's docs ranked by how many of the
-/// label's keyphrases they contain, top-k excerpted.
-pub fn topic_inputs() -> Result<Vec<TopicInput>> {
-    let docs = load_docs(DOCS_PATH).unwrap_or_default();
-    let dt = doc_topics().unwrap_or_default();
-    let labels = topic_labels()?;
-    let mut by_cluster: HashMap<i64, Vec<&Doc>> = HashMap::new();
-    for d in &docs {
-        if let Some(&c) = dt.get(&d.id) {
-            by_cluster.entry(c).or_default().push(d);
+/// All units that have a cached summary, for summary-embedding clustering.
+pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
+    let mut out = Vec::new();
+    for s in sessions()? {
+        if let Some(summary) = s.summary.filter(|x| !x.is_empty()) {
+            out.push(UnitClusterInput { key: s.id, summary });
         }
     }
-    Ok(by_cluster
-        .into_iter()
-        .map(|(id, ds)| {
-            let label = labels.get(&id).cloned().unwrap_or_default();
-            let kps: Vec<&str> = label.split(", ").collect();
-            let texts = top_docs_by_coverage(&ds, &kps, 10);
-            TopicInput { id, label, texts }
-        })
-        .collect())
-}
-
-/// The k docs containing the most of the given keyphrases (ties toward the more
-/// concise), each excerpted. Docs matching none are dropped.
-fn top_docs_by_coverage(docs: &[&Doc], kps: &[&str], k: usize) -> Vec<String> {
-    let lk: Vec<String> = kps.iter().filter(|w| !w.is_empty()).map(|s| s.to_lowercase()).collect();
-    let mut scored: Vec<(usize, &&Doc)> = docs
-        .iter()
-        .map(|d| {
-            let lt = d.text.to_lowercase();
-            (lk.iter().filter(|w| lt.contains(w.as_str())).count(), d)
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.text.len().cmp(&b.1.text.len())));
-    let covered: Vec<String> = scored.iter().filter(|(c, _)| *c > 0).take(k).map(|(_, d)| crate::excerpt(&d.text, 300)).collect();
-    if !covered.is_empty() {
-        return covered;
+    let cache = load_summary_cache();
+    for d in load_docs(DOCS_PATH).unwrap_or_default() {
+        if matches!(d.meta.kind.as_str(), "pull_request" | "issue") {
+            let key = gh_key(&d.meta.repo, d.meta.number.unwrap_or(0));
+            if let Some(c) = cache.get(&key).filter(|c| !c.summary.is_empty()) {
+                out.push(UnitClusterInput { key, summary: c.summary.clone() });
+            }
+        }
     }
-    // Fallback (keyphrases not literal in the text): the k most substantial docs,
-    // so every cluster still gets summarized rather than skipped.
-    let mut by_len: Vec<&&Doc> = docs.iter().collect();
-    by_len.sort_by_key(|d| std::cmp::Reverse(d.text.len()));
-    by_len.into_iter().take(k).map(|d| crate::excerpt(&d.text, 300)).collect()
+    Ok(out)
 }
 
 /// The k messages with the most keyphrase coverage, returned in chronological
@@ -698,9 +592,13 @@ pub fn weekly_buckets(timestamps: &[String], weeks: usize) -> Vec<u64> {
     out
 }
 
+/// Days since the Unix epoch from a day or full timestamp (only the date part
+/// matters, so day-only "YYYY-MM-DD" and full RFC3339 both work, same scale).
 fn epoch_day(ts: &str) -> Option<i64> {
-    let d = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
-    Some(d.timestamp() / 86_400)
+    let day = ts.split('T').next().unwrap_or(ts);
+    let d = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    Some((d - epoch).num_days())
 }
 
 fn duration_secs(a: &Agg) -> i64 {

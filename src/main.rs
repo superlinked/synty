@@ -7,7 +7,6 @@
 mod blocks;
 mod bucket;
 mod claudecode;
-mod cluster;
 mod codex;
 mod cowork;
 mod community;
@@ -31,6 +30,7 @@ mod model;
 mod qwen;
 mod search;
 mod summarize;
+mod topics;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -141,11 +141,14 @@ enum Cmd {
         #[arg(long, default_value = ".synty")]
         bucket: String,
     },
-    /// Louvain topics over a weighted kNN + github-link graph; print labeled
-    /// clusters. --resolution >1 yields more/smaller topics, <1 fewer/larger.
+    /// Cluster units (sessions, PRs, issues) by their summary embedding (MaxSim
+    /// kNN + Louvain) into topics. --resolution >1 yields more/smaller topics.
+    /// Run `summarize` first. Writes unit_clusters.json.
     Cluster {
         #[arg(long, default_value_t = 1.0)]
         resolution: f64,
+        #[arg(long, default_value = ".synty")]
+        bucket: String,
     },
     /// List emergent topics (from the last `cluster` run); optional substring filter
     Topic { query: Option<String> },
@@ -249,7 +252,7 @@ fn main() -> Result<()> {
         Cmd::Search { query, filter, k, bucket } => {
             search::run(&query, filter.as_deref(), k, &model_id(), &bucket)?
         }
-        Cmd::Cluster { resolution } => cluster::run(resolution)?,
+        Cmd::Cluster { resolution, bucket } => topics::run(resolution, &model_id(), &bucket)?,
         Cmd::Topic { query } => {
             let mut topics = units::topic_units(12)?;
             if let Some(q) = query {

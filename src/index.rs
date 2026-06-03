@@ -110,7 +110,7 @@ fn load_manifest(path: &Path) -> Option<Vec<u64>> {
 /// FNV-1a 64-bit — a small, deterministic content hash. A collision only costs
 /// a needless re-encode (the index re-derives everything), so it need not be
 /// cryptographic.
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         h ^= b as u64;

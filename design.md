@@ -77,14 +77,17 @@ runs on CI or a server without a developer machine.
 ## Derivations (all without an LLM)
 
 - **Search** — filtered late-interaction retrieval. *Built.*
-- **Clusters (topics)** — emergent, no taxonomy. **Louvain community detection**
-  over a weighted graph: kNN similarity (normalized per-doc, floored, summed
-  over both directions) plus GitHub `#`-references as a fixed-weight edge signal
-  — not the hard transitive union that previously merged a homogeneous repo into
-  one blob. A `--resolution` knob trades topic count vs size; modularity is
-  reported. Labels are extractive c-TF-IDF keyphrases. The kNN graph and per-doc
-  embeddings are cached next to the index, so a resolution sweep re-runs only
-  Louvain (sub-second) and never re-encodes. *Built (Louvain + resolution +
+- **Clusters (topics)** — emergent, no taxonomy. Clustering is over **units of
+  work** (sessions, PRs, issues), not the raw message firehose: each unit's
+  one-line summary is embedded (multi-vector ColBERT) and **Louvain** runs over a
+  MaxSim kNN graph of those summary embeddings (normalized per-unit, floored,
+  summed over both directions). A topic is therefore a coherent *set of units*,
+  so its members, facets (repos/authors), label, and summary are consistent by
+  construction — no doc-vs-unit reconciliation. A `--resolution` knob trades
+  topic count vs size; modularity is reported. Labels are extractive c-TF-IDF
+  keyphrases over the member summaries; summary embeddings are content-addressed
+  in the shared store (encode-once). Clustering the denoised summaries also beats
+  clustering the chat firehose. *Built (unit-summary Louvain + resolution +
   keyphrase labels).*
 - **Summaries.** Per session: opening ask, c-TF-IDF keyphrases, files touched,
   effort, linked PR, and a one-line abstractive summary from a local Qwen3-0.6B

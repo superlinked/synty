@@ -67,9 +67,13 @@ cargo run --release -- github    # pull PRs/issues via GitHub GraphQL ($GITHUB_T
 cargo run --release -- ingest    # turn events + GitHub into searchable documents
 cargo run --release -- index     # encode with ColBERT and build the index
 cargo run --release -- search "<query>" [--filter col=value]
-cargo run --release -- cluster --resolution 2.0   # emergent topics, no taxonomy
-cargo run --release -- summarize                  # local-LLM session summaries + topic digests
+cargo run --release -- summarize                  # local-LLM one-line summary per unit
+cargo run --release -- cluster --resolution 2.0   # group units by summary embedding → topics
+cargo run --release -- summarize                  # again: reduce each topic from its members
 ```
+
+`cluster` groups *units of work* (sessions, PRs, issues) by their summary, so run
+`summarize` first; the topic summaries are then a second `summarize` pass.
 
 ## Team mode (optional)
 
@@ -97,9 +101,10 @@ the tracker to start at login with `track --install launchd|systemd`.
 - **Index & search** — `next-plaid` (PLAID) stores those vectors and scores
   queries with MaxSim, backed by SQLite for exact metadata filters
   (`--filter repo=...`, `kind=pull_request`, …).
-- **Topics** — Louvain community detection over a similarity + GitHub-link graph,
-  labeled with extractive keyphrases; a `--resolution` knob trades more, smaller
-  topics for fewer, larger ones.
+- **Topics** — units of work (sessions, PRs, issues) clustered by the embedding
+  of their one-line summary (Louvain over a MaxSim kNN graph), labeled with
+  extractive keyphrases; a `--resolution` knob trades more, smaller topics for
+  fewer, larger ones. A topic is a coherent set of units, not a bag of messages.
 - **Source of truth** — sessions and GitHub items become append-only event
   envelopes; the index and its metadata are derived projections, rebuildable
   from the events at any time (and shareable through a bucket).
