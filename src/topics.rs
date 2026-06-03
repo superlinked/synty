@@ -1,9 +1,10 @@
 // Unit-level topics. Instead of clustering the 4k-doc message firehose, cluster
-// the *units of work* (sessions, PRs, issues) by the multi-vector ColBERT
-// embedding of their one-line summary — MaxSim kNN + Louvain, the same
-// late-interaction substrate as retrieval, one level up. A topic is then a
-// coherent set of units, so its members/facets/label/summary are consistent by
-// construction (no doc-vs-unit reconciliation). Writes unit_clusters.json.
+// the *units of work* (sessions, PRs, issues) by a multi-vector ColBERT
+// embedding of a compact per-unit text (its summary plus the session keyphrases
+// or the PR/issue title — a lone one-liner is too thin to separate) — MaxSim kNN
+// + Louvain, the same late-interaction substrate as retrieval, one level up. A
+// topic is then a coherent set of units, so its members/facets/label/summary are
+// consistent by construction. Writes unit_clusters.json; reports silhouette.
 
 use crate::community::{louvain, modularity, Graph};
 use crate::store::EmbStore;
@@ -14,6 +15,7 @@ use next_plaid::{IndexConfig, MmapIndex, SearchParameters, UpdateConfig};
 use std::collections::HashMap;
 
 const K: usize = 6;
+const EVAL_K: usize = 16; // neighbors fetched for the silhouette eval (graph uses top-K)
 const FLOOR: f64 = 0.6; // keep a neighbor only if ≥60% of the best neighbor's score
 const MIN_CLUSTER: usize = 3;
 const INDEX_DIR: &str = "index/topics";
@@ -24,10 +26,10 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let n = units.len();
     eprintln!("topics: clustering {n} units by summary embedding");
 
-    // Encode summaries, content-addressed in the shared store (encode-once per
-    // summary text, reused across runs/devices like doc embeddings).
+    // Encode the per-unit text, content-addressed in the shared store
+    // (encode-once per text, reused across runs/devices like doc embeddings).
     let store = EmbStore::open(bucket)?;
-    let hashes: Vec<u64> = units.iter().map(|u| crate::index::fnv1a(u.summary.as_bytes())).collect();
+    let hashes: Vec<u64> = units.iter().map(|u| crate::index::fnv1a(u.embed.as_bytes())).collect();
     let mut emb: Vec<Option<Array2<f32>>> = vec![None; n];
     let mut miss = Vec::new();
     for i in 0..n {
@@ -37,10 +39,10 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         }
     }
     if !miss.is_empty() {
-        eprintln!("topics: encoding {} new summaries", miss.len());
+        eprintln!("topics: encoding {} units", miss.len());
         let mut enc = Encoder::load(model_id)?;
         for chunk in miss.chunks(64) {
-            let texts: Vec<String> = chunk.iter().map(|&i| units[i].summary.clone()).collect();
+            let texts: Vec<String> = chunk.iter().map(|&i| units[i].embed.clone()).collect();
             for (&i, e) in chunk.iter().zip(enc.encode_docs(&texts)?) {
                 store.put(hashes[i], &e)?;
                 emb[i] = Some(e);
@@ -61,7 +63,12 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     )
     .map_err(|e| anyhow!("build summary index: {e}"))?;
 
-    let edges = build_edges(&idx, &emb)?;
+    // One kNN search feeds both the graph (top-K) and the quality eval (full).
+    let params = SearchParameters { top_k: EVAL_K + 1, n_full_scores: 256, n_ivf_probe: 4, ..Default::default() };
+    eprintln!("topics: kNN over {n} summaries");
+    let results = idx.search_batch(&emb, &params, true, None).map_err(|e| anyhow!("search: {e}"))?;
+
+    let edges = build_edges(&results);
     let comm = louvain(Graph::from_edges(n, &edges), resolution);
     let q = modularity(&Graph::from_edges(n, &edges), &comm, resolution);
 
@@ -76,6 +83,14 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let texts: Vec<Vec<&str>> = clusters.iter().map(|c| c.iter().map(|&m| units[m].summary.as_str()).collect()).collect();
     let phrases = crate::keyphrase::labels(&texts, 4);
 
+    // unit → cluster index (None if its community was below MIN_CLUSTER).
+    let mut of: Vec<Option<usize>> = vec![None; n];
+    for (ci, c) in clusters.iter().enumerate() {
+        for &m in c {
+            of[m] = Some(ci);
+        }
+    }
+
     let mut assign: Vec<serde_json::Value> = Vec::new();
     for (ci, c) in clusters.iter().enumerate() {
         let label = phrases[ci].join(", ");
@@ -89,14 +104,13 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         assign.len(),
         clusters.len()
     );
+    report_quality(&results, &of, &phrases, &units);
     Ok(())
 }
 
 /// kNN edges from MaxSim: normalized per-unit (÷ best neighbor), floored, summed
-/// over both directions so mutual neighbors weigh more. Same as `cluster`.
-fn build_edges(idx: &MmapIndex, emb: &[Array2<f32>]) -> Result<HashMap<(usize, usize), f64>> {
-    let params = SearchParameters { top_k: K + 1, n_full_scores: 256, n_ivf_probe: 4, ..Default::default() };
-    let results = idx.search_batch(emb, &params, true, None).map_err(|e| anyhow!("search: {e}"))?;
+/// over both directions so mutual neighbors weigh more. Top-K per unit.
+fn build_edges(results: &[next_plaid::QueryResult]) -> HashMap<(usize, usize), f64> {
     let mut edges: HashMap<(usize, usize), f64> = HashMap::new();
     for (i, r) in results.iter().enumerate() {
         let pairs: Vec<(usize, f32)> = r
@@ -118,5 +132,58 @@ fn build_edges(idx: &MmapIndex, emb: &[Array2<f32>]) -> Result<HashMap<(usize, u
             *edges.entry((i.min(j), i.max(j))).or_insert(0.0) += d;
         }
     }
-    Ok(edges)
+    edges
+}
+
+/// Cluster-quality report. For each clustered unit, silhouette = (a − b)/max(a,b)
+/// where a is its best same-cluster neighbor's MaxSim and b its best
+/// other-cluster neighbor's. Negative means the unit is nearer a *different*
+/// cluster — a likely misplacement. Reports the mean, the misplaced count, and
+/// the worst offenders (where they sit vs where they'd rather be).
+fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], labels: &[Vec<String>], units: &[units::UnitClusterInput]) {
+    let label = |ci: usize| labels.get(ci).map(|p| p.join(", ")).unwrap_or_default();
+    let mut sils: Vec<(usize, usize, usize, f32)> = Vec::new(); // (unit, own ci, nearest other ci, silhouette)
+    for (i, r) in results.iter().enumerate() {
+        let Some(ci) = of[i] else { continue };
+        let (mut a, mut b, mut other) = (None, None, ci);
+        for (id, s) in r.passage_ids.iter().zip(r.scores.iter()) {
+            let j = *id as usize;
+            if j == i {
+                continue;
+            }
+            match of[j] {
+                Some(cj) if cj == ci => a = a.or(Some(*s)),
+                Some(cj) => {
+                    if b.is_none() {
+                        b = Some(*s);
+                        other = cj;
+                    }
+                }
+                None => {}
+            }
+        }
+        let (a, b) = (a.unwrap_or(0.0), b.unwrap_or(0.0));
+        let sil = if a.max(b) > 0.0 { (a - b) / a.max(b) } else { 0.0 };
+        sils.push((i, ci, other, sil));
+    }
+    if sils.is_empty() {
+        return;
+    }
+    let mean = sils.iter().map(|x| x.3).sum::<f32>() / sils.len() as f32;
+    let misplaced = sils.iter().filter(|x| x.3 < 0.0).count();
+    eprintln!(
+        "quality: mean silhouette {mean:.3} · {misplaced}/{} units nearer another cluster ({:.0}%)",
+        sils.len(),
+        100.0 * misplaced as f32 / sils.len() as f32
+    );
+    sils.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!("  worst-placed units (in → would prefer):");
+    for (i, ci, other, sil) in sils.iter().take(8) {
+        eprintln!(
+            "    [{sil:+.2}] {} — in “{}” → “{}”",
+            crate::short(&units[*i].key),
+            label(*ci),
+            label(*other),
+        );
+    }
 }

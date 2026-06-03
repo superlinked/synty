@@ -502,15 +502,19 @@ pub fn doc_inputs() -> Result<Vec<DocInput>> {
 /// omitted — they can't be placed by summary.
 pub struct UnitClusterInput {
     pub key: String,
-    pub summary: String,
+    pub summary: String, // for c-TF-IDF labels
+    pub embed: String,   // richer text actually embedded for clustering
 }
 
-/// All units that have a cached summary, for summary-embedding clustering.
+/// All units that have a cached summary, for clustering. We embed more than the
+/// one-line summary — adding the session's keyphrases or the PR/issue title — so
+/// the vectors separate (a lone 20-token summary is too thin to cluster well).
 pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
     let mut out = Vec::new();
     for s in sessions()? {
         if let Some(summary) = s.summary.filter(|x| !x.is_empty()) {
-            out.push(UnitClusterInput { key: s.id, summary });
+            let embed = format!("{summary} {}", s.keyphrases.join(" "));
+            out.push(UnitClusterInput { key: s.id, summary, embed });
         }
     }
     let cache = load_summary_cache();
@@ -518,7 +522,8 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
         if matches!(d.meta.kind.as_str(), "pull_request" | "issue") {
             let key = gh_key(&d.meta.repo, d.meta.number.unwrap_or(0));
             if let Some(c) = cache.get(&key).filter(|c| !c.summary.is_empty()) {
-                out.push(UnitClusterInput { key, summary: c.summary.clone() });
+                let embed = format!("{} {}", c.summary, first_line(&d.text));
+                out.push(UnitClusterInput { key, summary: c.summary.clone(), embed });
             }
         }
     }
