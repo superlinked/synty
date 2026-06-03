@@ -522,7 +522,9 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
         if matches!(d.meta.kind.as_str(), "pull_request" | "issue") {
             let key = gh_key(&d.meta.repo, d.meta.number.unwrap_or(0));
             if let Some(c) = cache.get(&key).filter(|c| !c.summary.is_empty()) {
-                let embed = format!("{} {}", c.summary, first_line(&d.text));
+                // summary + title + body, capped so units stay comparable in length
+                // (MaxSim is length-biased — long bodies would otherwise hub).
+                let embed = crate::excerpt(&format!("{} {}", c.summary, d.text), 320);
                 out.push(UnitClusterInput { key, summary: c.summary.clone(), embed });
             }
         }
