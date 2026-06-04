@@ -501,7 +501,10 @@ impl App {
                             day_strip(&dailies[i], cap),
                             Cell::from(t.units.len().to_string()).style(dim),
                         ])
-                        .height(2)
+                        // 3 tall: the two content lines sit together at the top and
+                        // the blank third line separates this topic from the next,
+                        // so the 2-row strip reads as one group, not two rows.
+                        .height(3)
                     })
                     .collect();
                 (
