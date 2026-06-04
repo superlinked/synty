@@ -26,4 +26,3 @@ tmp/
 # the repo root and are tracked; only the per-machine state under .claude/ is ignored.
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
-metrics.jsonl
