@@ -141,18 +141,13 @@ Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n
     )
 }
 
-/// Reduce a cluster's member summaries into a short Title-Case name.
-fn prompt_for_topic_name(label: &str, members: &[String]) -> String {
-    let mut items = String::new();
-    for m in members.iter().take(20) {
-        items.push_str("- ");
-        items.push_str(m);
-        items.push('\n');
-    }
+/// Condense a topic's one-line summary into a short Title-Case name. Titling an
+/// existing sentence is far easier for a small model than abstracting a name from
+/// a list of items, which it can't do (it parrots examples and emits slugs).
+fn prompt_for_topic_name(summary: &str) -> String {
     format!(
-        "<|im_start|>user\nName this cluster of related engineering work with a short human title in Title Case — 2 to 5 words, like a chapter title. \
-Just the title: no slug, no commas, no file or branch names, no trailing period, no quotes.\n\n\
-Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        "<|im_start|>user\nShorten this description to a 2 to 4 word title in Title Case, like a chapter heading. Keep the most specific nouns; drop verbs and filler. Output only the title — no quotes, no period, no commas.\n\n\
+Description: {summary}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
 }
 
@@ -207,27 +202,61 @@ fn clean(s: &str) -> String {
     line
 }
 
-/// Clean a short topic name: no length floor, trailing period trimmed, and
-/// drop echoes of the prompt's field labels.
+/// Clean a short topic name. The 0.6B titles its summary well but SHOUTS in
+/// all-caps and sometimes snake_cases, so *normalize* (underscores→spaces,
+/// Title Case keeping acronyms) rather than reject. Only genuine non-titles —
+/// comma-lists, whole sentences (>6 words), field echoes, the bare generic
+/// word — fall back to the keyphrase label.
 fn clean_name(s: &str) -> String {
     let s = s.rsplit("</think>").next().unwrap_or(s).trim().trim_matches('"').trim();
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s);
-    let line = strip_opener(&crate::excerpt(line, 48));
-    let line = line.trim_end_matches('.').trim().to_string();
+    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s).replace('_', " ");
+    let line = crate::excerpt(&line, 48);
+    let line = line.trim_end_matches(['.', ':', ',']).trim();
     let low = line.to_lowercase();
-    let echo = ["keyphrases:", "items:", "name:", "title:", "repo:"].iter().any(|p| low.starts_with(p));
-    // Reject junk the 0.6B emits — slugs, comma-lists, ALL-CAPS shouting, the
-    // generic "… Cluster" suffix, over-long — so the caller keeps the keyphrase
-    // label instead. Only clean Title-Case names survive.
-    let slug = !line.contains(' ') && (line.contains('-') || line.contains('_'));
-    let listy = line.matches(',').count() >= 2;
-    let shouty = line.chars().any(|c| c.is_alphabetic()) && line == line.to_uppercase();
-    let generic = low.ends_with(" cluster") || matches!(low.as_str(), "cluster" | "chores");
-    if line.is_empty() || echo || slug || listy || shouty || generic || line.len() > 42 || line.split_whitespace().count() > 6 {
+    let echo = ["keyphrase", "items", "title", "repo", "update:", "description"].iter().any(|p| low.starts_with(p));
+    let words = line.split_whitespace().count();
+    if line.is_empty() || echo || line.contains(',') || !(1..=6).contains(&words) {
+        return String::new();
+    }
+    let t = title_case(line);
+    let t = t.trim_end_matches(" Cluster").trim();
+    if t.is_empty() || matches!(t.to_lowercase().as_str(), "cluster" | "chores" | "update" | "fix") {
         String::new()
     } else {
-        line
+        t.to_string()
     }
+}
+
+/// Title-case a phrase: keep known domain acronyms (GPU, SIE, NATS…) and codes
+/// (S3, M4, GPT-5.5) uppercase, lowercase function words mid-title, capitalize
+/// the rest. The model SHOUTS, so we can't infer acronyms from case — hence the
+/// small curated allowlist.
+fn title_case(s: &str) -> String {
+    const ACRO: &[&str] = &[
+        "GPU", "CPU", "AWS", "GCP", "TEI", "API", "SIE", "NATS", "OCR", "CLI", "UI", "UX", "JSON",
+        "LLM", "TLS", "VDB", "CTA", "SDK", "HTTP", "AI", "ML", "RAG", "SQL", "K8S", "GHCR", "TUI",
+        "MTP", "PR", "CI", "CD", "TLS", "BYO", "VM", "VMS",
+    ];
+    const STOP: &[&str] = &["and", "or", "for", "to", "the", "a", "an", "of", "in", "on", "at", "with", "by", "vs", "from", "into"];
+    s.split_whitespace()
+        .enumerate()
+        .map(|(i, w)| {
+            let core: String = w.to_uppercase().chars().filter(|c| c.is_alphanumeric()).collect();
+            let code = core.len() <= 6 && core.chars().any(|c| c.is_numeric()) && core.chars().all(|c| c.is_uppercase() || c.is_numeric());
+            if ACRO.contains(&core.as_str()) || code {
+                w.to_uppercase()
+            } else if i > 0 && STOP.contains(&w.to_lowercase().as_str()) {
+                w.to_lowercase()
+            } else {
+                let mut ch = w.chars();
+                match ch.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + &ch.as_str().to_lowercase(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 8-byte content hash of arbitrary parts, salted by the prompt version so a
@@ -262,7 +291,7 @@ struct Job {
 
 /// Salt for the topic reduce / name prompts; bump to regenerate them only.
 const TOPIC_PROMPT_VERSION: &str = "t5";
-const TOPIC_NAME_VERSION: &str = "n3";
+const TOPIC_NAME_VERSION: &str = "s1";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -278,9 +307,10 @@ fn unit_jobs() -> Result<Vec<Job>> {
     Ok(jobs)
 }
 
-/// Topic jobs: a one-line summary and a short name per cluster, both reduced
-/// from the member-unit summaries. The hash is over the label + sorted member
-/// summaries, so each regenerates when membership or a member summary changes.
+/// Topic jobs: a one-line summary reduced from the member-unit summaries, plus a
+/// short name that *titles that summary* (a small model shortens a sentence far
+/// better than it abstracts a name from a list of items). The summary's hash is
+/// over its members; the name's is over the summary text it titles.
 fn topic_jobs() -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
     for t in units::topic_units(12)? {
@@ -292,8 +322,6 @@ fn topic_jobs() -> Result<Vec<Job>> {
         sorted.sort_unstable();
         let mut sum_parts = vec![TOPIC_PROMPT_VERSION, t.label.as_str()];
         sum_parts.extend(sorted.iter().copied());
-        let mut name_parts = vec![TOPIC_NAME_VERSION, t.label.as_str()];
-        name_parts.extend(sorted.iter().copied());
         jobs.push(Job {
             key: units::topic_key(t.id),
             hash: hash_parts(&sum_parts),
@@ -301,13 +329,18 @@ fn topic_jobs() -> Result<Vec<Job>> {
             label: format!("topic:{}", t.id),
             short: false,
         });
-        jobs.push(Job {
-            key: units::topic_name_key(t.id),
-            hash: hash_parts(&name_parts),
-            prompt: prompt_for_topic_name(&t.label, &members),
-            label: format!("name:{}", t.id),
-            short: true,
-        });
+        // The name titles the topic summary, so it depends on it. The summary job
+        // above runs first in the same pass; for a topic whose summary isn't
+        // cached yet the name regenerates next run, once the summary exists.
+        if let Some(sum) = &t.summary {
+            jobs.push(Job {
+                key: units::topic_name_key(t.id),
+                hash: hash_parts(&[TOPIC_NAME_VERSION, sum.as_str()]),
+                prompt: prompt_for_topic_name(sum),
+                label: format!("name:{}", t.id),
+                short: true,
+            });
+        }
     }
     Ok(jobs)
 }
@@ -374,13 +407,15 @@ mod tests {
     }
 
     #[test]
-    fn clean_name_keeps_titles_drops_junk() {
-        assert_eq!(clean_name("S3 Cluster Cache"), "S3 Cluster Cache");
-        assert_eq!(clean_name("ColBERT & TEI Benchmarks."), "ColBERT & TEI Benchmarks");
-        assert_eq!(clean_name("SIE-INTERNAL CLUSTER"), ""); // shouty
-        assert_eq!(clean_name("finalize-aws-gcp-multi-gpu"), ""); // slug
-        assert_eq!(clean_name("Helm Perf Lab Cluster"), ""); // generic "… cluster"
-        assert_eq!(clean_name("foo, bar, baz"), ""); // listy
+    fn clean_name_normalizes_shouting() {
+        // The 0.6B SHOUTS and snake_cases good titles — normalize, don't reject.
+        assert_eq!(clean_name("SPARSE OPTIMIZATION"), "Sparse Optimization");
+        assert_eq!(clean_name("GPU INFRASTRUCTURE OPTIMIZATION"), "GPU Infrastructure Optimization");
+        assert_eq!(clean_name("QUEUE_ROUTING_NATS_HEALTH"), "Queue Routing NATS Health"); // snake → spaces
+        assert_eq!(clean_name("CONFIG API IMPLEMENTATION AND EXPANSION"), "Config API Implementation and Expansion");
+        assert_eq!(clean_name("VISION IMPROVEMENT CLUSTER"), "Vision Improvement"); // drop generic suffix
+        // Genuine non-titles still fall back to the keyphrase label.
+        assert_eq!(clean_name("Sharing experiments, proposing models, and cutting costs."), "");
     }
 }
 

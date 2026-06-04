@@ -113,9 +113,11 @@ pub struct TopicUnits {
 }
 
 impl TopicUnits {
-    /// The display title: the LLM name if present, else the keyphrase label.
+    /// The display title: the short LLM name, else the (longer) summary, else the
+    /// keyphrase label. So a topic only shows keywords when it has neither a name
+    /// nor a summary — never as the primary title when a description exists.
     pub fn title(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.label)
+        self.name.as_deref().or(self.summary.as_deref()).unwrap_or(&self.label)
     }
 }
 

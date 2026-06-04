@@ -483,9 +483,14 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        // keyphrase label on top; the reduced topic summary below
-                        // (falling back to the latest member's summary)
-                        let line = t.summary.clone().or_else(|| t.units.iter().find_map(|u| u.summary.clone())).unwrap_or_default();
+                        // title() is the LLM name on top; show the summary below.
+                        // When there's no name the title is already the summary, so
+                        // put the keyphrases below instead of duplicating it.
+                        let line = if t.name.is_some() {
+                            t.summary.clone().or_else(|| t.units.iter().find_map(|u| u.summary.clone())).unwrap_or_default()
+                        } else {
+                            t.label.clone()
+                        };
                         Row::new(vec![
                             two_line(t.title().to_string(), line, theme::FG),
                             day_strip(&dailies[i], cap),
