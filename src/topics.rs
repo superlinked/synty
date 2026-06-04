@@ -1,7 +1,8 @@
 // Unit-level topics. Instead of clustering the 4k-doc message firehose, cluster
 // the *units of work* (sessions, PRs, issues) by a multi-vector ColBERT
-// embedding of a compact per-unit text (its summary plus the session keyphrases
-// or the PR/issue title — a lone one-liner is too thin to separate) — MaxSim kNN
+// embedding of a compact per-unit text (its summary plus the session's repo and
+// touched files, or the PR/issue body — a lone one-liner is too thin to
+// separate) — MaxSim kNN
 // + Louvain, the same late-interaction substrate as retrieval, one level up. A
 // topic is then a coherent set of units, so its members/facets/label/summary are
 // consistent by construction. Writes unit_clusters.json; reports silhouette.
@@ -94,7 +95,10 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         eprintln!("topics: reassigned {moved} outlier units to their nearest cluster");
     }
 
-    // Member lists + c-TF-IDF labels over the *reassigned* membership.
+    // Member lists, plus a readable label per cluster: its most concise member
+    // summary. A provisional identifier for reports and the unit_clusters.json
+    // fallback — the topic's own LLM name/summary replaces it once `summarize`
+    // runs. (Clustering itself is LLM-free; this just borrows the unit summaries.)
     let ncl = clusters.len();
     let mut members: Vec<Vec<usize>> = vec![Vec::new(); ncl];
     for (i, o) in of.iter().enumerate() {
@@ -102,19 +106,28 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
             members[*ci].push(i);
         }
     }
-    let texts: Vec<Vec<&str>> = members.iter().map(|c| c.iter().map(|&m| units[m].summary.as_str()).collect()).collect();
-    let phrases = crate::keyphrase::labels(&texts, 4);
+    let labels: Vec<String> = members
+        .iter()
+        .map(|c| {
+            c.iter()
+                .map(|&m| units[m].summary.as_str())
+                .filter(|s| !s.is_empty())
+                .min_by_key(|s| s.len())
+                .map(|s| crate::excerpt(s, 60))
+                .unwrap_or_default()
+        })
+        .collect();
 
     let mut assign: Vec<serde_json::Value> = Vec::new();
     for (i, o) in of.iter().enumerate() {
         if let Some(ci) = o {
-            assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "label": phrases[*ci].join(", ")}));
+            assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "label": labels[*ci]}));
         }
     }
     std::fs::write("unit_clusters.json", serde_json::to_string(&assign)?)?;
     eprintln!("topics: wrote unit_clusters.json");
-    let (sil, misplaced, scored) = report_quality(&results, &of, &phrases, &units);
-    diag(&units, &results, &of, &phrases);
+    let (sil, misplaced, scored) = report_quality(&results, &of, &labels, &units);
+    diag(&units, &results, &of, &labels);
 
     // Standardized health/quality metrics (stderr block + metrics.jsonl line).
     let mut sizes: Vec<usize> = members.iter().map(|m| m.len()).filter(|&l| l > 0).collect();
@@ -142,9 +155,9 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
 /// Optional per-unit neighbor dump (`SYNTY_DIAG=<key substring>`): for each
 /// matching unit print its assigned cluster and its top MaxSim neighbors with
 /// scores and their clusters — to see *why* a unit landed where it did.
-fn diag(units: &[units::UnitClusterInput], results: &[next_plaid::QueryResult], of: &[Option<usize>], phrases: &[Vec<String>]) {
+fn diag(units: &[units::UnitClusterInput], results: &[next_plaid::QueryResult], of: &[Option<usize>], phrases: &[String]) {
     let Ok(want) = std::env::var("SYNTY_DIAG") else { return };
-    let label = |ci: Option<usize>| ci.map(|c| phrases.get(c).map(|p| p.join(", ")).unwrap_or_default()).unwrap_or_else(|| "—".into());
+    let label = |ci: Option<usize>| ci.map(|c| phrases.get(c).cloned().unwrap_or_default()).unwrap_or_else(|| "—".into());
     for (i, u) in units.iter().enumerate() {
         if !u.key.contains(&want) {
             continue;
@@ -261,8 +274,8 @@ fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) 
 /// cluster — a likely misplacement. Prints the worst offenders (where they sit
 /// vs where they'd rather be) and returns (mean silhouette, misplaced count,
 /// scored count) for the standardized metrics line.
-fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], labels: &[Vec<String>], units: &[units::UnitClusterInput]) -> (f32, usize, usize) {
-    let label = |ci: usize| labels.get(ci).map(|p| p.join(", ")).unwrap_or_default();
+fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], labels: &[String], units: &[units::UnitClusterInput]) -> (f32, usize, usize) {
+    let label = |ci: usize| labels.get(ci).cloned().unwrap_or_default();
     let mut sils: Vec<(usize, usize, usize, f32)> = Vec::new(); // (unit, own ci, nearest other ci, silhouette)
     for (i, r) in results.iter().enumerate() {
         let Some(ci) = of[i] else { continue };

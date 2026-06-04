@@ -1,8 +1,8 @@
 // Local abstractive session summaries via Qwen3-0.6B on candle. One concise
 // sentence per session, generated offline and cached by an input hash so the
 // reader never runs the model at view time. Greedy decode (temperature 0) keeps
-// it reproducible. This is the ONLY place a generative model is used — retrieval,
-// clustering, and keyphrases stay LLM-free, and nothing leaves the machine.
+// it reproducible. This is the ONLY place a generative model is used — retrieval
+// and clustering stay LLM-free, and nothing leaves the machine.
 
 use crate::units::{self, CachedSummary, DocInput, SessionInput};
 use anyhow::{anyhow, Context, Result};
@@ -89,7 +89,7 @@ fn select_device() -> Device {
 }
 
 /// One-line instruction prompt in Qwen's chat format, fed the extractive signals
-/// (ask, keyphrases, on-topic turns) for the model to synthesize.
+/// (ask + the longest turns) for the model to synthesize.
 fn prompt_for(s: &SessionInput) -> String {
     let mut turns = String::new();
     for (i, t) in s.turns.iter().enumerate() {
@@ -103,11 +103,10 @@ Name the concrete subject — the feature, file, component, repo, or system work
 Say what was built, changed, investigated, or decided, with the key specifics. \
 Skip greetings, status preambles, and meta-commentary. \
 Never echo a field label or output the repository name by itself. No preamble, no quotes, no lists.\n\n\
-Repo: {}\nFiles changed: {}\nInitial request: {}\nKey terms: {}\nMessages (chronological):\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+Repo: {}\nFiles changed: {}\nInitial request: {}\nMessages (chronological):\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
         s.repo,
         files,
         s.ask,
-        s.keyphrases.join(", "),
         turns,
     )
 }
@@ -126,7 +125,7 @@ Repo: {}\nTitle: {}\nBody:\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</th
 
 /// Reduce a cluster's member-unit summaries into one theme summary. Clustering
 /// is by summary embedding, so the members are genuinely on-theme.
-fn prompt_for_topic(label: &str, members: &[String]) -> String {
+fn prompt_for_topic(members: &[String]) -> String {
     let mut items = String::new();
     for m in members {
         items.push_str("- ");
@@ -135,9 +134,9 @@ fn prompt_for_topic(label: &str, members: &[String]) -> String {
     }
     format!(
         "<|im_start|>user\nYou are describing a cluster of related engineering work for an index. \
-From the keyphrases and the one-line summaries of its items below, write ONE self-contained sentence (max 26 words) naming what this area is about and what was done across it. \
+From the one-line summaries of its items below, write ONE self-contained sentence (max 26 words) naming what this area is about and what was done across it. \
 Name concrete subjects; do not just list the items. No preamble, no quotes, no lists.\n\n\
-Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+Items:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
 }
 
@@ -193,7 +192,7 @@ fn clean(s: &str) -> String {
     // Reject degenerate outputs that just echo a prompt field; the caller then
     // falls back to the extractive line.
     let low = line.to_lowercase();
-    let echo = ["repo:", "files changed:", "initial request:", "key terms:", "messages"]
+    let echo = ["repo:", "files changed:", "initial request:", "messages"]
         .iter()
         .any(|p| low.starts_with(p));
     if line.len() < 15 || echo {
@@ -206,7 +205,7 @@ fn clean(s: &str) -> String {
 /// all-caps and sometimes snake_cases, so *normalize* (underscores→spaces,
 /// Title Case keeping acronyms) rather than reject. Only genuine non-titles —
 /// comma-lists, whole sentences (>6 words), field echoes, the bare generic
-/// word — fall back to the keyphrase label.
+/// word — fall back to the representative-member label.
 fn clean_name(s: &str) -> String {
     let s = s.rsplit("</think>").next().unwrap_or(s).trim().trim_matches('"').trim();
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s).replace('_', " ");
@@ -272,7 +271,7 @@ fn hash_parts(parts: &[&str]) -> String {
 }
 
 fn input_hash(s: &SessionInput) -> String {
-    hash_parts(&[&s.ask, &s.keyphrases.join(","), &s.files.join(","), &s.turns.join("\n")])
+    hash_parts(&[&s.ask, &s.files.join(","), &s.turns.join("\n")])
 }
 
 fn doc_hash(d: &DocInput) -> String {
@@ -290,7 +289,7 @@ struct Job {
 }
 
 /// Salt for the topic reduce / name prompts; bump to regenerate them only.
-const TOPIC_PROMPT_VERSION: &str = "t5";
+const TOPIC_PROMPT_VERSION: &str = "t6";
 const TOPIC_NAME_VERSION: &str = "s1";
 
 /// Unit jobs: one per session and per PR/issue.
@@ -320,12 +319,12 @@ fn topic_jobs() -> Result<Vec<Job>> {
         }
         let mut sorted: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
         sorted.sort_unstable();
-        let mut sum_parts = vec![TOPIC_PROMPT_VERSION, t.label.as_str()];
+        let mut sum_parts = vec![TOPIC_PROMPT_VERSION];
         sum_parts.extend(sorted.iter().copied());
         jobs.push(Job {
             key: units::topic_key(t.id),
             hash: hash_parts(&sum_parts),
-            prompt: prompt_for_topic(&t.label, &members),
+            prompt: prompt_for_topic(&members),
             label: format!("topic:{}", t.id),
             short: false,
         });
@@ -414,7 +413,7 @@ mod tests {
         assert_eq!(clean_name("QUEUE_ROUTING_NATS_HEALTH"), "Queue Routing NATS Health"); // snake → spaces
         assert_eq!(clean_name("CONFIG API IMPLEMENTATION AND EXPANSION"), "Config API Implementation and Expansion");
         assert_eq!(clean_name("VISION IMPROVEMENT CLUSTER"), "Vision Improvement"); // drop generic suffix
-        // Genuine non-titles still fall back to the keyphrase label.
+        // Genuine non-titles still fall back to the representative-member label.
         assert_eq!(clean_name("Sharing experiments, proposing models, and cutting costs."), "");
     }
 }

@@ -501,10 +501,7 @@ impl App {
                             day_strip(&dailies[i], cap),
                             Cell::from(t.units.len().to_string()).style(dim),
                         ])
-                        // 3 tall: the two content lines sit together at the top and
-                        // the blank third line separates this topic from the next,
-                        // so the 2-row strip reads as one group, not two rows.
-                        .height(3)
+                        .height(2)
                     })
                     .collect();
                 (
@@ -587,13 +584,8 @@ impl App {
             s.thinking,
             s.tools,
         );
-        if !s.keyphrases.is_empty() {
-            o.push_str(&format!("about: {}\n", s.keyphrases.join(", ")));
-        }
-        match &s.summary {
-            Some(sum) => o.push_str(&format!("summary: {sum}\n")),
-            None if !s.gist.is_empty() => o.push_str(&format!("gist: {}\n", s.gist)),
-            None => {}
+        if let Some(sum) = &s.summary {
+            o.push_str(&format!("summary: {sum}\n"));
         }
         if let Some(pr) = &s.linked_pr {
             o.push_str(&format!("linked PR: {pr}\n"));
@@ -883,8 +875,6 @@ mod tests {
             linked_pr: None,
             topic: Some(0),
             struggle: 0.6,
-            keyphrases: vec!["ocr".into(), "adapter".into()],
-            gist: "add OCR adapter".into(),
             summary: Some("Added an OCR adapter to the sie pipeline.".into()),
         };
         let work = vec![

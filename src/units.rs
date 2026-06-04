@@ -28,8 +28,6 @@ pub struct Session {
     pub linked_pr: Option<String>,
     pub topic: Option<i64>,
     pub struggle: f32, // 0..1, normalized across sessions
-    pub keyphrases: Vec<String>,
-    pub gist: String, // representative line (most keyphrase coverage)
     pub summary: Option<String>, // abstractive one-liner (local LLM), if cached
 }
 
@@ -62,13 +60,12 @@ pub fn save_summary_cache(c: &SummaryCache) -> Result<()> {
     Ok(())
 }
 
-/// Per-session material for the summarizer: the ask, keyphrases, and the few
-/// messages with the most keyphrase coverage (the on-topic turns).
+/// Per-session material for the summarizer: the ask and the few longest turns
+/// (the substantive ones).
 pub struct SessionInput {
     pub id: String,
     pub repo: String,
     pub ask: String,
-    pub keyphrases: Vec<String>,
     pub files: Vec<String>,
     pub turns: Vec<String>,
 }
@@ -114,8 +111,8 @@ pub struct TopicUnits {
 
 impl TopicUnits {
     /// The display title: the short LLM name, else the (longer) summary, else the
-    /// keyphrase label. So a topic only shows keywords when it has neither a name
-    /// nor a summary — never as the primary title when a description exists.
+    /// cluster's representative-member label — so a topic only falls back to the
+    /// label when it has neither a name nor a summary.
     pub fn title(&self) -> &str {
         self.name.as_deref().or(self.summary.as_deref()).unwrap_or(&self.label)
     }
@@ -144,7 +141,7 @@ struct Agg {
     files: Vec<String>,
     seen_files: std::collections::HashSet<String>,
     linked_pr: Option<String>,
-    texts: Vec<String>, // message texts for keyphrase extraction
+    texts: Vec<String>, // message texts, for the summarizer's turn selection
 }
 
 /// Aggregate the raw envelopes under corpus/local into per-session tallies.
@@ -243,10 +240,6 @@ pub fn sessions() -> Result<Vec<Session>> {
     let raw: Vec<[f64; 4]> = ids.iter().map(|id| sig(&aggs[id])).collect();
     let scores = struggle_scores(&raw);
 
-    // c-TF-IDF keyphrases per session, the same extractive labeling as topics.
-    let text_refs: Vec<Vec<&str>> = ids.iter().map(|id| aggs[id].texts.iter().map(String::as_str).collect()).collect();
-    let keyphrases = crate::keyphrase::labels(&text_refs, 4);
-
     let mut out: Vec<Session> = ids
         .iter()
         .enumerate()
@@ -267,8 +260,6 @@ pub fn sessions() -> Result<Vec<Session>> {
                 linked_pr: a.linked_pr.clone(),
                 topic: topic_of.get(id).map(|(c, _)| *c),
                 struggle: scores[i],
-                gist: best_line(&aggs[id].texts, keyphrases.get(i).map(Vec::as_slice).unwrap_or(&[])),
-                keyphrases: keyphrases.get(i).cloned().unwrap_or_default(),
                 summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
             }
         })
@@ -450,27 +441,22 @@ fn unit_mix(units: &[Unit]) -> (usize, usize, usize) {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-/// Per-session inputs for the LLM summarizer (ask + keyphrases + on-topic
-/// turns). Shares aggregation and keyphrase extraction with `sessions`.
+/// Per-session inputs for the LLM summarizer (ask + the longest turns). Shares
+/// aggregation with `sessions`.
 pub fn session_inputs() -> Result<Vec<SessionInput>> {
     let aggs = aggregate();
     let ids: Vec<String> = aggs.keys().cloned().collect();
-    let text_refs: Vec<Vec<&str>> = ids.iter().map(|id| aggs[id].texts.iter().map(String::as_str).collect()).collect();
-    let keyphrases = crate::keyphrase::labels(&text_refs, 4);
     Ok(ids
         .iter()
-        .enumerate()
-        .filter(|(_, id)| aggs[*id].prompts > 0)
-        .map(|(i, id)| {
+        .filter(|id| aggs[*id].prompts > 0)
+        .map(|id| {
             let a = &aggs[id];
-            let kps = keyphrases.get(i).cloned().unwrap_or_default();
             SessionInput {
                 id: id.clone(),
                 repo: if a.repo.is_empty() { "local".into() } else { a.repo.clone() },
                 ask: a.ask.clone(),
                 files: a.files.iter().take(12).cloned().collect(),
-                turns: top_turns(&a.texts, &kps, 8),
-                keyphrases: kps,
+                turns: top_turns(&a.texts, 8),
             }
         })
         .collect())
@@ -552,44 +538,16 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
     Ok(out)
 }
 
-/// The k messages with the most keyphrase coverage, returned in chronological
-/// order and each capped generously (so the substance after a preamble survives,
-/// not just the generic opener). The material a summarizer reads.
-fn top_turns(texts: &[String], kps: &[String], k: usize) -> Vec<String> {
-    let lk: Vec<String> = kps.iter().map(|s| s.to_lowercase()).collect();
-    let mut scored: Vec<(usize, usize, &String)> = texts
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let lt = t.to_lowercase();
-            (lk.iter().filter(|k| lt.contains(k.as_str())).count(), i, t)
-        })
-        .collect();
-    // most coverage first; ties toward earlier turns
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let mut picked: Vec<(usize, &String)> = scored.into_iter().take(k).map(|(_, i, t)| (i, t)).collect();
-    // restore chronological order so the model reads the session in sequence
-    picked.sort_by_key(|(i, _)| *i);
-    picked.into_iter().map(|(_, t)| crate::excerpt(t, 600)).collect()
-}
-
-/// The session's most representative line: the message covering the most of its
-/// own keyphrases (ties broken toward the more concise one), whitespace-collapsed
-/// and capped. An extractive stand-in for an abstractive summary.
-fn best_line(texts: &[String], kps: &[String]) -> String {
-    if texts.is_empty() {
-        return String::new();
-    }
-    if kps.is_empty() {
-        return crate::excerpt(&texts[0], 160);
-    }
-    let lk: Vec<String> = kps.iter().map(|k| k.to_lowercase()).collect();
-    let best = texts.iter().max_by_key(|t| {
-        let lt = t.to_lowercase();
-        let cov = lk.iter().filter(|k| lt.contains(k.as_str())).count();
-        (cov, usize::MAX - t.len()) // most coverage, then shortest
-    });
-    best.map(|t| crate::excerpt(t, 160)).unwrap_or_default()
+/// The k longest messages, returned in chronological order and each capped
+/// generously — a keyphrase-free stand-in for "the on-topic turns": longer
+/// messages carry more of the actual work than the generic opener. The material
+/// a summarizer reads.
+fn top_turns(texts: &[String], k: usize) -> Vec<String> {
+    let mut idx: Vec<usize> = (0..texts.len()).collect();
+    idx.sort_by_key(|&i| std::cmp::Reverse(texts[i].len()));
+    idx.truncate(k);
+    idx.sort_unstable(); // restore chronological order
+    idx.into_iter().map(|i| crate::excerpt(&texts[i], 600)).collect()
 }
 
 fn session_outcome(s: &Session) -> String {

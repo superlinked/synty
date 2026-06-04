@@ -1,6 +1,6 @@
 // CLI summaries over the shared `units` view-model (parity with the TUI):
-//  - Sessions: repo, counts, opening ask, keyphrases, the one-line summary (or
-//    extractive gist), files touched, effort, linked PR.
+//  - Sessions: repo, counts, opening ask, the one-line summary, files touched,
+//    effort, linked PR.
 //  - Topics: the unit-level topic digest, same as `topic`, top N by recency.
 
 use crate::short;
@@ -13,13 +13,12 @@ pub fn run(sessions: usize, topics: usize) -> Result<()> {
     Ok(())
 }
 
-/// Print the exact summarizer inputs (ask, keyphrases, selected turns with their
-/// lengths) for every session — to inspect input quality without running the model.
+/// Print the exact summarizer inputs (ask, selected turns with their lengths)
+/// for every session — to inspect input quality without running the model.
 pub fn dump_inputs() -> Result<()> {
     for s in crate::units::session_inputs()? {
         println!("## {} · {}", short(&s.id), s.repo);
         println!("ask [{} chars]: {}", s.ask.len(), s.ask);
-        println!("keyphrases: {}", s.keyphrases.join(", "));
         for (i, t) in s.turns.iter().enumerate() {
             println!("  turn{i} [{} chars]: {}", t.len(), t);
         }
@@ -48,13 +47,8 @@ fn session_summaries(n: usize) -> Result<()> {
             crate::view::meter(s.struggle)
         );
         println!("ask: {}", s.ask);
-        if !s.keyphrases.is_empty() {
-            println!("about: {}", s.keyphrases.join(", "));
-        }
-        match &s.summary {
-            Some(sum) => println!("summary: {sum}"),
-            None if !s.gist.is_empty() => println!("gist: {}", s.gist),
-            None => {}
+        if let Some(sum) = &s.summary {
+            println!("summary: {sum}");
         }
         if !s.files.is_empty() {
             println!("files: {}", s.files.iter().take(8).cloned().collect::<Vec<_>>().join(", "));

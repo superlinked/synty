@@ -14,7 +14,6 @@ mod encode;
 mod eval;
 mod event;
 mod github;
-mod keyphrase;
 mod metrics;
 mod store;
 mod sync;
@@ -174,7 +173,7 @@ enum Cmd {
         /// Skip LLM generation; show cached/extractive summaries only.
         #[arg(long)]
         cached: bool,
-        /// Print the raw summarizer inputs (ask/keyphrases/turns) and exit.
+        /// Print the raw summarizer inputs (ask/turns) and exit.
         #[arg(long)]
         dump: bool,
         /// Prompt-tuning dry run: generate (don't cache) N topic summaries and print them.
