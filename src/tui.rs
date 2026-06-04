@@ -491,8 +491,11 @@ impl App {
                         } else {
                             t.label.clone()
                         };
+                        // repos on top, people below — a compact 2-line column.
+                        let cap2 = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.iter().take(3).cloned().collect::<Vec<_>>().join(", ") };
                         Row::new(vec![
                             two_line(t.title().to_string(), line, theme::FG),
+                            two_line(cap2(&t.repos), cap2(&t.authors), theme::FG),
                             day_strip(&dailies[i], cap),
                             Cell::from(t.units.len().to_string()).style(dim),
                             Cell::from(t.last_active.clone()).style(dim),
@@ -501,8 +504,8 @@ impl App {
                     })
                     .collect();
                 (
-                    vec!["", "ACTIVITY (4wk by day)", "UNITS", "LAST"],
-                    vec![Constraint::Min(20), Constraint::Length(TL_DAYS as u16 + 3), Constraint::Length(5), Constraint::Length(11)],
+                    vec!["", "REPOS · PEOPLE", "ACTIVITY (4wk by day)", "UNITS", "LAST"],
+                    vec![Constraint::Min(20), Constraint::Length(22), Constraint::Length(TL_DAYS as u16 + 3), Constraint::Length(5), Constraint::Length(11)],
                     rows,
                 )
             }
@@ -710,7 +713,9 @@ fn daily(t: &TopicUnits, gmax: i32) -> [u64; TL_DAYS] {
 }
 
 /// One block per day, shaded by that day's activity, grouped into weeks with a
-/// thin `│` divider every 7 days. Newest day on the right.
+/// thin `│` divider every 7 days. Newest day on the right. Rendered two rows
+/// tall (the same strip on both lines) so each day is a taller, easier-to-compare
+/// column that lines up with the two-line title/repos cells.
 fn day_strip(days: &[u64; TL_DAYS], cap: u64) -> Cell<'static> {
     let mut spans: Vec<Span> = Vec::with_capacity(TL_DAYS + TL_DAYS / 7);
     for (d, &n) in days.iter().enumerate() {
@@ -723,7 +728,7 @@ fn day_strip(days: &[u64; TL_DAYS], cap: u64) -> Cell<'static> {
             Span::styled("█", Style::new().fg(shade(n, cap)))
         });
     }
-    Cell::from(Line::from(spans))
+    Cell::from(Text::from(vec![Line::from(spans.clone()), Line::from(spans)]))
 }
 
 fn type_cell(k: Kind) -> Cell<'static> {
@@ -953,6 +958,8 @@ mod tests {
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("ACTIVITY"), "topics activity header missing");
         assert!(text.contains('│'), "week divider missing from activity strip");
+        assert!(text.contains("REPOS · PEOPLE"), "repos/people column header missing");
+        assert!(text.contains("sie, sie-web"), "repos line missing from topics row");
     }
 
     // Work rows surface the session's one-line summary, not just the ask.
