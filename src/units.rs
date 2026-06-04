@@ -200,10 +200,9 @@ fn aggregate() -> HashMap<String, Agg> {
                 "tool_call" => a.tools += 1,
                 "attachment_ref" => {
                     if FILE_TOOLS.contains(&ev["payload"]["tool_name"].as_str().unwrap_or("")) {
-                        if let Some(p) = ev["payload"]["local_path"].as_str() {
-                            let base = p.rsplit('/').next().unwrap_or(p).to_string();
-                            if a.seen_files.insert(base.clone()) {
-                                a.files.push(base);
+                        if let Some(tok) = ev["payload"]["local_path"].as_str().and_then(file_token) {
+                            if a.seen_files.insert(tok.clone()) {
+                                a.files.push(tok);
                             }
                         }
                     }
@@ -519,7 +518,11 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
     let mut out = Vec::new();
     for s in sessions()? {
         if let Some(summary) = s.summary.filter(|x| !x.is_empty()) {
-            let embed = format!("{summary} {} {}", s.repo, s.files.join(" "));
+            // Cap files + total length so sessions stay comparable in length to the
+            // 500-capped PR/issue embeds (MaxSim is length-biased — an embed that's
+            // all file paths would otherwise dominate and over-group by repo).
+            let files = s.files.iter().take(8).cloned().collect::<Vec<_>>().join(" ");
+            let embed = crate::excerpt(&format!("{summary} {} {}", s.repo, files), 500);
             out.push(UnitClusterInput { key: s.id, summary, embed });
         }
     }
@@ -548,6 +551,19 @@ fn top_turns(texts: &[String], k: usize) -> Vec<String> {
     idx.truncate(k);
     idx.sort_unstable(); // restore chronological order
     idx.into_iter().map(|i| crate::excerpt(&texts[i], 600)).collect()
+}
+
+/// A repo-qualified path tail for a touched file: the last up to 3 components
+/// (e.g. "synty/src/topics.rs"), so generic basenames like main.rs separate by
+/// repo in the clustering embed and the repo recurs once per file. Skips harness
+/// artifacts (sub-agent task outputs under /tmp, .claude state) — not source.
+fn file_token(path: &str) -> Option<String> {
+    if path.contains("/tmp/") || path.contains("/.claude/") || path.ends_with(".output") {
+        return None;
+    }
+    let mut parts: Vec<&str> = path.rsplit('/').filter(|s| !s.is_empty()).take(3).collect();
+    parts.reverse();
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 fn session_outcome(s: &Session) -> String {
@@ -612,6 +628,15 @@ fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // File tokens are repo-qualified path tails; harness/temp artifacts are dropped.
+    #[test]
+    fn file_token_qualifies_and_filters() {
+        assert_eq!(file_token("/Users/svonava/c/synty/src/topics.rs").as_deref(), Some("synty/src/topics.rs"));
+        assert_eq!(file_token("/Users/svonava/c/sie-internal/src/main.rs").as_deref(), Some("sie-internal/src/main.rs"));
+        assert_eq!(file_token("/Users/svonava/c/synty/Cargo.toml").as_deref(), Some("c/synty/Cargo.toml"));
+        assert_eq!(file_token("/private/tmp/claude-501/x/tasks/be6b03qny.output"), None);
+    }
 
     #[test]
     fn weekly_buckets_places_activity_by_age() {
