@@ -492,20 +492,19 @@ impl App {
                             t.label.clone()
                         };
                         // repos on top, people below — a compact 2-line column.
-                        let cap2 = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.iter().take(3).cloned().collect::<Vec<_>>().join(", ") };
+                        let cap2 = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.iter().take(4).cloned().collect::<Vec<_>>().join(", ") };
                         Row::new(vec![
                             two_line(t.title().to_string(), line, theme::FG),
                             two_line(cap2(&t.repos), cap2(&t.authors), theme::FG),
                             day_strip(&dailies[i], cap),
                             Cell::from(t.units.len().to_string()).style(dim),
-                            Cell::from(t.last_active.clone()).style(dim),
                         ])
                         .height(2)
                     })
                     .collect();
                 (
-                    vec!["", "REPOS · PEOPLE", "ACTIVITY (4wk by day)", "UNITS", "LAST"],
-                    vec![Constraint::Min(20), Constraint::Length(22), Constraint::Length(TL_DAYS as u16 + 3), Constraint::Length(5), Constraint::Length(11)],
+                    vec!["", "REPOS · PEOPLE", "ACTIVITY (4wk by day)", "UNITS"],
+                    vec![Constraint::Min(20), Constraint::Length(32), Constraint::Length(TL_DAYS as u16 + 3), Constraint::Length(5)],
                     rows,
                 )
             }
