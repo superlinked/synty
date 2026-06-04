@@ -62,7 +62,7 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
         o.push_str(&format!(
             "## {} — {}\n{} units · last active {} · activity this/last/prior wk: {}/{}/{} · {sess} sessions / {prs} PRs / {issues} issues\n",
             t.id,
-            t.label,
+            t.title(),
             t.units.len(),
             t.last_active,
             wk(1),

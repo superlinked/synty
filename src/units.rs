@@ -108,12 +108,25 @@ pub struct TopicUnits {
     pub repos: Vec<String>,   // repos involved, most frequent first
     pub authors: Vec<String>, // authors involved, most frequent first
     pub summary: Option<String>, // map-reduced topic summary (local LLM), if cached
+    pub name: Option<String>, // short LLM title (local LLM), if cached
     pub span: Option<(String, String)>, // first/last active day (YYYY-MM-DD)
+}
+
+impl TopicUnits {
+    /// The display title: the LLM name if present, else the keyphrase label.
+    pub fn title(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.label)
+    }
 }
 
 /// Cache key for a topic's reduced summary.
 pub fn topic_key(id: i64) -> String {
     format!("topic:{id}")
+}
+
+/// Cache key for a topic's short LLM name.
+pub fn topic_name_key(id: i64) -> String {
+    format!("topicname:{id}")
 }
 
 #[derive(Default)]
@@ -334,7 +347,8 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
             let repos = by_count(units.iter().filter(|u| !u.repo.is_empty()).map(|u| u.repo.clone()));
             let authors = by_count(units.iter().filter(|u| !u.author.is_empty()).map(|u| u.author.clone()));
             let summary = cache.get(&topic_key(id)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
-            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors, summary, span }
+            let name = cache.get(&topic_name_key(id)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
+            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors, summary, name, span }
         })
         .collect();
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));

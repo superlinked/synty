@@ -67,7 +67,7 @@ impl Summarizer {
             input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
         }
         let text = self.tok.decode(&out, true).map_err(|e| anyhow!("decode: {e}"))?;
-        Ok((clean(&text), ids.len(), out.len()))
+        Ok((text, ids.len(), out.len())) // raw; the caller cleans per job type
     }
 }
 
@@ -141,6 +141,21 @@ Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n
     )
 }
 
+/// Reduce a cluster's member summaries into a short Title-Case name.
+fn prompt_for_topic_name(label: &str, members: &[String]) -> String {
+    let mut items = String::new();
+    for m in members.iter().take(20) {
+        items.push_str("- ");
+        items.push_str(m);
+        items.push('\n');
+    }
+    format!(
+        "<|im_start|>user\nName this cluster of related engineering work with a short human title in Title Case — 2 to 5 words, like a chapter title. \
+Just the title: no slug, no commas, no file or branch names, no trailing period, no quotes.\n\n\
+Keyphrases: {label}\nItems:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    )
+}
+
 /// Drop a *complete* meta-opener clause including its verb ("This theme focuses
 /// on …", "The theme is …") so the remainder stays grammatical, then
 /// re-capitalize. Removing only "This theme " (without the verb) would leave a
@@ -192,6 +207,29 @@ fn clean(s: &str) -> String {
     line
 }
 
+/// Clean a short topic name: no length floor, trailing period trimmed, and
+/// drop echoes of the prompt's field labels.
+fn clean_name(s: &str) -> String {
+    let s = s.rsplit("</think>").next().unwrap_or(s).trim().trim_matches('"').trim();
+    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s);
+    let line = strip_opener(&crate::excerpt(line, 48));
+    let line = line.trim_end_matches('.').trim().to_string();
+    let low = line.to_lowercase();
+    let echo = ["keyphrases:", "items:", "name:", "title:", "repo:"].iter().any(|p| low.starts_with(p));
+    // Reject junk the 0.6B emits — slugs, comma-lists, ALL-CAPS shouting, the
+    // generic "… Cluster" suffix, over-long — so the caller keeps the keyphrase
+    // label instead. Only clean Title-Case names survive.
+    let slug = !line.contains(' ') && (line.contains('-') || line.contains('_'));
+    let listy = line.matches(',').count() >= 2;
+    let shouty = line.chars().any(|c| c.is_alphabetic()) && line == line.to_uppercase();
+    let generic = low.ends_with(" cluster") || matches!(low.as_str(), "cluster" | "chores");
+    if line.is_empty() || echo || slug || listy || shouty || generic || line.len() > 42 || line.split_whitespace().count() > 6 {
+        String::new()
+    } else {
+        line
+    }
+}
+
 /// 8-byte content hash of arbitrary parts, salted by the prompt version so a
 /// prompt change invalidates the cache.
 fn hash_parts(parts: &[&str]) -> String {
@@ -213,15 +251,18 @@ fn doc_hash(d: &DocInput) -> String {
 }
 
 /// One unit of summarization work: a cache key, its input hash, and the prompt.
+/// `short` jobs are topic names (cleaned as a title, not a sentence).
 struct Job {
     key: String,
     hash: String,
     prompt: String,
     label: String,
+    short: bool,
 }
 
-/// Salt for the topic (reduce) prompt; bump to regenerate topic summaries only.
+/// Salt for the topic reduce / name prompts; bump to regenerate them only.
 const TOPIC_PROMPT_VERSION: &str = "t5";
+const TOPIC_NAME_VERSION: &str = "n3";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -229,17 +270,17 @@ fn unit_jobs() -> Result<Vec<Job>> {
     let docs = units::doc_inputs()?;
     let mut jobs = Vec::with_capacity(sessions.len() + docs.len());
     for s in &sessions {
-        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id) });
+        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id), short: false });
     }
     for d in &docs {
-        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone() });
+        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone(), short: false });
     }
     Ok(jobs)
 }
 
-/// Topic jobs, reduced from the cluster's member-unit summaries. The hash is
-/// over the label + sorted member summaries, so a topic regenerates when its
-/// membership or any member summary changes.
+/// Topic jobs: a one-line summary and a short name per cluster, both reduced
+/// from the member-unit summaries. The hash is over the label + sorted member
+/// summaries, so each regenerates when membership or a member summary changes.
 fn topic_jobs() -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
     for t in units::topic_units(12)? {
@@ -249,13 +290,23 @@ fn topic_jobs() -> Result<Vec<Job>> {
         }
         let mut sorted: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
         sorted.sort_unstable();
-        let mut parts = vec![TOPIC_PROMPT_VERSION, t.label.as_str()];
-        parts.extend(sorted);
+        let mut sum_parts = vec![TOPIC_PROMPT_VERSION, t.label.as_str()];
+        sum_parts.extend(sorted.iter().copied());
+        let mut name_parts = vec![TOPIC_NAME_VERSION, t.label.as_str()];
+        name_parts.extend(sorted.iter().copied());
         jobs.push(Job {
             key: units::topic_key(t.id),
-            hash: hash_parts(&parts),
+            hash: hash_parts(&sum_parts),
             prompt: prompt_for_topic(&t.label, &members),
             label: format!("topic:{}", t.id),
+            short: false,
+        });
+        jobs.push(Job {
+            key: units::topic_name_key(t.id),
+            hash: hash_parts(&name_parts),
+            prompt: prompt_for_topic_name(&t.label, &members),
+            label: format!("name:{}", t.id),
+            short: true,
         });
     }
     Ok(jobs)
@@ -281,13 +332,14 @@ fn pending<'a>(jobs: &'a [Job], cache: &units::SummaryCache) -> Vec<&'a Job> {
 fn run_jobs(todo: &[&Job], cache: &mut units::SummaryCache, llm: &mut Summarizer, kind: &str) -> Result<(usize, usize)> {
     let (mut in_tok, mut out_tok) = (0usize, 0usize);
     for (n, j) in todo.iter().enumerate() {
-        let (summary, pt, ot) = match llm.generate(&j.prompt) {
+        let (raw, pt, ot) = match llm.generate(&j.prompt) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("  {} failed: {e}", j.label);
                 (String::new(), 0, 0)
             }
         };
+        let summary = if j.short { clean_name(&raw) } else { clean(&raw) };
         in_tok += pt;
         out_tok += ot;
         eprintln!("  [{kind} {}/{}] {} — {}", n + 1, todo.len(), j.label, summary);
@@ -320,6 +372,16 @@ mod tests {
         assert_eq!(strip_opener("The area is about developing an RLM in a box."), "Developing an RLM in a box.");
         assert_eq!(strip_opener("Integrated MinerU into SIE."), "Integrated MinerU into SIE.");
     }
+
+    #[test]
+    fn clean_name_keeps_titles_drops_junk() {
+        assert_eq!(clean_name("S3 Cluster Cache"), "S3 Cluster Cache");
+        assert_eq!(clean_name("ColBERT & TEI Benchmarks."), "ColBERT & TEI Benchmarks");
+        assert_eq!(clean_name("SIE-INTERNAL CLUSTER"), ""); // shouty
+        assert_eq!(clean_name("finalize-aws-gcp-multi-gpu"), ""); // slug
+        assert_eq!(clean_name("Helm Perf Lab Cluster"), ""); // generic "… cluster"
+        assert_eq!(clean_name("foo, bar, baz"), ""); // listy
+    }
 }
 
 /// A dry run for prompt tuning: generate (but do not cache) the first `n` topic
@@ -338,8 +400,9 @@ pub fn sample(n: usize) -> Result<()> {
     }
     let mut llm = Summarizer::load()?;
     for j in &sel {
-        let (s, _, _) = llm.generate(&j.prompt)?;
-        println!("{} — {s}", j.label);
+        let (raw, _, _) = llm.generate(&j.prompt)?;
+        let out = if j.short { clean_name(&raw) } else { clean(&raw) };
+        println!("{} — {out}", j.label);
     }
     Ok(())
 }
