@@ -523,13 +523,17 @@ pub struct UnitClusterInput {
 }
 
 /// All units that have a cached summary, for clustering. We embed more than the
-/// one-line summary — adding the session's keyphrases or the PR/issue title — so
-/// the vectors separate (a lone 20-token summary is too thin to cluster well).
+/// one-line summary so the vectors separate (a lone 20-token summary is too thin
+/// to cluster well). For sessions we add *project-identifying* tokens — the repo
+/// and the touched file names — rather than the often-generic c-TF-IDF
+/// keyphrases: a session that says "unit summaries and keyphrase labels" should
+/// cluster with other `synty` work via the repo and `topics.rs`/`qwen.rs` paths,
+/// not collide with vision-bench "unit labels" on incidental shared words.
 pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
     let mut out = Vec::new();
     for s in sessions()? {
         if let Some(summary) = s.summary.filter(|x| !x.is_empty()) {
-            let embed = format!("{summary} {}", s.keyphrases.join(" "));
+            let embed = format!("{summary} {} {}", s.repo, s.files.join(" "));
             out.push(UnitClusterInput { key: s.id, summary, embed });
         }
     }

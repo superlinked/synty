@@ -117,7 +117,31 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         assign.len(),
     );
     report_quality(&results, &of, &phrases, &units);
+    diag(&units, &results, &of, &phrases);
     Ok(())
+}
+
+/// Optional per-unit neighbor dump (`SYNTY_DIAG=<key substring>`): for each
+/// matching unit print its assigned cluster and its top MaxSim neighbors with
+/// scores and their clusters — to see *why* a unit landed where it did.
+fn diag(units: &[units::UnitClusterInput], results: &[next_plaid::QueryResult], of: &[Option<usize>], phrases: &[Vec<String>]) {
+    let Ok(want) = std::env::var("SYNTY_DIAG") else { return };
+    let label = |ci: Option<usize>| ci.map(|c| phrases.get(c).map(|p| p.join(", ")).unwrap_or_default()).unwrap_or_else(|| "—".into());
+    for (i, u) in units.iter().enumerate() {
+        if !u.key.contains(&want) {
+            continue;
+        }
+        eprintln!("\ndiag {} → cluster {:?} [{}]", u.key, of[i], label(of[i]));
+        eprintln!("  embed: {}", crate::excerpt(&u.embed, 160));
+        eprintln!("  top MaxSim neighbors (score · cluster · key · embed):");
+        for (id, s) in results[i].passage_ids.iter().zip(results[i].scores.iter()).take(10) {
+            let j = *id as usize;
+            if j == i {
+                continue;
+            }
+            eprintln!("    {s:.3}  c{:<3?} {}  {}", of[j], crate::short(&units[j].key), crate::excerpt(&units[j].embed, 70));
+        }
+    }
 }
 
 /// kNN edges from MaxSim: normalized per-unit (÷ best neighbor), floored, summed
