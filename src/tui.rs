@@ -469,14 +469,16 @@ impl App {
 
 
     /// (header, column widths, rows) for the current view's table.
-    fn build_table(&self) -> (Vec<&'static str>, Vec<Constraint>, Vec<Row<'static>>) {
+    fn build_table(&self) -> (Vec<String>, Vec<Constraint>, Vec<Row<'static>>) {
         let dim = Style::new().fg(theme::DIM);
         match self.view {
             // Topics always renders the topic list; its units live in the overlay.
             View::Topics => {
-                // Per-day activity over the last 4 weeks, shaded on a shared scale.
+                // Per-day activity over the last 4 calendar weeks (Mon-aligned),
+                // shaded on a shared scale; the header labels each week's Monday.
                 let gmax = self.topics.iter().flat_map(|t| &t.units).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
-                let dailies: Vec<[u64; TL_DAYS]> = self.topics.iter().map(|t| daily(t, gmax)).collect();
+                let start = week_start(gmax);
+                let dailies: Vec<[u64; TL_DAYS]> = self.topics.iter().map(|t| daily(t, start)).collect();
                 let cap = dailies.iter().flat_map(|d| d.iter().copied()).max().unwrap_or(0);
                 let rows = self
                     .topics
@@ -503,7 +505,7 @@ impl App {
                     })
                     .collect();
                 (
-                    vec!["", "REPOS · PEOPLE", "ACTIVITY (4wk by day)", "UNITS"],
+                    vec!["".into(), "REPOS · PEOPLE".into(), week_header(start, gmax), "UNITS".into()],
                     vec![Constraint::Min(20), Constraint::Length(32), Constraint::Length(TL_DAYS as u16 + 3), Constraint::Length(5)],
                     rows,
                 )
@@ -525,7 +527,7 @@ impl App {
                     })
                     .collect();
                 (
-                    vec!["WHEN", "TYPE", "REPO", "", "STATE"],
+                    ["WHEN", "TYPE", "REPO", "", "STATE"].map(String::from).to_vec(),
                     vec![Constraint::Length(11), Constraint::Length(8), Constraint::Length(12), Constraint::Min(20), Constraint::Length(8)],
                     rows,
                 )
@@ -545,7 +547,7 @@ impl App {
                         ])
                     })
                     .collect();
-                (vec!["TYPE", "REPO", ""], vec![Constraint::Length(8), Constraint::Length(12), Constraint::Min(20)], rows)
+                (["TYPE", "REPO", ""].map(String::from).to_vec(), vec![Constraint::Length(8), Constraint::Length(12), Constraint::Min(20)], rows)
             }
             View::Status => (vec![], vec![], vec![]),
         }
@@ -696,15 +698,36 @@ fn day_num(day: &str) -> Option<i32> {
     NaiveDate::parse_from_str(day, "%Y-%m-%d").ok().map(|d| d.num_days_from_ce())
 }
 
-/// A topic's per-day unit counts over the last `TL_DAYS` on a shared anchor
-/// (`gmax`, days from CE), oldest day first.
-fn daily(t: &TopicUnits, gmax: i32) -> [u64; TL_DAYS] {
+/// The oldest visible Monday (num_days_from_ce): the Monday of `gmax`'s calendar
+/// week, back three more weeks — so the strip shows four Mon-Sun weeks ending
+/// with the week of the most recent activity.
+fn week_start(gmax: i32) -> i32 {
+    let dow = NaiveDate::from_num_days_from_ce_opt(gmax).map(|d| d.weekday().num_days_from_monday() as i32).unwrap_or(0);
+    gmax - dow - (TL_DAYS as i32 - 7)
+}
+
+/// Header for the activity column: each week's Monday date (M/D), left-aligned in
+/// an 8-char slot so the label sits over the first block of its week.
+fn week_header(start: i32, gmax: i32) -> String {
+    if gmax == 0 {
+        return String::new();
+    }
+    let label = |w: i32| match NaiveDate::from_num_days_from_ce_opt(start + w * 7) {
+        Some(d) => format!("{}/{}", d.month(), d.day()),
+        None => String::new(),
+    };
+    format!("{:<8}{:<8}{:<8}{:<7}", label(0), label(1), label(2), label(3))
+}
+
+/// A topic's per-day unit counts over the four calendar weeks beginning at
+/// `start` (num_days_from_ce of the oldest Monday), oldest day first.
+fn daily(t: &TopicUnits, start: i32) -> [u64; TL_DAYS] {
     let mut d = [0u64; TL_DAYS];
     for u in &t.units {
         if let Some(day) = day_num(&u.when) {
-            let ago = (gmax - day).max(0) as usize;
-            if ago < TL_DAYS {
-                d[TL_DAYS - 1 - ago] += 1;
+            let off = day - start;
+            if (0..TL_DAYS as i32).contains(&off) {
+                d[off as usize] += 1;
             }
         }
     }
@@ -913,7 +936,7 @@ mod tests {
         }
         assert!(text.contains("autostart"), "footer missing autostart status");
         // breadcrumb-only chrome: no redundant TOPIC header, but functional ones remain
-        assert!(text.contains("ACTIVITY"), "topics table missing ACTIVITY header");
+        assert!(text.contains("REPOS · PEOPLE"), "topics table missing column headers");
         assert!(!text.contains("TOPIC"), "redundant TOPIC header should be gone");
         assert!(text.contains("synty › Topics"), "breadcrumb missing");
     }
@@ -955,7 +978,7 @@ mod tests {
         a.view = View::Topics;
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("ACTIVITY"), "topics activity header missing");
+        assert!(text.contains("5/25"), "week Monday date header missing (fixture week of 2026-05-25)");
         assert!(text.contains('│'), "week divider missing from activity strip");
         assert!(text.contains("REPOS · PEOPLE"), "repos/people column header missing");
         assert!(text.contains("sie, sie-web"), "repos line missing from topics row");
