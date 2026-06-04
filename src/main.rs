@@ -15,6 +15,7 @@ mod eval;
 mod event;
 mod github;
 mod keyphrase;
+mod metrics;
 mod store;
 mod sync;
 mod tail;

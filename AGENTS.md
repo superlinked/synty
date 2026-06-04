@@ -37,6 +37,17 @@ Rust binary.
   members) / `search` / `eval`. `cluster` consumes unit summaries; the topic pass
   of `summarize` consumes the clusters. `index` wipes/rebuilds `index/`.
 
+## Metrics
+
+Operations that produce health or quality numbers emit them the same way, never
+ad hoc: build a `metrics::Run`, record named fields, `emit()`. That prints a
+`[metrics <op>]` block to stderr and appends one JSON object to `metrics.jsonl`
+(gitignored). `cluster` logs silhouette, modularity, misplaced %, cluster-size
+min/median/max, and the session/doc mix; `summarize` logs unit coverage, topics
+named, and throughput. Inspect trends across iterations with `tail metrics.jsonl`
+/ `jq`. When a change is meant to move quality, read the metric — don't eyeball
+it or recompute in a throwaway script.
+
 ## Code
 
 - Match the surrounding style: comment density, naming, idiom. Each module opens

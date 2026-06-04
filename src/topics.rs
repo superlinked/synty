@@ -112,12 +112,30 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         }
     }
     std::fs::write("unit_clusters.json", serde_json::to_string(&assign)?)?;
-    eprintln!(
-        "topics: {} units in {ncl} clusters (resolution {resolution}, modularity {q:.3}) → unit_clusters.json",
-        assign.len(),
-    );
-    report_quality(&results, &of, &phrases, &units);
+    eprintln!("topics: wrote unit_clusters.json");
+    let (sil, misplaced, scored) = report_quality(&results, &of, &phrases, &units);
     diag(&units, &results, &of, &phrases);
+
+    // Standardized health/quality metrics (stderr block + metrics.jsonl line).
+    let mut sizes: Vec<usize> = members.iter().map(|m| m.len()).filter(|&l| l > 0).collect();
+    sizes.sort_unstable();
+    let docs = units.iter().filter(|u| u.key.starts_with("gh:")).count();
+    crate::metrics::Run::new("cluster")
+        .set("resolution", resolution)
+        .set("units", n)
+        .set("clustered", assign.len())
+        .set("unclustered", n - assign.len())
+        .set("clusters", sizes.len())
+        .set("modularity", q)
+        .set("silhouette", sil as f64)
+        .set("misplaced", misplaced)
+        .set("misplaced_pct", if scored > 0 { 100.0 * misplaced as f64 / scored as f64 } else { 0.0 })
+        .set("size_min", sizes.first().copied().unwrap_or(0))
+        .set("size_med", sizes.get(sizes.len() / 2).copied().unwrap_or(0))
+        .set("size_max", sizes.last().copied().unwrap_or(0))
+        .set("sessions", n - docs)
+        .set("docs", docs)
+        .emit();
     Ok(())
 }
 
@@ -240,9 +258,10 @@ fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) 
 /// Cluster-quality report. For each clustered unit, silhouette = (a − b)/max(a,b)
 /// where a is its best same-cluster neighbor's MaxSim and b its best
 /// other-cluster neighbor's. Negative means the unit is nearer a *different*
-/// cluster — a likely misplacement. Reports the mean, the misplaced count, and
-/// the worst offenders (where they sit vs where they'd rather be).
-fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], labels: &[Vec<String>], units: &[units::UnitClusterInput]) {
+/// cluster — a likely misplacement. Prints the worst offenders (where they sit
+/// vs where they'd rather be) and returns (mean silhouette, misplaced count,
+/// scored count) for the standardized metrics line.
+fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], labels: &[Vec<String>], units: &[units::UnitClusterInput]) -> (f32, usize, usize) {
     let label = |ci: usize| labels.get(ci).map(|p| p.join(", ")).unwrap_or_default();
     let mut sils: Vec<(usize, usize, usize, f32)> = Vec::new(); // (unit, own ci, nearest other ci, silhouette)
     for (i, r) in results.iter().enumerate() {
@@ -269,15 +288,10 @@ fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], lab
         sils.push((i, ci, other, sil));
     }
     if sils.is_empty() {
-        return;
+        return (0.0, 0, 0);
     }
     let mean = sils.iter().map(|x| x.3).sum::<f32>() / sils.len() as f32;
     let misplaced = sils.iter().filter(|x| x.3 < 0.0).count();
-    eprintln!(
-        "quality: mean silhouette {mean:.3} · {misplaced}/{} units nearer another cluster ({:.0}%)",
-        sils.len(),
-        100.0 * misplaced as f32 / sils.len() as f32
-    );
     sils.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
     eprintln!("  worst-placed units (in → would prefer):");
     for (i, ci, other, sil) in sils.iter().take(8) {
@@ -288,4 +302,5 @@ fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], lab
             label(*other),
         );
     }
+    (mean, misplaced, sils.len())
 }

@@ -476,11 +476,27 @@ pub fn summarize_all() -> Result<()> {
     units::save_summary_cache(&cache)?;
 
     let n = utodo.len() + ttodo.len();
+    let secs = t.elapsed().as_secs_f64();
     if n == 0 {
         eprintln!("summaries up to date ({} units, {} topics)", ujobs.len(), tjobs.len());
     } else {
-        let secs = t.elapsed().as_secs_f64();
         eprintln!("done: {n} items in {:.1}s — {:.1} output tok/s ({in_tok} prompt + {out_tok} output tok)", secs, out_tok as f64 / secs);
     }
+
+    // Standardized coverage/throughput metrics (stderr block + metrics.jsonl line).
+    let covered = ujobs.iter().filter(|j| cache.get(&j.key).map(|c| !c.summary.is_empty()).unwrap_or(false)).count();
+    let named = cache.iter().filter(|(k, v)| k.starts_with("topicname:") && !v.summary.is_empty()).count();
+    let topics = cache.keys().filter(|k| k.starts_with("topic:")).count();
+    crate::metrics::Run::new("summarize")
+        .set("units", ujobs.len())
+        .set("unit_coverage_pct", 100.0 * covered as f64 / ujobs.len().max(1) as f64)
+        .set("topics", topics)
+        .set("topics_named", named)
+        .set("regenerated", n)
+        .set("prompt_tok", in_tok)
+        .set("output_tok", out_tok)
+        .set("secs", secs)
+        .set("out_tok_per_s", if secs > 0.0 { out_tok as f64 / secs } else { 0.0 })
+        .emit();
     Ok(())
 }
