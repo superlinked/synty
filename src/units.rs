@@ -96,7 +96,8 @@ pub struct Unit {
 
 /// A topic with its work units, time span, activity over weeks, and type mix.
 pub struct TopicUnits {
-    pub id: i64,
+    pub id: i64, // positional cluster index — display/order only, NOT stable across runs
+    pub cache_key: String, // stable content-addressed key for the summary/name cache
     pub label: String,
     pub units: Vec<Unit>,
     pub last_active: String,
@@ -118,14 +119,17 @@ impl TopicUnits {
     }
 }
 
-/// Cache key for a topic's reduced summary.
-pub fn topic_key(id: i64) -> String {
-    format!("topic:{id}")
+/// Cache key for a topic's reduced summary. `key` is the cluster's stable
+/// content-addressed key (medoid hash), so the cache survives re-clustering's
+/// renumbering — a renumber yields a cache miss (→ regenerate), never a stale
+/// name attached to a different cluster.
+pub fn topic_key(key: &str) -> String {
+    format!("topic:{key}")
 }
 
 /// Cache key for a topic's short LLM name.
-pub fn topic_name_key(id: i64) -> String {
-    format!("topicname:{id}")
+pub fn topic_name_key(key: &str) -> String {
+    format!("topicname:{key}")
 }
 
 #[derive(Default)]
@@ -257,7 +261,7 @@ pub fn sessions() -> Result<Vec<Session>> {
                 tools: a.tools,
                 files: a.files.clone(),
                 linked_pr: a.linked_pr.clone(),
-                topic: topic_of.get(id).map(|(c, _)| *c),
+                topic: topic_of.get(id).map(|(c, _, _)| *c),
                 struggle: scores[i],
                 summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
             }
@@ -304,7 +308,7 @@ pub fn units() -> Result<Vec<Unit>> {
                 title: format!("{}#{} {}", d.meta.repo, num, first_line(&d.text)),
                 outcome: d.meta.state.clone().unwrap_or_default(),
                 summary: cache.get(&key).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
-                topic: topic_of.get(&key).map(|(c, _)| *c),
+                topic: topic_of.get(&key).map(|(c, _, _)| *c),
                 struggle: 0.0,
                 author: d.meta.author.clone(),
                 doc_id: Some(d.id),
@@ -321,6 +325,7 @@ pub fn units() -> Result<Vec<Unit>> {
 /// exactly a set of units and every facet derives from those units.
 pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
     let labels = cluster_labels();
+    let cache_keys = cluster_cache_keys();
     let cache = load_summary_cache();
     let mut by_topic: HashMap<i64, Vec<Unit>> = HashMap::new();
     for u in units()? {
@@ -338,9 +343,10 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
             let mix = unit_mix(&units);
             let repos = by_count(units.iter().filter(|u| !u.repo.is_empty()).map(|u| u.repo.clone()));
             let authors = by_count(units.iter().filter(|u| !u.author.is_empty()).map(|u| u.author.clone()));
-            let summary = cache.get(&topic_key(id)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
-            let name = cache.get(&topic_name_key(id)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
-            TopicUnits { id, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors, summary, name, span }
+            let cache_key = cache_keys.get(&id).cloned().unwrap_or_else(|| id.to_string());
+            let summary = cache.get(&topic_key(&cache_key)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
+            let name = cache.get(&topic_name_key(&cache_key)).map(|c| c.summary.clone()).filter(|s| !s.is_empty());
+            TopicUnits { id, cache_key, label: labels.get(&id).cloned().unwrap_or_default(), units, last_active, activity, mix, repos, authors, summary, name, span }
         })
         .collect();
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));
@@ -384,25 +390,36 @@ fn struggle_scores(raw: &[[f64; 4]]) -> Vec<f32> {
 
 // ── topic membership (unit-level) ─────────────────────────────────────────
 
-/// unit key → (cluster, label), from unit_clusters.json (written by `cluster`).
-/// Empty until clustering has run.
-fn unit_topics() -> HashMap<String, (i64, String)> {
+/// unit key → (cluster index, stable cache key, label), from unit_clusters.json
+/// (written by `cluster`). Empty until clustering has run. The stable key falls
+/// back to the index string for pre-I1 files.
+fn unit_topics() -> HashMap<String, (i64, String, String)> {
     let Ok(raw) = std::fs::read_to_string("unit_clusters.json") else { return HashMap::new() };
     let arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
     arr.iter()
         .filter_map(|it| {
             let key = it["key"].as_str()?.to_string();
             let cluster = it["cluster"].as_i64()?;
-            Some((key, (cluster, it["label"].as_str().unwrap_or("").to_string())))
+            let cache_key = it["topic"].as_str().map(String::from).unwrap_or_else(|| cluster.to_string());
+            Some((key, (cluster, cache_key, it["label"].as_str().unwrap_or("").to_string())))
         })
         .collect()
 }
 
-/// cluster → label.
+/// cluster index → label.
 fn cluster_labels() -> HashMap<i64, String> {
     let mut m = HashMap::new();
-    for (_, (c, l)) in unit_topics() {
+    for (_, (c, _, l)) in unit_topics() {
         m.entry(c).or_insert(l);
+    }
+    m
+}
+
+/// cluster index → stable cache key (medoid hash).
+fn cluster_cache_keys() -> HashMap<i64, String> {
+    let mut m = HashMap::new();
+    for (_, (c, k, _)) in unit_topics() {
+        m.entry(c).or_insert(k);
     }
     m
 }

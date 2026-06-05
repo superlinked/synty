@@ -118,10 +118,57 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         })
         .collect();
 
+    // Stable content-addressed key per cluster, so the summary/name cache survives
+    // renumbering. Read the PREVIOUS clusters (stable key → member set) before
+    // overwriting unit_clusters.json. A new cluster inherits the previous key it
+    // overlaps most (Jaccard ≥ 0.5, robust to membership drift); otherwise it gets
+    // a fresh key hashed from its medoid. Greedy match — exact at this cluster count.
+    let prev: Vec<(String, std::collections::HashSet<String>)> = std::fs::read_to_string("unit_clusters.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+        .map(|a| {
+            let mut m: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+            for it in &a {
+                if let (Some(t), Some(k)) = (it["topic"].as_str(), it["key"].as_str()) {
+                    m.entry(t.to_string()).or_default().insert(k.to_string());
+                }
+            }
+            m.into_iter().collect()
+        })
+        .unwrap_or_default();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stable_keys: Vec<String> = Vec::with_capacity(members.len());
+    let mut inherited = 0usize;
+    for (ci, m) in members.iter().enumerate() {
+        if m.is_empty() {
+            stable_keys.push(format!("e{ci}"));
+            continue;
+        }
+        let cur: std::collections::HashSet<&str> = m.iter().map(|&i| units[i].key.as_str()).collect();
+        let best = prev
+            .iter()
+            .filter(|(k, _)| !used.contains(k.as_str()))
+            .map(|(k, s)| {
+                let inter = s.iter().filter(|x| cur.contains(x.as_str())).count();
+                (k, inter as f64 / (s.len() + cur.len() - inter).max(1) as f64)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        match best {
+            Some((k, j)) if j >= 0.5 => {
+                used.insert(k.clone());
+                stable_keys.push(k.clone());
+                inherited += 1;
+            }
+            _ => stable_keys.push(format!("{:016x}", crate::index::fnv1a(units[medoid(m, &results, &of)].key.as_bytes()))),
+        }
+    }
+    let live = members.iter().filter(|m| !m.is_empty()).count();
+    let id_continuity = if prev.is_empty() || live == 0 { 0.0 } else { 100.0 * inherited as f64 / live as f64 };
+
     let mut assign: Vec<serde_json::Value> = Vec::new();
     for (i, o) in of.iter().enumerate() {
         if let Some(ci) = o {
-            assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "label": labels[*ci]}));
+            assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "topic": stable_keys[*ci], "label": labels[*ci]}));
         }
     }
     std::fs::write("unit_clusters.json", serde_json::to_string(&assign)?)?;
@@ -151,6 +198,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         .set("clustered", assign.len())
         .set("unclustered", n - assign.len())
         .set("clusters", sizes.len())
+        .set("id_continuity", id_continuity)
         .set("modularity", q)
         .set("silhouette_macro", qual.macro_sil as f64)
         .set("silhouette", qual.micro_sil as f64)
@@ -283,6 +331,26 @@ fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) 
         }
     }
     moved
+}
+
+/// The cluster's medoid — the member best connected to its co-members (max summed
+/// same-cluster MaxSim). Its key seeds the cluster's stable id: a central member
+/// persists across re-clusterings even as the periphery shifts.
+fn medoid(members: &[usize], results: &[next_plaid::QueryResult], of: &[Option<usize>]) -> usize {
+    *members
+        .iter()
+        .max_by(|&&a, &&b| same_cluster_score(a, results, of).partial_cmp(&same_cluster_score(b, results, of)).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(&members[0])
+}
+
+fn same_cluster_score(i: usize, results: &[next_plaid::QueryResult], of: &[Option<usize>]) -> f32 {
+    results[i]
+        .passage_ids
+        .iter()
+        .zip(results[i].scores.iter())
+        .filter(|(id, _)| **id as usize != i && of[**id as usize] == of[i])
+        .map(|(_, s)| *s)
+        .sum()
 }
 
 /// Cluster quality, computed once from the kNN results. Headline is the MACRO

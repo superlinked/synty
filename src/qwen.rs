@@ -322,7 +322,7 @@ fn topic_jobs() -> Result<Vec<Job>> {
         let mut sum_parts = vec![TOPIC_PROMPT_VERSION];
         sum_parts.extend(sorted.iter().copied());
         jobs.push(Job {
-            key: units::topic_key(t.id),
+            key: units::topic_key(&t.cache_key),
             hash: hash_parts(&sum_parts),
             prompt: prompt_for_topic(&members),
             label: format!("topic:{}", t.id),
@@ -333,7 +333,7 @@ fn topic_jobs() -> Result<Vec<Job>> {
         // cached yet the name regenerates next run, once the summary exists.
         if let Some(sum) = &t.summary {
             jobs.push(Job {
-                key: units::topic_name_key(t.id),
+                key: units::topic_name_key(&t.cache_key),
                 hash: hash_parts(&[TOPIC_NAME_VERSION, sum.as_str()]),
                 prompt: prompt_for_topic_name(sum),
                 label: format!("name:{}", t.id),
@@ -472,6 +472,14 @@ pub fn summarize_all() -> Result<()> {
         let (i, o) = run_jobs(&ttodo, &mut cache, llm.as_mut().unwrap(), "topic")?;
         (in_tok, out_tok) = (in_tok + i, out_tok + o);
     }
+    // Prune orphaned topic entries — stable keys from superseded clusterings, left
+    // behind when re-clustering changes a cluster's medoid/membership. Session and
+    // doc summaries (keyed by id / gh:repo#n) are untouched.
+    let valid: std::collections::HashSet<String> = units::topic_units(12)?.iter().map(|t| t.cache_key.clone()).collect();
+    cache.retain(|k, _| match k.strip_prefix("topic:").or_else(|| k.strip_prefix("topicname:")) {
+        Some(stable) => valid.contains(stable),
+        None => true,
+    });
     units::save_summary_cache(&cache)?;
 
     let n = utodo.len() + ttodo.len();
