@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -75,6 +75,13 @@ impl Facet {
             Facet::Person(n) => t.authors.iter().any(|a| a == n),
         }
     }
+    /// The same test for a single work unit (the Work view shares the filter).
+    fn matches_unit(&self, u: &Unit) -> bool {
+        match self {
+            Facet::Repo(n) => &u.repo == n,
+            Facet::Person(n) => &u.author == n,
+        }
+    }
     fn is_repo(&self) -> bool {
         matches!(self, Facet::Repo(_))
     }
@@ -103,7 +110,8 @@ struct App {
     view: View,
     sel: usize,
     drill_topic: Option<usize>, // Topics: viewing a topic's units (index into visible())
-    filter: Option<Facet>,      // Topics: show only topics touching this repo/person
+    filter: Option<Facet>,      // Topics/Work: show only items touching this repo/person
+    picker: Option<usize>,      // facet-picker overlay: selected row when open
     query: String,
     results: Vec<i64>, // doc ids
     engine: Engine,
@@ -194,6 +202,7 @@ impl App {
             sel: 0,
             drill_topic: None,
             filter: None,
+            picker: None,
             query: String::new(),
             results: vec![],
             engine: Engine::Loading,
@@ -243,7 +252,7 @@ impl App {
                 None => self.visible().len(),
                 Some(t) => self.drilled(t).map(|t| t.units.len()).unwrap_or(0),
             },
-            View::Work => self.work.len(),
+            View::Work => self.visible_work().len(),
             View::Search => self.results.len(),
             View::Status => 0,
         }
@@ -297,7 +306,71 @@ impl App {
         self.sel = 0;
     }
 
+    /// Work-unit indices passing the active filter (the Work view's `visible`).
+    fn visible_work(&self) -> Vec<usize> {
+        (0..self.work.len())
+            .filter(|&i| self.filter.as_ref().is_none_or(|f| f.matches_unit(&self.work[i])))
+            .collect()
+    }
+
+    /// Per-day unit counts for a facet over the four weeks from `start`, taken from
+    /// the Work units — the activity shown in the picker and the filter summary.
+    fn facet_activity(&self, f: &Facet, start: i32) -> [u64; TL_DAYS] {
+        let mut d = [0u64; TL_DAYS];
+        for u in self.work.iter().filter(|u| f.matches_unit(u)) {
+            if let Some(day) = day_num(&u.when) {
+                let off = day - start;
+                if (0..TL_DAYS as i32).contains(&off) {
+                    d[off as usize] += 1;
+                }
+            }
+        }
+        d
+    }
+
+    /// The picker's rows: `None` (clear) first, then repos, then people — each
+    /// group most-covered first (reusing the cycle order).
+    fn picker_items(&self) -> Vec<Option<Facet>> {
+        let mut items = vec![None];
+        items.extend(self.facet_names(true).into_iter().map(|n| Some(Facet::Repo(n))));
+        items.extend(self.facet_names(false).into_iter().map(|n| Some(Facet::Person(n))));
+        items
+    }
+
+    /// Open the facet picker, landing on the active facet if there is one.
+    fn open_picker(&mut self) {
+        let items = self.picker_items();
+        let cur = self
+            .filter
+            .as_ref()
+            .and_then(|f| items.iter().position(|it| it.as_ref().is_some_and(|x| x.is_repo() == f.is_repo() && x.name() == f.name())));
+        self.picker = Some(cur.unwrap_or(0));
+    }
+
+    /// Key handling while the picker overlay is open (modal — it captures keys
+    /// until dismissed, so view switches and list nav don't leak through).
+    fn picker_key(&mut self, code: KeyCode) {
+        let items = self.picker_items();
+        let n = items.len();
+        let i = self.picker.unwrap_or(0).min(n - 1);
+        match code {
+            KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') => self.picker = None,
+            KeyCode::Down | KeyCode::Char('j') => self.picker = Some((i + 1).min(n - 1)),
+            KeyCode::Up | KeyCode::Char('k') => self.picker = Some(i.saturating_sub(1)),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                self.filter = items.into_iter().nth(i).flatten();
+                self.picker = None;
+                self.drill_topic = None;
+                self.sel = 0;
+            }
+            _ => {}
+        }
+    }
+
     fn on_key(&mut self, code: KeyCode) {
+        if self.picker.is_some() {
+            return self.picker_key(code);
+        }
         match code {
             KeyCode::Tab => return self.cycle(1),
             KeyCode::BackTab => return self.cycle(-1),
@@ -330,9 +403,11 @@ impl App {
                     self.sel = ti;
                 }
             }
-            // Cycle the topic list's repo / person filter (Topics list only).
-            KeyCode::Char('r') if self.view == View::Topics && self.drill_topic.is_none() => self.cycle_facet(true),
-            KeyCode::Char('p') if self.view == View::Topics && self.drill_topic.is_none() => self.cycle_facet(false),
+            // Repo / person filter, shared by the Topics and Work lists: f opens a
+            // picker to browse facets, r/p cycle one directly.
+            KeyCode::Char('f') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.open_picker(),
+            KeyCode::Char('r') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(true),
+            KeyCode::Char('p') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(false),
             _ => {}
         }
     }
@@ -379,10 +454,23 @@ impl App {
         let [top, body, footer] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
         self.draw_header(f, top);
+        // With a facet filter active, a one-line activity summary of that
+        // workstream sits above the Topics/Work list.
+        let body = match (&self.filter, self.view) {
+            (Some(fac), View::Topics | View::Work) => {
+                let [sum, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+                f.render_widget(Paragraph::new(self.filter_summary(fac)), sum);
+                rest
+            }
+            _ => body,
+        };
         match self.view {
             View::Status => f.render_widget(self.status_para(), body),
             View::Topics => self.draw_topics(f, body),
             View::Work | View::Search => self.draw_master_detail(f, body),
+        }
+        if self.picker.is_some() {
+            self.draw_picker(f, body);
         }
         // footer: contextual keys (left) · autostart status (right)
         let auto = if self.autostart { " autostart ✓ " } else { " autostart ✗ " };
@@ -553,6 +641,59 @@ impl App {
         o
     }
 
+    /// A one-line summary of the active facet's workstream: counts plus a compact
+    /// four-week activity bar — the "activity across this repo/person" header.
+    fn filter_summary(&self, f: &Facet) -> Line<'static> {
+        let topics = self.topics.iter().filter(|t| f.matches(t)).count();
+        let units = self.work.iter().filter(|u| f.matches_unit(u)).count();
+        let gmax = self.work.iter().filter(|u| f.matches_unit(u)).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
+        let days = self.facet_activity(f, week_start(gmax));
+        Line::from(vec![
+            Span::styled(format!(" {} ", f.tag()), Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("· {topics} topics · {units} units · last 4wk "), Style::new().fg(theme::DIM)),
+            Span::styled(week_spark(&days, week_cap(&days)), Style::new().fg(theme::SAGE)),
+        ])
+    }
+
+    /// The facet-picker overlay: a centered list of repos and people (with topic
+    /// counts and a four-week bar) plus a "clear filter" row, selectable into the
+    /// shared `filter`.
+    fn draw_picker(&self, f: &mut Frame, body: Rect) {
+        let items = self.picker_items();
+        let sel = self.picker.unwrap_or(0).min(items.len().saturating_sub(1));
+        let w = 52.min(body.width.saturating_sub(4)).max(20);
+        let h = (items.len() as u16 + 2).clamp(3, body.height.saturating_sub(2).max(3));
+        let area = centered(body, w, h);
+        f.render_widget(Clear, area);
+        let block = Block::bordered().border_style(Style::new().fg(theme::ACCENT)).title(" filter by repo / person ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let rows: Vec<ListItem> = items
+            .iter()
+            .map(|it| match it {
+                None => ListItem::new(Line::from(Span::styled("  all — clear filter", Style::new().fg(theme::FG)))),
+                Some(fac) => {
+                    let topics = self.topics.iter().filter(|t| fac.matches(t)).count();
+                    let gmax = self.work.iter().filter(|u| fac.matches_unit(u)).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
+                    let days = self.facet_activity(fac, week_start(gmax));
+                    let (tag, color) = match fac {
+                        Facet::Repo(n) => (format!("repo  {n}"), theme::GITHUB),
+                        Facet::Person(n) => (format!("@{n}"), theme::SESSION),
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {tag:<24}"), Style::new().fg(color)),
+                        Span::styled(format!("{topics:>2} topics  "), Style::new().fg(theme::DIM)),
+                        Span::styled(week_spark(&days, week_cap(&days)), Style::new().fg(theme::SAGE)),
+                    ]))
+                }
+            })
+            .collect();
+        let mut ls = ListState::default();
+        ls.select(Some(sel));
+        let list = List::new(rows).highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD)).highlight_symbol("▌");
+        f.render_stateful_widget(list, inner, &mut ls);
+    }
 
     /// (header, column widths, rows) for the current view's table.
     fn build_table(&self) -> (Vec<String>, Vec<Constraint>, Vec<Row<'static>>) {
@@ -599,9 +740,10 @@ impl App {
             }
             View::Work => {
                 let rows = self
-                    .work
-                    .iter()
-                    .map(|u| {
+                    .visible_work()
+                    .into_iter()
+                    .map(|i| {
+                        let u = &self.work[i];
                         let (primary, secondary) = unit_lines(u);
                         Row::new(vec![
                             Cell::from(u.when.clone()).style(dim),
@@ -642,7 +784,7 @@ impl App {
 
     fn detail_lines(&self) -> String {
         match self.view {
-            View::Work => self.work.get(self.sel).map(|u| self.unit_detail(u)).unwrap_or_default(),
+            View::Work => self.visible_work().get(self.sel).and_then(|&i| self.work.get(i)).map(|u| self.unit_detail(u)).unwrap_or_default(),
             View::Search => self.results.get(self.sel).and_then(|id| self.doc_by_id.get(id)).map(|&i| doc_detail(&self.docs[i])).unwrap_or_default(),
             _ => String::new(),
         }
@@ -703,6 +845,9 @@ impl App {
     }
 
     fn footer(&self) -> String {
+        if self.picker.is_some() {
+            return "  ↑↓ choose · Enter apply · Esc cancel".to_string();
+        }
         let keys = match self.view {
             View::Search => match &self.engine {
                 Engine::Loading => "loading model…",
@@ -711,9 +856,9 @@ impl App {
                 Engine::Ready => "type · Enter search · ↑↓ results · 1-4 views · Esc quit",
             },
             _ if self.drill_topic.is_some() => "↑↓ units · h back · 1-4 views · q quit",
-            View::Topics => "↑↓ move · Enter drill · r/p filter · 1-4 views · q quit",
+            View::Topics => "↑↓ move · Enter drill · f/r/p filter · 1-4 views · q quit",
             View::Status => "1-4 views · Tab cycle · q quit",
-            View::Work => "↑↓ move · 1-4 views · Tab cycle · q quit",
+            View::Work => "↑↓ move · f/r/p filter · 1-4 views · Tab cycle · q quit",
         };
         format!("  {keys}")
     }
@@ -833,6 +978,39 @@ fn day_strip(days: &[u64; TL_DAYS], cap: u64) -> Cell<'static> {
         });
     }
     Cell::from(Text::from(vec![Line::from(spans.clone()), Line::from(spans)]))
+}
+
+const SPARK: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Largest single-week unit count in a daily strip (the shading ceiling).
+fn week_cap(days: &[u64; TL_DAYS]) -> u64 {
+    (0..TL_DAYS / 7).map(|w| days[w * 7..w * 7 + 7].iter().sum::<u64>()).max().unwrap_or(0)
+}
+
+/// Four block glyphs, one per calendar week, each shaded by that week's unit
+/// count relative to `cap` — a compact activity bar for picker rows and the
+/// filter summary line.
+fn week_spark(days: &[u64; TL_DAYS], cap: u64) -> String {
+    (0..TL_DAYS / 7)
+        .map(|w| {
+            let sum: u64 = days[w * 7..w * 7 + 7].iter().sum();
+            if sum == 0 || cap == 0 {
+                SPARK[0]
+            } else {
+                SPARK[(sum * 8).div_ceil(cap).clamp(1, 8) as usize]
+            }
+        })
+        .collect()
+}
+
+/// A `w`×`h` rectangle centered within `area` (clamped to it) — for overlays.
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w.min(area.width),
+        height: h.min(area.height),
+    }
 }
 
 fn type_cell(k: Kind) -> Cell<'static> {
@@ -981,6 +1159,7 @@ mod tests {
             sel: 0,
             drill_topic: None,
             filter: None,
+            picker: None,
             query: String::new(),
             results: vec![],
             engine: Engine::Loading,
@@ -993,6 +1172,29 @@ mod tests {
 
     fn clone_unit(u: &Unit) -> Unit {
         Unit { kind: u.kind, when: u.when.clone(), repo: u.repo.clone(), title: u.title.clone(), outcome: u.outcome.clone(), summary: u.summary.clone(), topic: u.topic, struggle: u.struggle, author: u.author.clone(), doc_id: u.doc_id, session_id: u.session_id.clone() }
+    }
+
+    // app() plus a second, unrelated topic and its work unit, so filters have
+    // something to narrow against (infra/bob vs the fixture's sie/alice).
+    fn app2() -> App {
+        let mut a = app();
+        let infra = Unit { kind: Kind::Pr, when: "2026-05-30".into(), repo: "infra".into(), title: "infra#3 terraform runner".into(), outcome: "MERGED".into(), summary: Some("Terraform runner IAM work.".into()), topic: Some(1), struggle: 0.0, author: "bob".into(), doc_id: None, session_id: None };
+        a.work.push(clone_unit(&infra));
+        a.topics.push(TopicUnits {
+            id: 1,
+            cache_key: "t1".into(),
+            label: "infra".into(),
+            units: vec![infra],
+            last_active: "2026-05-30".into(),
+            activity: vec![0, 1, 0, 0],
+            mix: (0, 1, 0),
+            repos: vec!["infra".into()],
+            authors: vec!["bob".into()],
+            summary: Some("Terraform runner IAM work.".into()),
+            name: Some("Infra & Terraform".into()),
+            span: Some(("2026-05-28".into(), "2026-05-30".into())),
+        });
+        a
     }
 
     #[test]
@@ -1081,22 +1283,7 @@ mod tests {
     // last value clears the filter, and the breadcrumb names the active facet.
     #[test]
     fn repo_person_filter_narrows_topic_list() {
-        let mut a = app();
-        // A second, unrelated topic so the filter has something to narrow against.
-        a.topics.push(TopicUnits {
-            id: 1,
-            cache_key: "t1".into(),
-            label: "infra".into(),
-            units: vec![Unit { kind: Kind::Pr, when: "2026-05-30".into(), repo: "infra".into(), title: "infra#3 terraform runner".into(), outcome: "MERGED".into(), summary: Some("Terraform runner IAM work.".into()), topic: Some(1), struggle: 0.0, author: "bob".into(), doc_id: None, session_id: None }],
-            last_active: "2026-05-30".into(),
-            activity: vec![0, 1, 0, 0],
-            mix: (0, 1, 0),
-            repos: vec!["infra".into()],
-            authors: vec!["bob".into()],
-            summary: Some("Terraform runner IAM work.".into()),
-            name: Some("Infra & Terraform".into()),
-            span: Some(("2026-05-28".into(), "2026-05-30".into())),
-        });
+        let mut a = app2();
         // Two distinct topics: sie/sie-web/alice vs infra/bob.
         assert_eq!(a.visible().len(), 2);
 
@@ -1125,5 +1312,66 @@ mod tests {
         let drilled = a.drilled(0).expect("a visible topic");
         let want = a.filter.as_ref().unwrap().name();
         assert!(drilled.authors.iter().any(|p| p.as_str() == want), "drilled topic matches the active person filter");
+    }
+
+    // The facet picker (f) selects a repo/person; the chosen filter scopes both
+    // the Topics list and the Work list, and the "all" row clears it.
+    #[test]
+    fn facet_picker_selects_and_scopes_both_views() {
+        let mut a = app2();
+        a.on_key(KeyCode::Char('f'));
+        assert!(a.picker.is_some(), "f opens the facet picker");
+        // item 0 is "clear"; step onto the first real facet and apply it.
+        a.on_key(KeyCode::Down);
+        a.on_key(KeyCode::Enter);
+        assert!(a.picker.is_none(), "Enter closes the picker");
+        assert!(a.filter.is_some(), "Enter applies a facet filter");
+        assert_eq!(a.visible().len(), 1, "picked facet narrows the topic list");
+        // the same filter scopes the Work view.
+        a.view = View::Work;
+        assert!(a.visible_work().len() < a.work.len(), "filter narrows the Work list too");
+        // reopening and choosing the top row clears the filter.
+        a.on_key(KeyCode::Char('f'));
+        a.on_key(KeyCode::Up);
+        a.on_key(KeyCode::Enter);
+        assert!(a.filter.is_none(), "the 'all' row clears the filter");
+        assert_eq!(a.visible_work().len(), a.work.len());
+    }
+
+    // The picker overlay renders its title, the clear row, and the facets.
+    #[test]
+    fn picker_overlay_renders() {
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut a = app2();
+        a.on_key(KeyCode::Char('f'));
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("filter by repo / person"), "picker panel title missing: {text}");
+        assert!(text.contains("clear filter"), "picker missing the clear row");
+        assert!(text.contains("infra"), "picker missing a repo facet");
+        assert!(text.contains("Enter apply"), "footer should switch to picker hints");
+    }
+
+    // r/p drive the filter from the Work view too, not just Topics.
+    #[test]
+    fn filter_keys_work_in_work_view() {
+        let mut a = app2();
+        a.view = View::Work;
+        a.on_key(KeyCode::Char('r'));
+        assert!(a.filter.is_some(), "r sets a filter in the Work view");
+        assert!(a.visible_work().len() < a.work.len(), "Work list narrows under the filter");
+    }
+
+    // With a filter active, a one-line activity summary sits above the list.
+    #[test]
+    fn filter_summary_line_renders() {
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut a = app2();
+        a.filter = Some(Facet::Repo("infra".into()));
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        // lowercase "topics"/"units" are unique to the summary (column headers are caps).
+        assert!(text.contains("topics") && text.contains("units"), "filter summary line missing counts: {text}");
+        assert!(text.contains("last 4wk"), "filter summary missing the activity bar label");
     }
 }
