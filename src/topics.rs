@@ -106,6 +106,10 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     if moved > 0 {
         eprintln!("topics: reassigned {moved} outlier units to their nearest cluster");
     }
+    let bridges = snap_to_prs(&mut of, &units);
+    if bridges > 0 {
+        eprintln!("topics: snapped {bridges} sessions to their produced PR's topic");
+    }
 
     // Member lists, plus a readable label per cluster: its most concise member
     // summary. A provisional identifier for reports and the unit_clusters.json
@@ -201,6 +205,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         .set("clustered", assign.len())
         .set("unclustered", n - assign.len())
         .set("clusters", sizes.len())
+        .set("bridges", bridges)
         .set("id_continuity", id_continuity)
         .set("modularity", q)
         .set("cohesion_med", qual.cohesion_med as f64)
@@ -242,6 +247,24 @@ fn diag(units: &[units::UnitClusterInput], results: &[next_plaid::QueryResult], 
 
 /// kNN edges from MaxSim: normalized per-unit (÷ best neighbor), floored, summed
 /// over both directions so mutual neighbors weigh more. Top-K per unit.
+/// Snap each session to the topic of the PR it produced — they're one unit of
+/// work, so the GitHub artifact (clustered by its own content) anchors the
+/// session. A hard override after reassignment, since a soft edge loses to the
+/// kNN-based reassign. Returns the number of sessions moved.
+fn snap_to_prs(of: &mut [Option<usize>], units: &[units::UnitClusterInput]) -> usize {
+    let idx: HashMap<&str, usize> = units.iter().enumerate().map(|(i, u)| (u.key.as_str(), i)).collect();
+    let mut snapped = 0;
+    for i in 0..units.len() {
+        if let Some(&j) = units[i].linked.as_deref().and_then(|pr| idx.get(pr)) {
+            if of[j].is_some() && of[i] != of[j] {
+                of[i] = of[j];
+                snapped += 1;
+            }
+        }
+    }
+    snapped
+}
+
 fn build_edges(results: &[next_plaid::QueryResult]) -> HashMap<(usize, usize), f64> {
     let n = results.len();
     // Directed normalized weights + each unit's top-K neighbor set.

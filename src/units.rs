@@ -484,6 +484,21 @@ pub fn gh_key(repo: &str, number: i64) -> String {
     format!("gh:{repo}#{number}")
 }
 
+/// Normalize a session's linked_pr (stored as a URL or "repo#num") to the gh:
+/// unit key, so a session can be bridged to the PR it produced during clustering.
+pub fn linked_pr_key(linked: &str) -> Option<String> {
+    if let Some(rest) = linked.strip_prefix("https://github.com/").or_else(|| linked.strip_prefix("http://github.com/")) {
+        let p: Vec<&str> = rest.split('/').collect();
+        if p.len() >= 4 && (p[2] == "pull" || p[2] == "issues") {
+            return Some(gh_key(p[1], p[3].parse().ok()?));
+        }
+        None
+    } else {
+        let (repo, num) = linked.split_once('#')?;
+        Some(gh_key(repo, num.parse().ok()?))
+    }
+}
+
 /// A PR/issue as summarizer input: title + body, capped.
 pub struct DocInput {
     pub key: String,
@@ -522,6 +537,7 @@ pub struct UnitClusterInput {
     pub key: String,
     pub summary: String, // for c-TF-IDF labels
     pub embed: String,   // richer text actually embedded for clustering
+    pub linked: Option<String>, // for a session: the gh: key of the PR it produced
 }
 
 /// All units that have a cached summary, for clustering. We embed more than the
@@ -540,7 +556,8 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
             // all file paths would otherwise dominate and over-group by repo).
             let files = s.files.iter().take(8).cloned().collect::<Vec<_>>().join(" ");
             let embed = crate::excerpt(&format!("{summary} {} {}", s.repo, files), 500);
-            out.push(UnitClusterInput { key: s.id, summary, embed });
+            let linked = s.linked_pr.as_deref().and_then(linked_pr_key);
+            out.push(UnitClusterInput { key: s.id, summary, embed, linked });
         }
     }
     let cache = load_summary_cache();
@@ -551,7 +568,7 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
                 // summary + title + body, capped so units stay comparable in length
                 // (MaxSim is length-biased — long bodies would otherwise hub).
                 let embed = crate::excerpt(&format!("{} {}", c.summary, d.text), 500);
-                out.push(UnitClusterInput { key, summary: c.summary.clone(), embed });
+                out.push(UnitClusterInput { key, summary: c.summary.clone(), embed, linked: None });
             }
         }
     }
