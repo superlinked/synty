@@ -60,6 +60,38 @@ enum Engine {
     Err(String),
 }
 
+/// Active topic-list filter: show only topics that touch this repo or person.
+/// Cycled with `r` / `p`; wrapping past the last value clears it.
+#[derive(Clone)]
+enum Facet {
+    Repo(String),
+    Person(String),
+}
+
+impl Facet {
+    fn matches(&self, t: &TopicUnits) -> bool {
+        match self {
+            Facet::Repo(n) => t.repos.iter().any(|r| r == n),
+            Facet::Person(n) => t.authors.iter().any(|a| a == n),
+        }
+    }
+    fn is_repo(&self) -> bool {
+        matches!(self, Facet::Repo(_))
+    }
+    fn name(&self) -> &str {
+        match self {
+            Facet::Repo(n) | Facet::Person(n) => n,
+        }
+    }
+    /// Short tag for the breadcrumb (`repo:sie-web` / `@alice`).
+    fn tag(&self) -> String {
+        match self {
+            Facet::Repo(n) => format!("repo:{n}"),
+            Facet::Person(n) => format!("@{n}"),
+        }
+    }
+}
+
 struct App {
     docs: Vec<Doc>,
     doc_by_id: HashMap<i64, usize>,
@@ -70,7 +102,8 @@ struct App {
     status: crate::view::Status,
     view: View,
     sel: usize,
-    drill_topic: Option<usize>, // Topics: viewing a topic's units
+    drill_topic: Option<usize>, // Topics: viewing a topic's units (index into visible())
+    filter: Option<Facet>,      // Topics: show only topics touching this repo/person
     query: String,
     results: Vec<i64>, // doc ids
     engine: Engine,
@@ -160,6 +193,7 @@ impl App {
             view: View::Topics,
             sel: 0,
             drill_topic: None,
+            filter: None,
             query: String::new(),
             results: vec![],
             engine: Engine::Loading,
@@ -206,13 +240,61 @@ impl App {
     fn list_len(&self) -> usize {
         match self.view {
             View::Topics => match self.drill_topic {
-                None => self.topics.len(),
-                Some(t) => self.topics.get(t).map(|t| t.units.len()).unwrap_or(0),
+                None => self.visible().len(),
+                Some(t) => self.drilled(t).map(|t| t.units.len()).unwrap_or(0),
             },
             View::Work => self.work.len(),
             View::Search => self.results.len(),
             View::Status => 0,
         }
+    }
+
+    /// Topic indices passing the active filter, in their natural order (all when
+    /// unfiltered). `sel`/`drill_topic` index into THIS list, not `topics`.
+    fn visible(&self) -> Vec<usize> {
+        (0..self.topics.len())
+            .filter(|&i| self.filter.as_ref().is_none_or(|f| f.matches(&self.topics[i])))
+            .collect()
+    }
+
+    /// The topic at visible position `vi` (resolves the filter indirection).
+    fn drilled(&self, vi: usize) -> Option<&TopicUnits> {
+        self.visible().get(vi).and_then(|&i| self.topics.get(i))
+    }
+
+    /// Distinct repos (`repo=true`) or people across topics, most-covered first —
+    /// the order `r`/`p` cycle through.
+    fn facet_names(&self, repo: bool) -> Vec<String> {
+        let mut ct: HashMap<&str, usize> = HashMap::new();
+        for t in &self.topics {
+            for n in if repo { &t.repos } else { &t.authors } {
+                *ct.entry(n.as_str()).or_default() += 1;
+            }
+        }
+        let mut v: Vec<(&str, usize)> = ct.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        v.into_iter().map(|(n, _)| n.to_string()).collect()
+    }
+
+    /// Step the repo (or person) filter to its next value, wrapping past the end
+    /// to "no filter" so the one key both sets and clears.
+    fn cycle_facet(&mut self, repo: bool) {
+        let names = self.facet_names(repo);
+        if names.is_empty() {
+            return;
+        }
+        let cur = match &self.filter {
+            Some(f) if f.is_repo() == repo => names.iter().position(|n| n == f.name()),
+            _ => None, // unset, or filtering the other facet → start this one over
+        };
+        let next = match cur {
+            None => Some(names[0].clone()),
+            Some(i) if i + 1 < names.len() => Some(names[i + 1].clone()),
+            Some(_) => None, // past the last value → clear the filter
+        };
+        self.filter = next.map(|n| if repo { Facet::Repo(n) } else { Facet::Person(n) });
+        self.drill_topic = None;
+        self.sel = 0;
     }
 
     fn on_key(&mut self, code: KeyCode) {
@@ -238,7 +320,7 @@ impl App {
             KeyCode::Char('g') => self.sel = 0,
             KeyCode::Char('G') => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.view == View::Topics && self.drill_topic.is_none() && !self.topics.is_empty() {
+                if self.view == View::Topics && self.drill_topic.is_none() && !self.visible().is_empty() {
                     self.drill_topic = Some(self.sel);
                     self.sel = 0;
                 }
@@ -248,6 +330,9 @@ impl App {
                     self.sel = ti;
                 }
             }
+            // Cycle the topic list's repo / person filter (Topics list only).
+            KeyCode::Char('r') if self.view == View::Topics && self.drill_topic.is_none() => self.cycle_facet(true),
+            KeyCode::Char('p') if self.view == View::Topics && self.drill_topic.is_none() => self.cycle_facet(false),
             _ => {}
         }
     }
@@ -332,9 +417,10 @@ impl App {
     }
 
     fn breadcrumb(&self) -> String {
+        let filt = self.filter.as_ref().map(|f| format!(" · {}", f.tag())).unwrap_or_default();
         match (self.view, self.drill_topic) {
-            (View::Topics, Some(t)) => format!("synty › Topics › {}", self.topics.get(t).map(|x| x.title()).unwrap_or("")),
-            (View::Topics, None) => format!("synty › Topics ({})", self.topics.len()),
+            (View::Topics, Some(t)) => format!("synty › Topics › {}", self.drilled(t).map(|x| x.title()).unwrap_or("")),
+            (View::Topics, None) => format!("synty › Topics ({}){filt}", self.visible().len()),
             (View::Work, _) => format!("synty › Work ({})", self.work.len()),
             (View::Search, _) => format!("synty › Search ({})", self.results.len()),
             (View::Status, _) => "synty › Status".to_string(),
@@ -397,7 +483,7 @@ impl App {
         f.render_stateful_widget(table, area, &mut ts);
 
         if let Some(ti) = self.drill_topic {
-            if let Some(t) = self.topics.get(ti) {
+            if let Some(t) = self.drilled(ti) {
                 self.draw_topic_overlay(f, area, t);
             }
         }
@@ -476,15 +562,16 @@ impl App {
             View::Topics => {
                 // Per-day activity over the last 4 calendar weeks (Mon-aligned),
                 // shaded on a shared scale; the header labels each week's Monday.
-                let gmax = self.topics.iter().flat_map(|t| &t.units).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
+                let vis = self.visible();
+                let gmax = vis.iter().flat_map(|&i| &self.topics[i].units).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
                 let start = week_start(gmax);
-                let dailies: Vec<[u64; TL_DAYS]> = self.topics.iter().map(|t| daily(t, start)).collect();
+                let dailies: Vec<[u64; TL_DAYS]> = vis.iter().map(|&i| daily(&self.topics[i], start)).collect();
                 let cap = dailies.iter().flat_map(|d| d.iter().copied()).max().unwrap_or(0);
-                let rows = self
-                    .topics
+                let rows = vis
                     .iter()
                     .enumerate()
-                    .map(|(i, t)| {
+                    .map(|(row, &i)| {
+                        let t = &self.topics[i];
                         // title() is the LLM name on top; show the summary below.
                         // When there's no name the title is already the summary, so
                         // put the keyphrases below instead of duplicating it.
@@ -498,7 +585,7 @@ impl App {
                         Row::new(vec![
                             two_line(t.title().to_string(), line, theme::FG),
                             two_line(cap2(&t.repos), cap2(&t.authors), theme::FG),
-                            day_strip(&dailies[i], cap),
+                            day_strip(&dailies[row], cap),
                             Cell::from(t.units.len().to_string()).style(dim),
                         ])
                         .height(2)
@@ -624,7 +711,7 @@ impl App {
                 Engine::Ready => "type · Enter search · ↑↓ results · 1-4 views · Esc quit",
             },
             _ if self.drill_topic.is_some() => "↑↓ units · h back · 1-4 views · q quit",
-            View::Topics => "↑↓ move · Enter drill · 1-4 views · q quit",
+            View::Topics => "↑↓ move · Enter drill · r/p filter · 1-4 views · q quit",
             View::Status => "1-4 views · Tab cycle · q quit",
             View::Work => "↑↓ move · 1-4 views · Tab cycle · q quit",
         };
@@ -893,6 +980,7 @@ mod tests {
             view: View::Topics,
             sel: 0,
             drill_topic: None,
+            filter: None,
             query: String::new(),
             results: vec![],
             engine: Engine::Loading,
@@ -987,5 +1075,55 @@ mod tests {
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("synty › Work"), "work breadcrumb missing");
         assert!(text.contains("OCR adapter to the sie"), "work row missing summary text: {text}");
+    }
+
+    // Pressing r/p filters the topic list to one repo / person; cycling past the
+    // last value clears the filter, and the breadcrumb names the active facet.
+    #[test]
+    fn repo_person_filter_narrows_topic_list() {
+        let mut a = app();
+        // A second, unrelated topic so the filter has something to narrow against.
+        a.topics.push(TopicUnits {
+            id: 1,
+            cache_key: "t1".into(),
+            label: "infra".into(),
+            units: vec![Unit { kind: Kind::Pr, when: "2026-05-30".into(), repo: "infra".into(), title: "infra#3 terraform runner".into(), outcome: "MERGED".into(), summary: Some("Terraform runner IAM work.".into()), topic: Some(1), struggle: 0.0, author: "bob".into(), doc_id: None, session_id: None }],
+            last_active: "2026-05-30".into(),
+            activity: vec![0, 1, 0, 0],
+            mix: (0, 1, 0),
+            repos: vec!["infra".into()],
+            authors: vec!["bob".into()],
+            summary: Some("Terraform runner IAM work.".into()),
+            name: Some("Infra & Terraform".into()),
+            span: Some(("2026-05-28".into(), "2026-05-30".into())),
+        });
+        // Two distinct topics: sie/sie-web/alice vs infra/bob.
+        assert_eq!(a.visible().len(), 2);
+
+        // r selects the first repo facet → the list narrows to the topic it touches.
+        a.on_key(KeyCode::Char('r'));
+        assert!(a.filter.is_some(), "r should set a repo filter");
+        assert_eq!(a.visible().len(), 1, "repo filter should narrow to one topic");
+        assert!(a.breadcrumb().contains("repo:"), "breadcrumb should name the repo facet");
+
+        // Cycling through every repo (infra, sie, sie-web) then once more clears it.
+        for _ in 0..3 {
+            a.on_key(KeyCode::Char('r'));
+        }
+        assert!(a.filter.is_none(), "cycling past the last repo clears the filter");
+        assert_eq!(a.visible().len(), 2);
+
+        // p filters by person and is mutually exclusive with the repo facet.
+        a.on_key(KeyCode::Char('p'));
+        assert!(a.breadcrumb().contains('@'), "breadcrumb should name the person facet");
+        assert_eq!(a.visible().len(), 1, "person filter should narrow to one topic");
+
+        // Drilling while filtered resolves through the visible list, not topics[sel].
+        a.sel = 0;
+        a.on_key(KeyCode::Enter);
+        assert_eq!(a.drill_topic, Some(0), "drill indexes the visible list");
+        let drilled = a.drilled(0).expect("a visible topic");
+        let want = a.filter.as_ref().unwrap().name();
+        assert!(drilled.authors.iter().any(|p| p.as_str() == want), "drilled topic matches the active person filter");
     }
 }
