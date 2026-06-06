@@ -20,6 +20,11 @@ const EVAL_K: usize = 16; // neighbors fetched for the silhouette eval (graph us
 const FLOOR: f64 = 0.6; // keep a neighbor only if ≥60% of the best neighbor's score
 const MIN_CLUSTER: usize = 3;
 const INDEX_DIR: &str = "index/topics";
+/// Louvain resolution scale. The base default was too coarse and produced
+/// incoherent grab-bags (the resolution limit fusing weakly-connected sub-themes);
+/// a finer resolution yields coherent topics. Calibrated against the anchor
+/// membership eval, NOT silhouette (which prefers coarser clusters → grab-bags).
+const RES_SCALE: f64 = 2.5;
 
 pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let units = units::cluster_units()?;
@@ -70,8 +75,15 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let results = idx.search_batch(&emb, &params, true, None).map_err(|e| anyhow!("search: {e}"))?;
 
     let edges = build_edges(&results);
-    let comm = louvain(Graph::from_edges(n, &edges), resolution);
-    let q = modularity(&Graph::from_edges(n, &edges), &comm, resolution);
+    // Resolution is scaled UP (RES_SCALE): the default was too coarse, so the global
+    // resolution limit fused weakly-connected sub-themes into incoherent grab-bags.
+    // A finer resolution breaks them into coherent topics at the natural granularity
+    // — judged by anchor membership (silhouette misleads here: it always prefers
+    // fewer, coarser clusters, which is exactly the grab-bag failure). Agglomerative
+    // re-merging was tried and dropped: coherent and grab-bag sub-themes merge at the
+    // same threshold, so it can't re-coarsen selectively.
+    let comm = louvain(Graph::from_edges(n, &edges), resolution * RES_SCALE);
+    let q = modularity(&Graph::from_edges(n, &edges), &comm, resolution * RES_SCALE);
 
     let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, &c) in comm.iter().enumerate() {
@@ -80,7 +92,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let mut clusters: Vec<Vec<usize>> = groups.into_values().filter(|v| v.len() >= MIN_CLUSTER).collect();
     clusters.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
 
-    // unit → cluster index from Louvain (None if its community was < MIN_CLUSTER).
+    // unit → cluster index (None if its community was < MIN_CLUSTER).
     let mut of: Vec<Option<usize>> = vec![None; n];
     for (ci, c) in clusters.iter().enumerate() {
         for &m in c {
@@ -89,7 +101,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     }
 
     // Outlier reassignment: move each unit that's nearer another cluster into it
-    // (one simultaneous pass over the Louvain assignment — no oscillation).
+    // (one simultaneous pass — no oscillation).
     let moved = reassign(&results, &mut of);
     if moved > 0 {
         eprintln!("topics: reassigned {moved} outlier units to their nearest cluster");
@@ -104,55 +116,6 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     for (i, o) in of.iter().enumerate() {
         if let Some(ci) = o {
             members[*ci].push(i);
-        }
-    }
-
-    // I6 (experimental, enable with SYNTY_SPLIT=1): split grab-bag clusters into
-    // their sub-themes via a local Louvain on each flagged cluster's induced
-    // subgraph, gated so only genuinely-separable sub-themes split. It works —
-    // breaks grab-bags into coherent sub-topics (the anchor membership eval goes
-    // 3/5 → 5/5) — but at this calibration it also fragments coherent clusters,
-    // and silhouette structurally penalizes the extra clusters, so it can't yet be
-    // the validating metric or the default. Off until a better keep-criterion lands.
-    if std::env::var("SYNTY_SPLIT").is_ok() {
-        let mut next_id = members.len();
-        let mut splits = 0;
-        for ci in 0..members.len() {
-            if members[ci].len() < GRABBAG_MIN {
-                continue;
-            }
-            let comm = subgraph_split(&members[ci], &edges, resolution * SPLIT_RES);
-            if count_big(&comm) < 2 || sub_silhouette(&members[ci], &comm, &results) < SPLIT_FLOOR {
-                continue; // not splittable, or the sub-themes are too similar (coherent)
-            }
-            let mut sizes: HashMap<usize, usize> = HashMap::new();
-            for &c in &comm {
-                *sizes.entry(c).or_default() += 1;
-            }
-            let gid: HashMap<usize, usize> = sizes
-                .iter()
-                .filter(|(_, sz)| **sz >= MIN_CLUSTER)
-                .map(|(c, _)| {
-                    let g = next_id;
-                    next_id += 1;
-                    (*c, g)
-                })
-                .collect();
-            for (k, &mem) in members[ci].iter().enumerate() {
-                if let Some(&g) = gid.get(&comm[k]) {
-                    of[mem] = Some(g);
-                }
-            }
-            splits += 1;
-        }
-        if splits > 0 {
-            eprintln!("topics: split {splits} grab-bag clusters into sub-themes");
-            members = vec![Vec::new(); next_id];
-            for (i, o) in of.iter().enumerate() {
-                if let Some(ci) = o {
-                    members[*ci].push(i);
-                }
-            }
         }
     }
 
@@ -232,13 +195,6 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     sizes.sort_unstable();
     let docs = units.iter().filter(|u| u.key.starts_with("gh:")).count();
     let tiny = sizes.iter().filter(|&&l| l < MIN_CLUSTER).count();
-    // splittable = sizeable clusters whose induced subgraph splits into ≥2
-    // sub-themes — the I6 split candidates. (Not all are grab-bags: the global
-    // resolution limit hides sub-structure even in coherent clusters; I6 keeps a
-    // split only if it raises macro-silhouette.)
-    let splittable = (0..members.len())
-        .filter(|&ci| members[ci].len() >= GRABBAG_MIN && count_big(&subgraph_split(&members[ci], &edges, resolution)) >= 2)
-        .count();
     crate::metrics::Run::new("cluster")
         .set("resolution", resolution)
         .set("units", n)
@@ -250,7 +206,6 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         .set("silhouette_macro", qual.macro_sil as f64)
         .set("silhouette", qual.micro_sil as f64)
         .set("cohesion_med", qual.cohesion_med as f64)
-        .set("splittable", splittable)
         .set("misplaced", qual.misplaced)
         .set("misplaced_pct", if qual.scored > 0 { 100.0 * qual.misplaced as f64 / qual.scored as f64 } else { 0.0 })
         .set("vote_disagree", qual.vote_disagree)
@@ -414,69 +369,11 @@ struct Quality {
     vote_disagree: usize,
 }
 
-/// Louvain on a cluster's induced subgraph — returns the sub-community per member
-/// (parallel to `members`). The global resolution limit hides sub-structure even
-/// in coherent clusters, so a local re-run with its own 2m resolves the themes a
-/// grab-bag fused (the signal silhouette/cohesion miss). I0 counts ≥MIN sub-
-/// communities; I6 reassigns members to them.
-fn subgraph_split(members: &[usize], edges: &HashMap<(usize, usize), f64>, resolution: f64) -> Vec<usize> {
-    let idx: HashMap<usize, usize> = members.iter().enumerate().map(|(local, &g)| (g, local)).collect();
-    let mut sub: HashMap<(usize, usize), f64> = HashMap::new();
-    for (&(i, j), &w) in edges {
-        if let (Some(&li), Some(&lj)) = (idx.get(&i), idx.get(&j)) {
-            sub.insert((li, lj), w);
-        }
-    }
-    louvain(Graph::from_edges(members.len(), &sub), resolution)
-}
-
-/// Mean silhouette of a cluster's members against their SUB-communities (best
-/// same-sub vs best different-sub neighbor, both within the parent). High → the
-/// sub-themes are separable (a genuine grab-bag, splitting helps); near zero →
-/// the sub-topics are mutually similar (a coherent cluster, splitting just
-/// fragments it). This is the keep-the-split gate.
-fn sub_silhouette(members: &[usize], comm: &[usize], results: &[next_plaid::QueryResult]) -> f32 {
-    let sub_of: HashMap<usize, usize> = members.iter().zip(comm).map(|(&g, &c)| (g, c)).collect();
-    let mut sum = 0.0f32;
-    for (k, &mem) in members.iter().enumerate() {
-        let (mut a, mut b) = (None, None);
-        for (id, s) in results[mem].passage_ids.iter().zip(results[mem].scores.iter()) {
-            let j = *id as usize;
-            if j == mem {
-                continue;
-            }
-            match sub_of.get(&j) {
-                Some(&jc) if jc == comm[k] => a = a.or(Some(*s)),
-                Some(_) => b = b.or(Some(*s)),
-                None => {}
-            }
-        }
-        let (a, b) = (a.unwrap_or(0.0), b.unwrap_or(0.0));
-        sum += if a.max(b) > 0.0 { (a - b) / a.max(b) } else { 0.0 };
-    }
-    if members.is_empty() { 0.0 } else { sum / members.len() as f32 }
-}
-
-/// Number of sub-communities of at least `MIN_CLUSTER` members.
-fn count_big(comm: &[usize]) -> usize {
-    let mut sizes: HashMap<usize, usize> = HashMap::new();
-    for &c in comm {
-        *sizes.entry(c).or_default() += 1;
-    }
-    sizes.values().filter(|&&s| s >= MIN_CLUSTER).count()
-}
-
 /// Min cluster size for a per-cluster aggregate to count — tiny clusters give
 /// one-pair noise that would set the floor (silhouette macro / cohesion median).
 const QGATE: usize = 5;
-/// A grab-bag must also be sizeable to be worth flagging/splitting.
-const GRABBAG_MIN: usize = 8;
-/// Resolution multiplier for the per-cluster re-split — a local Louvain with its
-/// own 2m sidesteps the global resolution limit that fused the sub-themes.
-const SPLIT_RES: f64 = 1.5;
-/// Split a cluster only if its sub-themes are this separable (mean sub-silhouette)
-/// — keeps coherent clusters whole while breaking up true grab-bags.
-const SPLIT_FLOOR: f32 = 0.10;
+/// Min size for a cluster to appear in the lowest-coherence debug.
+const COHERENCE_MIN: usize = 8;
 
 /// Mean of per-cluster mean silhouettes over clusters of at least `min_size`.
 fn macro_silhouette(per_cluster: &[Vec<f32>], min_size: usize) -> f32 {
@@ -576,7 +473,7 @@ fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], lab
     }
     per.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
     eprintln!("  lowest-coherence clusters (S_C · ρ_C · size · label):");
-    for (ci, sz, sc, r) in per.iter().filter(|(_, n, _, _)| *n >= GRABBAG_MIN).take(6) {
+    for (ci, sz, sc, r) in per.iter().filter(|(_, n, _, _)| *n >= COHERENCE_MIN).take(6) {
         eprintln!("    c{ci} [S_C {sc:+.2} ρ {r:.2}] n={sz} — {}", label(*ci));
     }
     Quality { micro_sil, macro_sil, misplaced, scored: sils.len(), cohesion_med, vote_disagree }
