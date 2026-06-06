@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -111,7 +111,6 @@ struct App {
     sel: usize,
     drill_topic: Option<usize>, // Topics: viewing a topic's units (index into visible())
     filter: Option<Facet>,      // Topics/Work: show only items touching this repo/person
-    picker: Option<usize>,      // facet-picker overlay: selected row when open
     query: String,
     results: Vec<i64>, // doc ids
     engine: Engine,
@@ -202,7 +201,6 @@ impl App {
             sel: 0,
             drill_topic: None,
             filter: None,
-            picker: None,
             query: String::new(),
             results: vec![],
             engine: Engine::Loading,
@@ -313,64 +311,66 @@ impl App {
             .collect()
     }
 
-    /// Per-day unit counts for a facet over the four weeks from `start`, taken from
-    /// the Work units — the activity shown in the picker and the filter summary.
-    fn facet_activity(&self, f: &Facet, start: i32) -> [u64; TL_DAYS] {
-        let mut d = [0u64; TL_DAYS];
-        for u in self.work.iter().filter(|u| f.matches_unit(u)) {
-            if let Some(day) = day_num(&u.when) {
-                let off = day - start;
-                if (0..TL_DAYS as i32).contains(&off) {
-                    d[off as usize] += 1;
-                }
+    /// The always-on facet bar: every repo then every person as chips on one
+    /// line, the active one inverted (repos sky / people sand). Windowed around
+    /// the active chip so it stays visible; ‹ › flag hidden chips. r/p cycle it.
+    fn facet_bar(&self, width: u16) -> Line<'static> {
+        let chips: Vec<(String, bool)> = self
+            .facet_names(true)
+            .into_iter()
+            .map(|n| (n, true))
+            .chain(self.facet_names(false).into_iter().map(|n| (n, false)))
+            .collect();
+        if chips.is_empty() {
+            return Line::from(Span::styled("  (no repos or people yet)", Style::new().fg(theme::DIM)));
+        }
+        let active = self.filter.as_ref().and_then(|f| chips.iter().position(|(n, r)| *r == f.is_repo() && n == f.name()));
+        // Fit a window of chips that contains the active one, expanding outward.
+        let avail = width.saturating_sub(14) as usize;
+        let cw = |n: &str| n.chars().count() + 4; // name + "@"/separator/padding slack
+        let center = active.unwrap_or(0);
+        let (mut start, mut end, mut used) = (center, center, cw(&chips[center].0));
+        loop {
+            let mut grew = false;
+            if end + 1 < chips.len() && used + cw(&chips[end + 1].0) <= avail {
+                end += 1;
+                used += cw(&chips[end].0);
+                grew = true;
+            }
+            if start > 0 && used + cw(&chips[start - 1].0) <= avail {
+                start -= 1;
+                used += cw(&chips[start].0);
+                grew = true;
+            }
+            if !grew {
+                break;
             }
         }
-        d
-    }
-
-    /// The picker's rows: `None` (clear) first, then repos, then people — each
-    /// group most-covered first (reusing the cycle order).
-    fn picker_items(&self) -> Vec<Option<Facet>> {
-        let mut items = vec![None];
-        items.extend(self.facet_names(true).into_iter().map(|n| Some(Facet::Repo(n))));
-        items.extend(self.facet_names(false).into_iter().map(|n| Some(Facet::Person(n))));
-        items
-    }
-
-    /// Open the facet picker, landing on the active facet if there is one.
-    fn open_picker(&mut self) {
-        let items = self.picker_items();
-        let cur = self
-            .filter
-            .as_ref()
-            .and_then(|f| items.iter().position(|it| it.as_ref().is_some_and(|x| x.is_repo() == f.is_repo() && x.name() == f.name())));
-        self.picker = Some(cur.unwrap_or(0));
-    }
-
-    /// Key handling while the picker overlay is open (modal — it captures keys
-    /// until dismissed, so view switches and list nav don't leak through).
-    fn picker_key(&mut self, code: KeyCode) {
-        let items = self.picker_items();
-        let n = items.len();
-        let i = self.picker.unwrap_or(0).min(n - 1);
-        match code {
-            KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') => self.picker = None,
-            KeyCode::Down | KeyCode::Char('j') => self.picker = Some((i + 1).min(n - 1)),
-            KeyCode::Up | KeyCode::Char('k') => self.picker = Some(i.saturating_sub(1)),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                self.filter = items.into_iter().nth(i).flatten();
-                self.picker = None;
-                self.drill_topic = None;
-                self.sel = 0;
-            }
-            _ => {}
+        let mut spans: Vec<Span> = Vec::new();
+        if start > 0 {
+            spans.push(Span::styled("‹ ", Style::new().fg(theme::DIM)));
         }
+        for i in start..=end {
+            let (name, is_repo) = &chips[i];
+            if i > start {
+                let crossed = *is_repo != chips[i - 1].1; // repo→people boundary
+                spans.push(Span::styled(if crossed { " ┃ " } else { " · " }, Style::new().fg(theme::BORDER)));
+            }
+            let chip = if *is_repo { name.clone() } else { format!("@{name}") };
+            let style = if active == Some(i) {
+                Style::new().bg(theme::ACCENT).fg(theme::BG).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(if *is_repo { theme::GITHUB } else { theme::SESSION })
+            };
+            spans.push(Span::styled(chip, style));
+        }
+        if end + 1 < chips.len() {
+            spans.push(Span::styled(" ›", Style::new().fg(theme::DIM)));
+        }
+        Line::from(spans)
     }
 
     fn on_key(&mut self, code: KeyCode) {
-        if self.picker.is_some() {
-            return self.picker_key(code);
-        }
         match code {
             KeyCode::Tab => return self.cycle(1),
             KeyCode::BackTab => return self.cycle(-1),
@@ -403,9 +403,8 @@ impl App {
                     self.sel = ti;
                 }
             }
-            // Repo / person filter, shared by the Topics and Work lists: f opens a
-            // picker to browse facets, r/p cycle one directly.
-            KeyCode::Char('f') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.open_picker(),
+            // Repo / person filter (the facet bar), shared by Topics and Work:
+            // r/p cycle through the bar's chips.
             KeyCode::Char('r') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(true),
             KeyCode::Char('p') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(false),
             _ => {}
@@ -454,12 +453,12 @@ impl App {
         let [top, body, footer] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
         self.draw_header(f, top);
-        // With a facet filter active, a one-line activity summary of that
-        // workstream sits above the Topics/Work list.
-        let body = match (&self.filter, self.view) {
-            (Some(fac), View::Topics | View::Work) => {
-                let [sum, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
-                f.render_widget(Paragraph::new(self.filter_summary(fac)), sum);
+        // An always-on facet bar sits above the Topics/Work list (hidden while
+        // drilled): repos and people as chips, the active filter inverted.
+        let body = match self.view {
+            View::Topics | View::Work if self.drill_topic.is_none() => {
+                let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+                f.render_widget(Paragraph::new(self.facet_bar(bar.width)), bar);
                 rest
             }
             _ => body,
@@ -468,9 +467,6 @@ impl App {
             View::Status => f.render_widget(self.status_para(), body),
             View::Topics => self.draw_topics(f, body),
             View::Work | View::Search => self.draw_master_detail(f, body),
-        }
-        if self.picker.is_some() {
-            self.draw_picker(f, body);
         }
         // footer: contextual keys (left) · autostart status (right)
         let auto = if self.autostart { " autostart ✓ " } else { " autostart ✗ " };
@@ -620,79 +616,31 @@ impl App {
     }
 
     /// Facets for a topic overlay: the reduced summary, then counts, repos,
-    /// authors, activity, type mix.
-    fn topic_facets(&self, t: &TopicUnits) -> String {
+    /// authors, activity, type mix — with the active filter's repo/person
+    /// highlighted in the repos:/people: lines.
+    fn topic_facets(&self, t: &TopicUnits) -> Text<'static> {
         let (sess, prs, issues) = t.mix;
         let a = last3(&t.activity);
-        let join = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.iter().take(6).cloned().collect::<Vec<_>>().join(", ") };
-        let mut o = String::new();
+        let repo_active = self.filter.as_ref().filter(|f| f.is_repo()).map(|f| f.name());
+        let person_active = self.filter.as_ref().filter(|f| !f.is_repo()).map(|f| f.name());
+        let dim = Style::new().fg(theme::DIM);
+        let field = |label: &str, names: &[String], active: Option<&str>| {
+            let mut spans = vec![Span::styled(format!("{label} "), dim)];
+            spans.extend(styled_names(names, active, theme::FG, 6));
+            Line::from(spans)
+        };
+        let mut lines: Vec<Line> = Vec::new();
         if let Some(s) = &t.summary {
-            o.push_str(s);
-            o.push_str("\n\n");
+            lines.push(Line::from(Span::styled(s.clone(), Style::new().fg(theme::FG))));
+            lines.push(Line::from(""));
         }
         let when = t.span.as_ref().map(|(x, y)| format!("active {x} → {y}")).unwrap_or_else(|| format!("last active {}", t.last_active));
-        o.push_str(&format!(
-            "{} units · {when}\nrepos: {}\npeople: {}\nactivity prior/last/this wk: {} / {} / {}\nmix: {sess} sessions · {prs} PRs · {issues} issues",
-            t.units.len(),
-            join(&t.repos),
-            join(&t.authors),
-            a[0], a[1], a[2],
-        ));
-        o
-    }
-
-    /// A one-line summary of the active facet's workstream: counts plus a compact
-    /// four-week activity bar — the "activity across this repo/person" header.
-    fn filter_summary(&self, f: &Facet) -> Line<'static> {
-        let topics = self.topics.iter().filter(|t| f.matches(t)).count();
-        let units = self.work.iter().filter(|u| f.matches_unit(u)).count();
-        let gmax = self.work.iter().filter(|u| f.matches_unit(u)).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
-        let days = self.facet_activity(f, week_start(gmax));
-        Line::from(vec![
-            Span::styled(format!(" {} ", f.tag()), Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("· {topics} topics · {units} units · last 4wk "), Style::new().fg(theme::DIM)),
-            Span::styled(week_spark(&days, week_cap(&days)), Style::new().fg(theme::SAGE)),
-        ])
-    }
-
-    /// The facet-picker overlay: a centered list of repos and people (with topic
-    /// counts and a four-week bar) plus a "clear filter" row, selectable into the
-    /// shared `filter`.
-    fn draw_picker(&self, f: &mut Frame, body: Rect) {
-        let items = self.picker_items();
-        let sel = self.picker.unwrap_or(0).min(items.len().saturating_sub(1));
-        let w = 52.min(body.width.saturating_sub(4)).max(20);
-        let h = (items.len() as u16 + 2).clamp(3, body.height.saturating_sub(2).max(3));
-        let area = centered(body, w, h);
-        f.render_widget(Clear, area);
-        let block = Block::bordered().border_style(Style::new().fg(theme::ACCENT)).title(" filter by repo / person ");
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let rows: Vec<ListItem> = items
-            .iter()
-            .map(|it| match it {
-                None => ListItem::new(Line::from(Span::styled("  all — clear filter", Style::new().fg(theme::FG)))),
-                Some(fac) => {
-                    let topics = self.topics.iter().filter(|t| fac.matches(t)).count();
-                    let gmax = self.work.iter().filter(|u| fac.matches_unit(u)).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
-                    let days = self.facet_activity(fac, week_start(gmax));
-                    let (tag, color) = match fac {
-                        Facet::Repo(n) => (format!("repo  {n}"), theme::GITHUB),
-                        Facet::Person(n) => (format!("@{n}"), theme::SESSION),
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("  {tag:<24}"), Style::new().fg(color)),
-                        Span::styled(format!("{topics:>2} topics  "), Style::new().fg(theme::DIM)),
-                        Span::styled(week_spark(&days, week_cap(&days)), Style::new().fg(theme::SAGE)),
-                    ]))
-                }
-            })
-            .collect();
-        let mut ls = ListState::default();
-        ls.select(Some(sel));
-        let list = List::new(rows).highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD)).highlight_symbol("▌");
-        f.render_stateful_widget(list, inner, &mut ls);
+        lines.push(Line::from(Span::styled(format!("{} units · {when}", t.units.len()), dim)));
+        lines.push(field("repos:", &t.repos, repo_active));
+        lines.push(field("people:", &t.authors, person_active));
+        lines.push(Line::from(Span::styled(format!("activity prior/last/this wk: {} / {} / {}", a[0], a[1], a[2]), dim)));
+        lines.push(Line::from(Span::styled(format!("mix: {sess} sessions · {prs} PRs · {issues} issues"), dim)));
+        Text::from(lines)
     }
 
     /// (header, column widths, rows) for the current view's table.
@@ -708,6 +656,8 @@ impl App {
                 let start = week_start(gmax);
                 let dailies: Vec<[u64; TL_DAYS]> = vis.iter().map(|&i| daily(&self.topics[i], start)).collect();
                 let cap = dailies.iter().flat_map(|d| d.iter().copied()).max().unwrap_or(0);
+                let repo_active = self.filter.as_ref().filter(|f| f.is_repo()).map(|f| f.name());
+                let person_active = self.filter.as_ref().filter(|f| !f.is_repo()).map(|f| f.name());
                 let rows = vis
                     .iter()
                     .enumerate()
@@ -721,11 +671,13 @@ impl App {
                         } else {
                             t.label.clone()
                         };
-                        // repos on top, people below — a compact 2-line column.
-                        let cap2 = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.iter().take(4).cloned().collect::<Vec<_>>().join(", ") };
+                        // repos on top, people below; the active facet inverted.
                         Row::new(vec![
                             two_line(t.title().to_string(), line, theme::FG),
-                            two_line(cap2(&t.repos), cap2(&t.authors), theme::FG),
+                            Cell::from(Text::from(vec![
+                                Line::from(styled_names(&t.repos, repo_active, theme::FG, 4)),
+                                Line::from(styled_names(&t.authors, person_active, theme::FG, 4)),
+                            ])),
                             day_strip(&dailies[row], cap),
                             Cell::from(t.units.len().to_string()).style(dim),
                         ])
@@ -739,16 +691,22 @@ impl App {
                 )
             }
             View::Work => {
+                let repo_active = self.filter.as_ref().filter(|f| f.is_repo()).map(|f| f.name());
                 let rows = self
                     .visible_work()
                     .into_iter()
                     .map(|i| {
                         let u = &self.work[i];
                         let (primary, secondary) = unit_lines(u);
+                        let repo_style = if repo_active == Some(u.repo.as_str()) {
+                            Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                        } else {
+                            dim
+                        };
                         Row::new(vec![
                             Cell::from(u.when.clone()).style(dim),
                             type_cell(u.kind),
-                            Cell::from(u.repo.clone()).style(dim),
+                            Cell::from(u.repo.clone()).style(repo_style),
                             two_line(primary, secondary, theme::FG),
                             state_cell(u),
                         ])
@@ -845,9 +803,6 @@ impl App {
     }
 
     fn footer(&self) -> String {
-        if self.picker.is_some() {
-            return "  ↑↓ choose · Enter apply · Esc cancel".to_string();
-        }
         let keys = match self.view {
             View::Search => match &self.engine {
                 Engine::Loading => "loading model…",
@@ -856,9 +811,9 @@ impl App {
                 Engine::Ready => "type · Enter search · ↑↓ results · 1-4 views · Esc quit",
             },
             _ if self.drill_topic.is_some() => "↑↓ units · h back · 1-4 views · q quit",
-            View::Topics => "↑↓ move · Enter drill · f/r/p filter · 1-4 views · q quit",
+            View::Topics => "↑↓ move · Enter drill · r/p filter · 1-4 views · q quit",
             View::Status => "1-4 views · Tab cycle · q quit",
-            View::Work => "↑↓ move · f/r/p filter · 1-4 views · Tab cycle · q quit",
+            View::Work => "↑↓ move · r/p filter · 1-4 views · Tab cycle · q quit",
         };
         format!("  {keys}")
     }
@@ -886,6 +841,28 @@ fn two_line(primary: String, secondary: String, color: Color) -> Cell<'static> {
         Line::from(Span::styled(primary, Style::new().fg(color))),
         Line::from(Span::styled(secondary, Style::new().fg(theme::DIM))),
     ]))
+}
+
+/// `names` as styled spans, comma-joined: the active facet inverted (ACCENT
+/// bold), the rest in `base`; a dim "—" when empty. Caps at `max` names — the
+/// shared highlighter for the topic column and the drill overlay's facet lines.
+fn styled_names(names: &[String], active: Option<&str>, base: Color, max: usize) -> Vec<Span<'static>> {
+    if names.is_empty() {
+        return vec![Span::styled("—", Style::new().fg(theme::DIM))];
+    }
+    let mut spans = Vec::new();
+    for (i, n) in names.iter().take(max).enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(", ", Style::new().fg(theme::DIM)));
+        }
+        let style = if active == Some(n.as_str()) {
+            Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(base)
+        };
+        spans.push(Span::styled(n.clone(), style));
+    }
+    spans
 }
 
 /// (primary, secondary) text for a unit row: the one-line summary on top when
@@ -978,39 +955,6 @@ fn day_strip(days: &[u64; TL_DAYS], cap: u64) -> Cell<'static> {
         });
     }
     Cell::from(Text::from(vec![Line::from(spans.clone()), Line::from(spans)]))
-}
-
-const SPARK: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-/// Largest single-week unit count in a daily strip (the shading ceiling).
-fn week_cap(days: &[u64; TL_DAYS]) -> u64 {
-    (0..TL_DAYS / 7).map(|w| days[w * 7..w * 7 + 7].iter().sum::<u64>()).max().unwrap_or(0)
-}
-
-/// Four block glyphs, one per calendar week, each shaded by that week's unit
-/// count relative to `cap` — a compact activity bar for picker rows and the
-/// filter summary line.
-fn week_spark(days: &[u64; TL_DAYS], cap: u64) -> String {
-    (0..TL_DAYS / 7)
-        .map(|w| {
-            let sum: u64 = days[w * 7..w * 7 + 7].iter().sum();
-            if sum == 0 || cap == 0 {
-                SPARK[0]
-            } else {
-                SPARK[(sum * 8).div_ceil(cap).clamp(1, 8) as usize]
-            }
-        })
-        .collect()
-}
-
-/// A `w`×`h` rectangle centered within `area` (clamped to it) — for overlays.
-fn centered(area: Rect, w: u16, h: u16) -> Rect {
-    Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
-        width: w.min(area.width),
-        height: h.min(area.height),
-    }
 }
 
 fn type_cell(k: Kind) -> Cell<'static> {
@@ -1159,7 +1103,6 @@ mod tests {
             sel: 0,
             drill_topic: None,
             filter: None,
-            picker: None,
             query: String::new(),
             results: vec![],
             engine: Engine::Loading,
@@ -1314,44 +1257,6 @@ mod tests {
         assert!(drilled.authors.iter().any(|p| p.as_str() == want), "drilled topic matches the active person filter");
     }
 
-    // The facet picker (f) selects a repo/person; the chosen filter scopes both
-    // the Topics list and the Work list, and the "all" row clears it.
-    #[test]
-    fn facet_picker_selects_and_scopes_both_views() {
-        let mut a = app2();
-        a.on_key(KeyCode::Char('f'));
-        assert!(a.picker.is_some(), "f opens the facet picker");
-        // item 0 is "clear"; step onto the first real facet and apply it.
-        a.on_key(KeyCode::Down);
-        a.on_key(KeyCode::Enter);
-        assert!(a.picker.is_none(), "Enter closes the picker");
-        assert!(a.filter.is_some(), "Enter applies a facet filter");
-        assert_eq!(a.visible().len(), 1, "picked facet narrows the topic list");
-        // the same filter scopes the Work view.
-        a.view = View::Work;
-        assert!(a.visible_work().len() < a.work.len(), "filter narrows the Work list too");
-        // reopening and choosing the top row clears the filter.
-        a.on_key(KeyCode::Char('f'));
-        a.on_key(KeyCode::Up);
-        a.on_key(KeyCode::Enter);
-        assert!(a.filter.is_none(), "the 'all' row clears the filter");
-        assert_eq!(a.visible_work().len(), a.work.len());
-    }
-
-    // The picker overlay renders its title, the clear row, and the facets.
-    #[test]
-    fn picker_overlay_renders() {
-        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        let mut a = app2();
-        a.on_key(KeyCode::Char('f'));
-        term.draw(|f| a.draw(f)).unwrap();
-        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("filter by repo / person"), "picker panel title missing: {text}");
-        assert!(text.contains("clear filter"), "picker missing the clear row");
-        assert!(text.contains("infra"), "picker missing a repo facet");
-        assert!(text.contains("Enter apply"), "footer should switch to picker hints");
-    }
-
     // r/p drive the filter from the Work view too, not just Topics.
     #[test]
     fn filter_keys_work_in_work_view() {
@@ -1362,16 +1267,27 @@ mod tests {
         assert!(a.visible_work().len() < a.work.len(), "Work list narrows under the filter");
     }
 
-    // With a filter active, a one-line activity summary sits above the list.
+    // The facet bar lists every repo and person, and inverts the active one.
     #[test]
-    fn filter_summary_line_renders() {
-        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    fn facet_bar_lists_and_highlights() {
         let mut a = app2();
+        let text: String = a.facet_bar(120).spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("sie") && text.contains("infra"), "bar should list repos: {text}");
+        assert!(text.contains("@alice") && text.contains("@bob"), "bar should list people: {text}");
+        // the active facet's chip is inverted (accent background).
         a.filter = Some(Facet::Repo("infra".into()));
-        term.draw(|f| a.draw(f)).unwrap();
-        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        // lowercase "topics"/"units" are unique to the summary (column headers are caps).
-        assert!(text.contains("topics") && text.contains("units"), "filter summary line missing counts: {text}");
-        assert!(text.contains("last 4wk"), "filter summary missing the activity bar label");
+        let chip = a.facet_bar(120).spans.into_iter().find(|s| s.content == "infra").expect("infra chip");
+        assert_eq!(chip.style.bg, Some(theme::ACCENT), "active chip should be inverted");
+    }
+
+    // styled_names accents the active facet name and leaves the others in base.
+    #[test]
+    fn active_facet_name_is_highlighted() {
+        let names = vec!["sie".to_string(), "infra".to_string()];
+        let spans = styled_names(&names, Some("infra"), theme::FG, 4);
+        let infra = spans.iter().find(|s| s.content == "infra").expect("infra span");
+        assert_eq!(infra.style.fg, Some(theme::ACCENT), "active name should be accented");
+        let sie = spans.iter().find(|s| s.content == "sie").expect("sie span");
+        assert_eq!(sie.style.fg, Some(theme::FG), "inactive name keeps the base color");
     }
 }
