@@ -311,60 +311,60 @@ impl App {
             .collect()
     }
 
-    /// The always-on facet bar: every repo then every person as chips on one
-    /// line, the active one inverted (repos sky / people sand). Windowed around
-    /// the active chip so it stays visible; ‹ › flag hidden chips. r/p cycle it.
-    fn facet_bar(&self, width: u16) -> Line<'static> {
-        let chips: Vec<(String, bool)> = self
-            .facet_names(true)
-            .into_iter()
-            .map(|n| (n, true))
-            .chain(self.facet_names(false).into_iter().map(|n| (n, false)))
-            .collect();
-        if chips.is_empty() {
-            return Line::from(Span::styled("  (no repos or people yet)", Style::new().fg(theme::DIM)));
+    /// The always-on facet bar: two labeled rows — repos (sky) above accounts
+    /// (sand) — with the active filter inverted in place. r cycles the repos
+    /// row, p the accounts row.
+    fn facet_bar(&self, width: u16) -> Text<'static> {
+        Text::from(vec![self.facet_row("Repos:", true, width), self.facet_row("Accounts:", false, width)])
+    }
+
+    /// One row of the facet bar: a dim label, then the repo (or account) chips,
+    /// windowed around the active one so it stays visible (‹ › flag hidden chips).
+    fn facet_row(&self, label: &str, repo: bool, width: u16) -> Line<'static> {
+        let names = self.facet_names(repo);
+        let mut spans = vec![Span::styled(format!("{label:<9} "), Style::new().fg(theme::DIM))];
+        if names.is_empty() {
+            spans.push(Span::styled("—", Style::new().fg(theme::DIM)));
+            return Line::from(spans);
         }
-        let active = self.filter.as_ref().and_then(|f| chips.iter().position(|(n, r)| *r == f.is_repo() && n == f.name()));
+        let active = self.filter.as_ref().filter(|f| f.is_repo() == repo).and_then(|f| names.iter().position(|n| n == f.name()));
         // Fit a window of chips that contains the active one, expanding outward.
-        let avail = width.saturating_sub(14) as usize;
-        let cw = |n: &str| n.chars().count() + 4; // name + "@"/separator/padding slack
+        let avail = width.saturating_sub(12) as usize; // label + ‹ › slack
+        let cw = |n: &str| n.chars().count() + 3; // name + separator/padding slack
         let center = active.unwrap_or(0);
-        let (mut start, mut end, mut used) = (center, center, cw(&chips[center].0));
+        let (mut start, mut end, mut used) = (center, center, cw(&names[center]));
         loop {
             let mut grew = false;
-            if end + 1 < chips.len() && used + cw(&chips[end + 1].0) <= avail {
+            if end + 1 < names.len() && used + cw(&names[end + 1]) <= avail {
                 end += 1;
-                used += cw(&chips[end].0);
+                used += cw(&names[end]);
                 grew = true;
             }
-            if start > 0 && used + cw(&chips[start - 1].0) <= avail {
+            if start > 0 && used + cw(&names[start - 1]) <= avail {
                 start -= 1;
-                used += cw(&chips[start].0);
+                used += cw(&names[start]);
                 grew = true;
             }
             if !grew {
                 break;
             }
         }
-        let mut spans: Vec<Span> = Vec::new();
         if start > 0 {
             spans.push(Span::styled("‹ ", Style::new().fg(theme::DIM)));
         }
-        for i in start..=end {
-            let (name, is_repo) = &chips[i];
-            if i > start {
-                let crossed = *is_repo != chips[i - 1].1; // repo→people boundary
-                spans.push(Span::styled(if crossed { " ┃ " } else { " · " }, Style::new().fg(theme::BORDER)));
+        let color = if repo { theme::GITHUB } else { theme::SESSION };
+        for (j, name) in names[start..=end].iter().enumerate() {
+            if j > 0 {
+                spans.push(Span::styled(" · ", Style::new().fg(theme::BORDER)));
             }
-            let chip = if *is_repo { name.clone() } else { format!("@{name}") };
-            let style = if active == Some(i) {
+            let style = if active == Some(start + j) {
                 Style::new().bg(theme::ACCENT).fg(theme::BG).add_modifier(Modifier::BOLD)
             } else {
-                Style::new().fg(if *is_repo { theme::GITHUB } else { theme::SESSION })
+                Style::new().fg(color)
             };
-            spans.push(Span::styled(chip, style));
+            spans.push(Span::styled(name.clone(), style));
         }
-        if end + 1 < chips.len() {
+        if end + 1 < names.len() {
             spans.push(Span::styled(" ›", Style::new().fg(theme::DIM)));
         }
         Line::from(spans)
@@ -454,10 +454,10 @@ impl App {
             Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
         self.draw_header(f, top);
         // An always-on facet bar sits above the Topics/Work list (hidden while
-        // drilled): repos and people as chips, the active filter inverted.
+        // drilled): a Repos row over an Accounts row, the active filter inverted.
         let body = match self.view {
             View::Topics | View::Work if self.drill_topic.is_none() => {
-                let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+                let [bar, rest] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(body);
                 f.render_widget(Paragraph::new(self.facet_bar(bar.width)), bar);
                 rest
             }
@@ -637,7 +637,7 @@ impl App {
         let when = t.span.as_ref().map(|(x, y)| format!("active {x} → {y}")).unwrap_or_else(|| format!("last active {}", t.last_active));
         lines.push(Line::from(Span::styled(format!("{} units · {when}", t.units.len()), dim)));
         lines.push(field("repos:", &t.repos, repo_active));
-        lines.push(field("people:", &t.authors, person_active));
+        lines.push(field("accounts:", &t.authors, person_active));
         lines.push(Line::from(Span::styled(format!("activity prior/last/this wk: {} / {} / {}", a[0], a[1], a[2]), dim)));
         lines.push(Line::from(Span::styled(format!("mix: {sess} sessions · {prs} PRs · {issues} issues"), dim)));
         Text::from(lines)
@@ -685,7 +685,7 @@ impl App {
                     })
                     .collect();
                 (
-                    vec!["".into(), "REPOS · PEOPLE".into(), week_header(start, gmax), "UNITS".into()],
+                    vec!["".into(), "REPOS · ACCOUNTS".into(), week_header(start, gmax), "UNITS".into()],
                     vec![Constraint::Min(20), Constraint::Length(32), Constraint::Length(TL_DAYS as u16 + 3), Constraint::Length(5)],
                     rows,
                 )
@@ -1162,7 +1162,7 @@ mod tests {
         }
         assert!(text.contains("autostart"), "footer missing autostart status");
         // breadcrumb-only chrome: no redundant TOPIC header, but functional ones remain
-        assert!(text.contains("REPOS · PEOPLE"), "topics table missing column headers");
+        assert!(text.contains("REPOS · ACCOUNTS"), "topics table missing column headers");
         assert!(!text.contains("TOPIC"), "redundant TOPIC header should be gone");
         assert!(text.contains("synty › Topics"), "breadcrumb missing");
     }
@@ -1179,7 +1179,7 @@ mod tests {
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         // overlay shows facets (repos/authors) and a member unit's summary
-        assert!(text.contains("repos:") && text.contains("people:"), "overlay missing facets: {text}");
+        assert!(text.contains("repos:") && text.contains("accounts:"), "overlay missing facets: {text}");
         assert!(text.contains("OCR adapter to the sie"), "overlay missing unit summary");
         // h restores selection to the drilled topic
         a.on_key(KeyCode::Char('h'));
@@ -1206,7 +1206,7 @@ mod tests {
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("5/25"), "week Monday date header missing (fixture week of 2026-05-25)");
         assert!(text.contains('│'), "week divider missing from activity strip");
-        assert!(text.contains("REPOS · PEOPLE"), "repos/people column header missing");
+        assert!(text.contains("REPOS · ACCOUNTS"), "repos/people column header missing");
         assert!(text.contains("sie, sie-web"), "repos line missing from topics row");
     }
 
@@ -1267,16 +1267,19 @@ mod tests {
         assert!(a.visible_work().len() < a.work.len(), "Work list narrows under the filter");
     }
 
-    // The facet bar lists every repo and person, and inverts the active one.
+    // The facet bar has a Repos row over an Accounts row, and inverts the active.
     #[test]
     fn facet_bar_lists_and_highlights() {
         let mut a = app2();
-        let text: String = a.facet_bar(120).spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains("sie") && text.contains("infra"), "bar should list repos: {text}");
-        assert!(text.contains("@alice") && text.contains("@bob"), "bar should list people: {text}");
+        let bar = a.facet_bar(120);
+        let repos: String = bar.lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        let accounts: String = bar.lines[1].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(repos.starts_with("Repos:") && repos.contains("sie") && repos.contains("infra"), "repos row: {repos}");
+        assert!(accounts.starts_with("Accounts:") && accounts.contains("alice") && accounts.contains("bob"), "accounts row: {accounts}");
         // the active facet's chip is inverted (accent background).
         a.filter = Some(Facet::Repo("infra".into()));
-        let chip = a.facet_bar(120).spans.into_iter().find(|s| s.content == "infra").expect("infra chip");
+        let bar = a.facet_bar(120);
+        let chip = bar.lines.iter().flat_map(|l| &l.spans).find(|s| s.content == "infra").expect("infra chip");
         assert_eq!(chip.style.bg, Some(theme::ACCENT), "active chip should be inverted");
     }
 
