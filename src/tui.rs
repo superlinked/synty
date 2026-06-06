@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn navbar_shows_all_labels() {
         let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
-        let mut a = app();
+        let a = app();
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         for label in ["Topics", "Work", "Search", "Status"] {

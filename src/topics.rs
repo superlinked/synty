@@ -5,7 +5,7 @@
 // separate) — MaxSim kNN
 // + Louvain, the same late-interaction substrate as retrieval, one level up. A
 // topic is then a coherent set of units, so its members/facets/label/summary are
-// consistent by construction. Writes unit_clusters.json; reports silhouette.
+// consistent by construction. Writes unit_clusters.json; reports anchor-validated coherence.
 
 use crate::community::{louvain, modularity, Graph};
 use crate::store::EmbStore;
@@ -16,7 +16,7 @@ use next_plaid::{IndexConfig, MmapIndex, SearchParameters, UpdateConfig};
 use std::collections::HashMap;
 
 const K: usize = 6;
-const EVAL_K: usize = 16; // neighbors fetched for the silhouette eval (graph uses top-K)
+const EVAL_K: usize = 16; // neighbors fetched for the quality eval (graph uses top-K)
 const FLOOR: f64 = 0.6; // keep a neighbor only if ≥60% of the best neighbor's score
 const MIN_CLUSTER: usize = 3;
 const INDEX_DIR: &str = "index/topics";
@@ -189,8 +189,8 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let qual = report_quality(&results, &of, &labels, &units);
     diag(&units, &results, &of, &labels);
 
-    // Standardized health/quality metrics. silhouette_macro is the headline (the
-    // micro mean is size-inflated); cohesion_med/grabbags flag incoherent clusters.
+    // Standardized health/quality metrics. Coherence is judged by the anchor eval;
+    // cohesion_med/vote_disagree are diagnostics, not decision metrics.
     let mut sizes: Vec<usize> = members.iter().map(|m| m.len()).filter(|&l| l > 0).collect();
     sizes.sort_unstable();
     let docs = units.iter().filter(|u| u.key.starts_with("gh:")).count();
@@ -203,8 +203,6 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         .set("clusters", sizes.len())
         .set("id_continuity", id_continuity)
         .set("modularity", q)
-        .set("silhouette_macro", qual.macro_sil as f64)
-        .set("silhouette", qual.micro_sil as f64)
         .set("cohesion_med", qual.cohesion_med as f64)
         .set("misplaced", qual.misplaced)
         .set("misplaced_pct", if qual.scored > 0 { 100.0 * qual.misplaced as f64 / qual.scored as f64 } else { 0.0 })
@@ -355,45 +353,30 @@ fn same_cluster_score(i: usize, results: &[next_plaid::QueryResult], of: &[Optio
         .sum()
 }
 
-/// Cluster quality, computed once from the kNN results. Headline is the MACRO
-/// silhouette (per-cluster mean of means; the micro mean is inflated up to 41%
-/// by one large cluster — arXiv:2401.05831). `cohesion_med`/`grabbags` flag
-/// incoherent clusters via the cohesion ratio ρ_C = within ÷ global mean MaxSim
-/// (arXiv:2511.19350). `vote_disagree` is a rescale-invariant placement check.
+/// Cluster quality from the kNN results, all judged against the anchor eval — no
+/// silhouette (it structurally prefers coarser clusters, i.e. it rewards exactly
+/// the grab-bags we fixed). `misplaced` = units whose nearest neighbor sits in
+/// another cluster; `cohesion_med` = median cohesion ratio ρ_C = within ÷ global
+/// mean MaxSim (arXiv:2511.19350); `vote_disagree` = units whose kNN-majority
+/// cluster differs from their assignment (rescale-invariant placement).
 struct Quality {
-    micro_sil: f32,
-    macro_sil: f32,
     misplaced: usize,
     scored: usize,
     cohesion_med: f32,
     vote_disagree: usize,
 }
 
-/// Min cluster size for a per-cluster aggregate to count — tiny clusters give
-/// one-pair noise that would set the floor (silhouette macro / cohesion median).
+/// Min cluster size for the cohesion median to count a cluster — tiny clusters
+/// give one-pair noise that would set the floor.
 const QGATE: usize = 5;
-/// Min size for a cluster to appear in the lowest-coherence debug.
+/// Min size for a cluster to appear in the lowest-cohesion debug.
 const COHERENCE_MIN: usize = 8;
-
-/// Mean of per-cluster mean silhouettes over clusters of at least `min_size`.
-fn macro_silhouette(per_cluster: &[Vec<f32>], min_size: usize) -> f32 {
-    let means: Vec<f32> = per_cluster
-        .iter()
-        .filter(|c| c.len() >= min_size)
-        .map(|c| c.iter().sum::<f32>() / c.len() as f32)
-        .collect();
-    if means.is_empty() {
-        0.0
-    } else {
-        means.iter().sum::<f32>() / means.len() as f32
-    }
-}
 
 fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], labels: &[String], units: &[units::UnitClusterInput]) -> Quality {
     let label = |ci: usize| labels.get(ci).cloned().unwrap_or_default();
-    let mut sils: Vec<(usize, usize, usize, f32)> = Vec::new(); // (unit, own ci, nearest other ci, silhouette)
-    let mut by_cluster: HashMap<usize, (Vec<f32>, Vec<f32>)> = HashMap::new(); // ci -> (silhouettes, same-cluster best a)
-    let (mut top1_sum, mut top1_n) = (0.0f32, 0usize);
+    let mut by_a: HashMap<usize, Vec<f32>> = HashMap::new(); // ci -> each member's best same-cluster MaxSim
+    let mut margins: Vec<(usize, usize, usize, f32)> = Vec::new(); // (unit, own ci, nearest other ci, a−b)
+    let (mut top1_sum, mut top1_n, mut misplaced) = (0.0f32, 0usize, 0usize);
     for (i, r) in results.iter().enumerate() {
         let Some(ci) = of[i] else { continue };
         let (mut a, mut b, mut other, mut top1) = (None, None, ci, None);
@@ -415,33 +398,26 @@ fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], lab
             }
         }
         let (a, b) = (a.unwrap_or(0.0), b.unwrap_or(0.0));
-        let sil = if a.max(b) > 0.0 { (a - b) / a.max(b) } else { 0.0 };
         top1_sum += top1.unwrap_or(0.0);
         top1_n += 1;
-        let e = by_cluster.entry(ci).or_default();
-        e.0.push(sil);
-        e.1.push(a);
-        sils.push((i, ci, other, sil));
+        by_a.entry(ci).or_default().push(a);
+        if b > a {
+            misplaced += 1;
+        }
+        margins.push((i, ci, other, a - b));
     }
-    if sils.is_empty() {
-        return Quality { micro_sil: 0.0, macro_sil: 0.0, misplaced: 0, scored: 0, cohesion_med: 0.0, vote_disagree: 0 };
+    let scored = margins.len();
+    if scored == 0 {
+        return Quality { misplaced: 0, scored: 0, cohesion_med: 0.0, vote_disagree: 0 };
     }
-    let micro_sil = sils.iter().map(|x| x.3).sum::<f32>() / sils.len() as f32;
-    let misplaced = sils.iter().filter(|x| x.3 < 0.0).count();
 
-    // Per cluster: mean silhouette S_C (headline, scale-free) and cohesion ratio
-    // ρ_C = within ÷ global mean MaxSim (secondary signal).
-    let per_cluster_sils: Vec<Vec<f32>> = by_cluster.values().map(|(s, _)| s.clone()).collect();
-    let macro_sil = macro_silhouette(&per_cluster_sils, QGATE);
+    // Cohesion ratio ρ_C = mean within-cluster best-neighbor MaxSim ÷ global mean.
     let global = (top1_sum / top1_n as f32).max(1e-6);
-    let mut per: Vec<(usize, usize, f32, f32)> = by_cluster // (ci, size, S_C, ρ_C)
+    let mut rho: Vec<(usize, usize, f32)> = by_a
         .iter()
-        .map(|(ci, (s, a))| {
-            let sc = s.iter().sum::<f32>() / s.len() as f32;
-            (*ci, s.len(), sc, (a.iter().sum::<f32>() / a.len() as f32) / global)
-        })
+        .map(|(ci, a)| (*ci, a.len(), (a.iter().sum::<f32>() / a.len() as f32) / global))
         .collect();
-    let mut rho_gate: Vec<f32> = per.iter().filter(|(_, n, _, _)| *n >= QGATE).map(|(_, _, _, r)| *r).collect();
+    let mut rho_gate: Vec<f32> = rho.iter().filter(|(_, n, _)| *n >= QGATE).map(|(_, _, r)| *r).collect();
     rho_gate.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let cohesion_med = rho_gate.get(rho_gate.len() / 2).copied().unwrap_or(0.0);
 
@@ -466,34 +442,15 @@ fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], lab
         }
     }
 
-    sils.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+    margins.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
     eprintln!("  worst-placed units (in → would prefer):");
-    for (i, ci, other, sil) in sils.iter().take(6) {
-        eprintln!("    [{sil:+.2}] {} — in “{}” → “{}”", crate::short(&units[*i].key), label(*ci), label(*other));
+    for (i, ci, other, m) in margins.iter().take(6) {
+        eprintln!("    [{m:+.2}] {} — in “{}” → “{}”", crate::short(&units[*i].key), label(*ci), label(*other));
     }
-    per.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-    eprintln!("  lowest-coherence clusters (S_C · ρ_C · size · label):");
-    for (ci, sz, sc, r) in per.iter().filter(|(_, n, _, _)| *n >= COHERENCE_MIN).take(6) {
-        eprintln!("    c{ci} [S_C {sc:+.2} ρ {r:.2}] n={sz} — {}", label(*ci));
+    rho.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!("  lowest-cohesion clusters (ρ_C · size · label):");
+    for (ci, sz, r) in rho.iter().filter(|(_, n, _)| *n >= COHERENCE_MIN).take(6) {
+        eprintln!("    c{ci} [ρ {r:.2}] n={sz} — {}", label(*ci));
     }
-    Quality { micro_sil, macro_sil, misplaced, scored: sils.len(), cohesion_med, vote_disagree }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Macro silhouette = mean of per-cluster mean silhouettes, ignoring clusters
-    // below the size gate. Hand-computable cross-check (not the size-guaranteed
-    // "macro < micro" inequality, which proves nothing).
-    #[test]
-    fn macro_silhouette_averages_per_cluster_means() {
-        // cluster A (size 5) mean = 1.0; cluster B (size 5) mean = 0.0;
-        // a size-1 cluster of 1.0 must be ignored → macro = (1.0 + 0.0)/2 = 0.5,
-        // whereas the micro mean would be (5·1 + 5·0 + 1·1)/11 ≈ 0.545.
-        let per_cluster = vec![vec![1.0; 5], vec![0.0; 5], vec![1.0]];
-        assert!((macro_silhouette(&per_cluster, QGATE) - 0.5).abs() < 1e-6);
-        // gating: nothing meets the size floor → 0.0
-        assert_eq!(macro_silhouette(&[vec![1.0], vec![0.0]], QGATE), 0.0);
-    }
+    Quality { misplaced, scored, cohesion_med, vote_disagree }
 }
