@@ -75,6 +75,13 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let results = idx.search_batch(&emb, &params, true, None).map_err(|e| anyhow!("search: {e}"))?;
 
     let edges = build_edges(&results);
+    // Degree in the mutual-kNN graph: a unit with no edge is an outlier we abstain
+    // on rather than force-assign.
+    let mut has_edge = vec![false; n];
+    for &(i, j) in edges.keys() {
+        has_edge[i] = true;
+        has_edge[j] = true;
+    }
     // Resolution is scaled UP (RES_SCALE): the default was too coarse, so the global
     // resolution limit fused weakly-connected sub-themes into incoherent grab-bags.
     // A finer resolution breaks them into coherent topics at the natural granularity
@@ -102,7 +109,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
 
     // Outlier reassignment: move each unit that's nearer another cluster into it
     // (one simultaneous pass — no oscillation).
-    let moved = reassign(&results, &mut of);
+    let moved = reassign(&results, &mut of, &has_edge);
     if moved > 0 {
         eprintln!("topics: reassigned {moved} outlier units to their nearest cluster");
     }
@@ -306,10 +313,10 @@ fn build_edges(results: &[next_plaid::QueryResult]) -> HashMap<(usize, usize), f
 /// Reassign outliers to their nearest cluster, iterating a few simultaneous
 /// passes so units left stranded when their neighbors move get cleaned up too.
 /// Capped, so it always terminates. Returns how many units ended up moved.
-fn reassign(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) -> usize {
+fn reassign(results: &[next_plaid::QueryResult], of: &mut [Option<usize>], has_edge: &[bool]) -> usize {
     let orig = of.to_vec();
     for _ in 0..5 {
-        if reassign_once(results, of) == 0 {
+        if reassign_once(results, of, has_edge) == 0 {
             break;
         }
     }
@@ -317,10 +324,11 @@ fn reassign(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) -> us
 }
 
 /// One simultaneous pass. A *clustered* unit nearer another cluster moves there;
-/// an *orphan* (left unplaced by the mutual-kNN graph) joins its single nearest
-/// cluster — so the tight core is kept while coverage is restored. Decisions
-/// read the current assignment and apply at once. Returns how many changed.
-fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) -> usize {
+/// an *orphan* joins its single nearest cluster — UNLESS it has no mutual-kNN
+/// neighbor (degree 0), a genuine outlier we abstain on rather than force into a
+/// topic it doesn't belong to (precision over coverage). Decisions read the
+/// current assignment and apply at once. Returns how many changed.
+fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>], has_edge: &[bool]) -> usize {
     let orig = of.to_vec();
     let mut moved = 0;
     for (i, r) in results.iter().enumerate() {
@@ -345,9 +353,12 @@ fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>]) 
                 None => {}
             }
         }
-        // orphan with a placeable neighbor, or a member nearer another cluster
         if let Some(o) = other {
-            if (orig[i].is_none() || b > a) && of[i] != Some(o) {
+            // adopt an orphan only if it has a mutual neighbor (else abstain), or
+            // move a clustered member that's nearer another cluster.
+            let adopt = orig[i].is_none() && has_edge[i];
+            let relocate = orig[i].is_some() && b > a;
+            if (adopt || relocate) && of[i] != Some(o) {
                 of[i] = Some(o);
                 moved += 1;
             }
