@@ -42,7 +42,7 @@ enum View {
     Status,
 }
 const VIEWS: [View; 4] = [View::Topics, View::Work, View::Search, View::Status];
-const VIEW_NAMES: [&str; 4] = ["1 Topics", "2 Work", "3 Search", "4 Status"];
+const VIEW_NAMES: [&str; 4] = ["Topics[1]", "Work[2]", "Search[3]", "Status[4]"];
 const TL_DAYS: usize = 28; // topic activity strip: current + 3 prior weeks, by day
 
 enum SearchMsg {
@@ -315,7 +315,7 @@ impl App {
     /// (sand) — with the active filter inverted in place. r cycles the repos
     /// row, p the accounts row.
     fn facet_bar(&self, width: u16) -> Text<'static> {
-        Text::from(vec![self.facet_row("Repos:", true, width), self.facet_row("Accounts:", false, width)])
+        Text::from(vec![self.facet_row("Repo[r]:", true, width), self.facet_row("Acct[a]:", false, width)])
     }
 
     /// One row of the facet bar: a dim label, then the repo (or account) chips,
@@ -327,22 +327,29 @@ impl App {
             spans.push(Span::styled("—", Style::new().fg(theme::DIM)));
             return Line::from(spans);
         }
+        // Unit count per facet (how active each one is), from the Work units the
+        // filter would select — rendered as name(n), like the Topics UNITS column.
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for u in &self.work {
+            *counts.entry(if repo { u.repo.as_str() } else { u.author.as_str() }).or_default() += 1;
+        }
+        let chips: Vec<String> = names.iter().map(|n| format!("{n}({})", counts.get(n.as_str()).copied().unwrap_or(0))).collect();
         let active = self.filter.as_ref().filter(|f| f.is_repo() == repo).and_then(|f| names.iter().position(|n| n == f.name()));
         // Fit a window of chips that contains the active one, expanding outward.
         let avail = width.saturating_sub(12) as usize; // label + ‹ › slack
-        let cw = |n: &str| n.chars().count() + 3; // name + separator/padding slack
+        let cw = |s: &str| s.chars().count() + 3; // chip + separator/padding slack
         let center = active.unwrap_or(0);
-        let (mut start, mut end, mut used) = (center, center, cw(&names[center]));
+        let (mut start, mut end, mut used) = (center, center, cw(&chips[center]));
         loop {
             let mut grew = false;
-            if end + 1 < names.len() && used + cw(&names[end + 1]) <= avail {
+            if end + 1 < chips.len() && used + cw(&chips[end + 1]) <= avail {
                 end += 1;
-                used += cw(&names[end]);
+                used += cw(&chips[end]);
                 grew = true;
             }
-            if start > 0 && used + cw(&names[start - 1]) <= avail {
+            if start > 0 && used + cw(&chips[start - 1]) <= avail {
                 start -= 1;
-                used += cw(&names[start]);
+                used += cw(&chips[start]);
                 grew = true;
             }
             if !grew {
@@ -353,7 +360,7 @@ impl App {
             spans.push(Span::styled("‹ ", Style::new().fg(theme::DIM)));
         }
         let color = if repo { theme::GITHUB } else { theme::SESSION };
-        for (j, name) in names[start..=end].iter().enumerate() {
+        for (j, chip) in chips[start..=end].iter().enumerate() {
             if j > 0 {
                 spans.push(Span::styled(" · ", Style::new().fg(theme::BORDER)));
             }
@@ -362,15 +369,19 @@ impl App {
             } else {
                 Style::new().fg(color)
             };
-            spans.push(Span::styled(name.clone(), style));
+            spans.push(Span::styled(chip.clone(), style));
         }
-        if end + 1 < names.len() {
+        if end + 1 < chips.len() {
             spans.push(Span::styled(" ›", Style::new().fg(theme::DIM)));
         }
         Line::from(spans)
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        // Esc is the universal reset: it peels back state in every view.
+        if code == KeyCode::Esc {
+            return self.reset();
+        }
         match code {
             KeyCode::Tab => return self.cycle(1),
             KeyCode::BackTab => return self.cycle(-1),
@@ -381,7 +392,7 @@ impl App {
             return self.search_key(code);
         }
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q') => {
                 if let Some(ti) = self.drill_topic.take() {
                     self.sel = ti; // back to the topic we drilled
                 } else {
@@ -403,17 +414,16 @@ impl App {
                     self.sel = ti;
                 }
             }
-            // Repo / person filter (the facet bar), shared by Topics and Work:
-            // r/p cycle through the bar's chips.
+            // Facet bar filter, shared by Topics and Work: r cycles the Repo row,
+            // a the Acct row.
             KeyCode::Char('r') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(true),
-            KeyCode::Char('p') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(false),
+            KeyCode::Char('a') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(false),
             _ => {}
         }
     }
 
     fn search_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Esc => self.quit = true,
             KeyCode::Char(c) => self.query.push(c),
             KeyCode::Backspace => {
                 self.query.pop();
@@ -444,6 +454,22 @@ impl App {
         let n = self.list_len();
         if n > 0 {
             self.sel = (self.sel as i32 + d).clamp(0, n as i32 - 1) as usize;
+        }
+    }
+
+    /// Esc: peel back one layer of state — exit a drill, then clear the filter,
+    /// then clear a search query — and quit only when nothing is left to reset.
+    fn reset(&mut self) {
+        if let Some(ti) = self.drill_topic.take() {
+            self.sel = ti;
+        } else if self.filter.take().is_some() {
+            self.sel = 0;
+        } else if self.view == View::Search && !self.query.is_empty() {
+            self.query.clear();
+            self.results.clear();
+            self.sel = 0;
+        } else {
+            self.quit = true;
         }
     }
 
@@ -808,12 +834,12 @@ impl App {
                 Engine::Loading => "loading model…",
                 Engine::Searching => "searching…",
                 Engine::Err(e) => return format!("  {e}"),
-                Engine::Ready => "type · Enter search · ↑↓ results · 1-4 views · Esc quit",
+                Engine::Ready => "type · Enter search · ↑↓ results · Esc clear",
             },
-            _ if self.drill_topic.is_some() => "↑↓ units · h back · 1-4 views · q quit",
-            View::Topics => "↑↓ move · Enter drill · r/p filter · 1-4 views · q quit",
-            View::Status => "1-4 views · Tab cycle · q quit",
-            View::Work => "↑↓ move · r/p filter · 1-4 views · Tab cycle · q quit",
+            _ if self.drill_topic.is_some() => "↑↓ units · Esc/h back · q quit",
+            View::Topics => "↑↓ move · Enter drill · Esc reset · Tab cycle · q quit",
+            View::Status => "Tab cycle · q quit",
+            View::Work => "↑↓ move · Esc reset · Tab cycle · q quit",
         };
         format!("  {keys}")
     }
@@ -1243,9 +1269,9 @@ mod tests {
         assert!(a.filter.is_none(), "cycling past the last repo clears the filter");
         assert_eq!(a.visible().len(), 2);
 
-        // p filters by person and is mutually exclusive with the repo facet.
-        a.on_key(KeyCode::Char('p'));
-        assert!(a.breadcrumb().contains('@'), "breadcrumb should name the person facet");
+        // a filters by account and is mutually exclusive with the repo facet.
+        a.on_key(KeyCode::Char('a'));
+        assert!(a.breadcrumb().contains('@'), "breadcrumb should name the account facet");
         assert_eq!(a.visible().len(), 1, "person filter should narrow to one topic");
 
         // Drilling while filtered resolves through the visible list, not topics[sel].
@@ -1257,7 +1283,7 @@ mod tests {
         assert!(drilled.authors.iter().any(|p| p.as_str() == want), "drilled topic matches the active person filter");
     }
 
-    // r/p drive the filter from the Work view too, not just Topics.
+    // r/a drive the filter from the Work view too, not just Topics.
     #[test]
     fn filter_keys_work_in_work_view() {
         let mut a = app2();
@@ -1267,6 +1293,22 @@ mod tests {
         assert!(a.visible_work().len() < a.work.len(), "Work list narrows under the filter");
     }
 
+    // Esc peels back state — drill, then filter — and only quits when clean.
+    #[test]
+    fn esc_resets_then_quits() {
+        let mut a = app2();
+        a.on_key(KeyCode::Char('a')); // set an account filter
+        assert!(a.filter.is_some());
+        a.on_key(KeyCode::Esc);
+        assert!(a.filter.is_none() && !a.quit, "Esc clears the filter without quitting");
+        a.on_key(KeyCode::Enter); // drill a topic
+        assert!(a.drill_topic.is_some());
+        a.on_key(KeyCode::Esc);
+        assert!(a.drill_topic.is_none() && !a.quit, "Esc exits the drill without quitting");
+        a.on_key(KeyCode::Esc);
+        assert!(a.quit, "Esc on a clean screen quits");
+    }
+
     // The facet bar has a Repos row over an Accounts row, and inverts the active.
     #[test]
     fn facet_bar_lists_and_highlights() {
@@ -1274,12 +1316,14 @@ mod tests {
         let bar = a.facet_bar(120);
         let repos: String = bar.lines[0].spans.iter().map(|s| s.content.to_string()).collect();
         let accounts: String = bar.lines[1].spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(repos.starts_with("Repos:") && repos.contains("sie") && repos.contains("infra"), "repos row: {repos}");
-        assert!(accounts.starts_with("Accounts:") && accounts.contains("alice") && accounts.contains("bob"), "accounts row: {accounts}");
+        assert!(repos.starts_with("Repo[r]:") && repos.contains("sie") && repos.contains("infra"), "repos row: {repos}");
+        assert!(accounts.starts_with("Acct[a]:") && accounts.contains("alice") && accounts.contains("bob"), "accounts row: {accounts}");
+        // each chip carries a unit count, like the Topics UNITS column.
+        assert!(repos.contains("infra("), "repo chip should show a unit count: {repos}");
         // the active facet's chip is inverted (accent background).
         a.filter = Some(Facet::Repo("infra".into()));
         let bar = a.facet_bar(120);
-        let chip = bar.lines.iter().flat_map(|l| &l.spans).find(|s| s.content == "infra").expect("infra chip");
+        let chip = bar.lines.iter().flat_map(|l| &l.spans).find(|s| s.content.starts_with("infra")).expect("infra chip");
         assert_eq!(chip.style.bg, Some(theme::ACCENT), "active chip should be inverted");
     }
 
