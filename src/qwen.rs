@@ -150,6 +150,46 @@ Description: {summary}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
     )
 }
 
+/// Frequent content words across a cluster's member summaries (document frequency,
+/// ≥3 chars, minus stopwords) — the cluster's salient terms for the name gate.
+fn cluster_terms(members: &[String], k: usize) -> Vec<String> {
+    let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for m in members {
+        let mut seen = std::collections::HashSet::new();
+        for w in m.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3 && !STOPWORDS.contains(w)) {
+            if seen.insert(w.to_string()) {
+                *freq.entry(w.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let mut v: Vec<(String, usize)> = freq.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.into_iter().take(k).map(|(w, _)| w).collect()
+}
+
+/// True if the generated name shares at least one salient term with the cluster —
+/// otherwise it is about something the members are not, and is rejected.
+fn name_grounded(name: &str, terms: &[String]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let low = name.to_lowercase();
+    let words: std::collections::HashSet<&str> = low.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3).collect();
+    terms.iter().any(|t| words.contains(t.as_str()))
+}
+
+/// Generic developer vocabulary that must not count as a cluster's salient term —
+/// a name should match on a concrete subject, not "update"/"fix"/"feature".
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "was", "were", "with", "that", "this", "from", "into", "are", "has", "have",
+    "had", "not", "added", "add", "adds", "fix", "fixes", "fixed", "update", "updates", "updated",
+    "updating", "implement", "implemented", "implementing", "support", "new", "using", "use", "used",
+    "via", "across", "their", "its", "which", "while", "when", "also", "now", "set", "get", "include",
+    "includes", "including", "improve", "improved", "improving", "enhance", "enhanced", "enhancing",
+    "project", "work", "feature", "features", "changes", "change", "code", "file", "files", "repo",
+    "repository", "dependencies", "dependency", "data", "based", "various", "tools", "system",
+];
+
 /// Drop a *complete* meta-opener clause including its verb ("This theme focuses
 /// on …", "The theme is …") so the remainder stays grammatical, then
 /// re-capitalize. Removing only "This theme " (without the verb) would leave a
@@ -279,18 +319,22 @@ fn doc_hash(d: &DocInput) -> String {
 }
 
 /// One unit of summarization work: a cache key, its input hash, and the prompt.
-/// `short` jobs are topic names (cleaned as a title, not a sentence).
+/// `short` jobs are topic names (cleaned as a title, not a sentence). `gate`, when
+/// set, holds the cluster's salient terms: a name sharing none of them is rejected
+/// (→ empty, so `title()` falls through to the grounded summary) — this is what
+/// stops "Colpali" on error-handling PRs or "Update Dependencies" on synty work.
 struct Job {
     key: String,
     hash: String,
     prompt: String,
     label: String,
     short: bool,
+    gate: Option<Vec<String>>,
 }
 
 /// Salt for the topic reduce / name prompts; bump to regenerate them only.
 const TOPIC_PROMPT_VERSION: &str = "t6";
-const TOPIC_NAME_VERSION: &str = "s1";
+const TOPIC_NAME_VERSION: &str = "s2";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -298,10 +342,10 @@ fn unit_jobs() -> Result<Vec<Job>> {
     let docs = units::doc_inputs()?;
     let mut jobs = Vec::with_capacity(sessions.len() + docs.len());
     for s in &sessions {
-        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id), short: false });
+        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id), short: false, gate: None });
     }
     for d in &docs {
-        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone(), short: false });
+        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone(), short: false, gate: None });
     }
     Ok(jobs)
 }
@@ -327,10 +371,12 @@ fn topic_jobs() -> Result<Vec<Job>> {
             prompt: prompt_for_topic(&members),
             label: format!("topic:{}", t.id),
             short: false,
+            gate: None,
         });
         // The name titles the topic summary, so it depends on it. The summary job
         // above runs first in the same pass; for a topic whose summary isn't
-        // cached yet the name regenerates next run, once the summary exists.
+        // cached yet the name regenerates next run, once the summary exists. The
+        // gate carries the cluster's salient terms so an off-theme name is rejected.
         if let Some(sum) = &t.summary {
             jobs.push(Job {
                 key: units::topic_name_key(&t.cache_key),
@@ -338,6 +384,7 @@ fn topic_jobs() -> Result<Vec<Job>> {
                 prompt: prompt_for_topic_name(sum),
                 label: format!("name:{}", t.id),
                 short: true,
+                gate: Some(cluster_terms(&members, 12)),
             });
         }
     }
@@ -372,6 +419,12 @@ fn run_jobs(todo: &[&Job], cache: &mut units::SummaryCache, llm: &mut Summarizer
             }
         };
         let summary = if j.short { clean_name(&raw) } else { clean(&raw) };
+        // Faithfulness gate: a topic name sharing no salient term with its cluster
+        // is rejected (→ empty → title() falls through to the grounded summary).
+        let summary = match &j.gate {
+            Some(terms) if !name_grounded(&summary, terms) => String::new(),
+            _ => summary,
+        };
         in_tok += pt;
         out_tok += ot;
         eprintln!("  [{kind} {}/{}] {} — {}", n + 1, todo.len(), j.label, summary);
@@ -403,6 +456,20 @@ mod tests {
         assert_eq!(strip_opener("About designing the inference deck."), "Designing the inference deck.");
         assert_eq!(strip_opener("The area is about developing an RLM in a box."), "Developing an RLM in a box.");
         assert_eq!(strip_opener("Integrated MinerU into SIE."), "Integrated MinerU into SIE.");
+    }
+
+    // The faithfulness gate rejects a name that shares no salient term with its
+    // cluster, but keeps one that does.
+    #[test]
+    fn name_gate_rejects_off_theme() {
+        let members = vec![
+            "Added InputTooLongError and an overflow policy to the extract SDK".to_string(),
+            "gliclass returns all label scores and bounds input length".to_string(),
+        ];
+        let terms = cluster_terms(&members, 12);
+        assert!(name_grounded("Overflow Policy Handling", &terms)); // shares "overflow"/"policy"
+        assert!(!name_grounded("Colpali Visual Retrieval", &terms)); // shares nothing
+        assert!(!name_grounded("Update Dependencies", &terms)); // generic words, not cluster terms
     }
 
     #[test]
