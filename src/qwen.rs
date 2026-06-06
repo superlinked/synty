@@ -140,13 +140,22 @@ Items:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
 }
 
-/// Condense a topic's one-line summary into a short Title-Case name. Titling an
-/// existing sentence is far easier for a small model than abstracting a name from
-/// a list of items, which it can't do (it parrots examples and emits slugs).
-fn prompt_for_topic_name(summary: &str) -> String {
+/// Name a topic with a short Title-Case heading, GROUNDED in the cluster's salient
+/// terms and a few representative items (not just the reduced summary). Concrete
+/// evidence makes the small model build the name from terms the cluster actually
+/// uses, so it passes the faithfulness gate instead of free-associating. (No
+/// example *name* is given — the 0.6B parrots those; terms and items are data.)
+fn prompt_for_topic_name(summary: &str, terms: &[String], examples: &[String]) -> String {
+    let kw = terms.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+    let mut items = String::new();
+    for e in examples {
+        items.push_str("- ");
+        items.push_str(e);
+        items.push('\n');
+    }
     format!(
-        "<|im_start|>user\nShorten this description to a 2 to 4 word title in Title Case, like a chapter heading. Keep the most specific nouns; drop verbs and filler. Output only the title — no quotes, no period, no commas.\n\n\
-Description: {summary}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        "<|im_start|>user\nName this cluster of engineering work with a short Title Case heading of 2 to 4 words, like a chapter title. Build it from the key terms and items below — prefer the most specific, recurring nouns. Output only the title: no quotes, no period, no commas.\n\n\
+Key terms: {kw}\nItems:\n{items}Description: {summary}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
 }
 
@@ -334,7 +343,7 @@ struct Job {
 
 /// Salt for the topic reduce / name prompts; bump to regenerate them only.
 const TOPIC_PROMPT_VERSION: &str = "t6";
-const TOPIC_NAME_VERSION: &str = "s2";
+const TOPIC_NAME_VERSION: &str = "s3";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -378,13 +387,17 @@ fn topic_jobs() -> Result<Vec<Job>> {
         // cached yet the name regenerates next run, once the summary exists. The
         // gate carries the cluster's salient terms so an off-theme name is rejected.
         if let Some(sum) = &t.summary {
+            let terms = cluster_terms(&members, 12);
+            let mut examples: Vec<&String> = members.iter().collect();
+            examples.sort_by_key(|s| s.len()); // shortest = most title-like
+            let examples: Vec<String> = examples.iter().take(3).map(|s| crate::excerpt(s, 90)).collect();
             jobs.push(Job {
                 key: units::topic_name_key(&t.cache_key),
-                hash: hash_parts(&[TOPIC_NAME_VERSION, sum.as_str()]),
-                prompt: prompt_for_topic_name(sum),
+                hash: hash_parts(&[TOPIC_NAME_VERSION, sum.as_str(), &terms.join(",")]),
+                prompt: prompt_for_topic_name(sum, &terms, &examples),
                 label: format!("name:{}", t.id),
                 short: true,
-                gate: Some(cluster_terms(&members, 12)),
+                gate: Some(terms),
             });
         }
     }
