@@ -330,15 +330,63 @@ pub fn autostart_enabled() -> bool {
     .any(|p| Path::new(p).exists())
 }
 
-/// Write a login-time autostart unit running `synty track --watch`.
-fn install(kind: &str, o: &Opts) -> Result<()> {
+/// The login-time autostart unit path + kind for this platform, if supported.
+pub fn autostart_unit() -> Option<(String, &'static str)> {
+    let home = std::env::var("HOME").ok()?;
+    if cfg!(target_os = "macos") {
+        Some((format!("{home}/Library/LaunchAgents/com.superlinked.synty.plist"), "launchd"))
+    } else if cfg!(target_os = "linux") {
+        Some((format!("{home}/.config/systemd/user/synty.service"), "systemd"))
+    } else {
+        None
+    }
+}
+
+/// Turn login-time autostart on or off, then best-effort (un)load it so the
+/// change takes effect now. Quiet (no stdout/stderr) — safe to call from the TUI.
+pub fn autostart_set(on: bool) -> Result<()> {
+    let (path, kind) = autostart_unit().ok_or_else(|| anyhow!("autostart unsupported on this platform"))?;
+    if on {
+        write_unit(kind, &path, "corpus/local", "local")?;
+        loader(kind, &path, true);
+    } else {
+        loader(kind, &path, false);
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+/// (un)load the unit via launchctl / systemctl, swallowing all output and errors.
+fn loader(kind: &str, path: &str, on: bool) {
+    let run = |cmd: &str, args: &[&str]| {
+        let _ = std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    };
+    match (kind, on) {
+        ("launchd", true) => run("launchctl", &["load", "-w", path]),
+        ("launchd", false) => run("launchctl", &["unload", "-w", path]),
+        ("systemd", true) => {
+            run("systemctl", &["--user", "daemon-reload"]);
+            run("systemctl", &["--user", "enable", "--now", "synty.service"]);
+        }
+        ("systemd", false) => run("systemctl", &["--user", "disable", "--now", "synty.service"]),
+        _ => {}
+    }
+}
+
+/// Write the autostart unit file for `kind` (no output) — runs `synty track
+/// --watch` at login.
+fn write_unit(kind: &str, path: &str, out: &str, machine: &str) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let args = format!("track --watch --out {} --machine {}", o.out, o.machine);
-    match kind {
-        "launchd" => {
-            let plist = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+    let cwd = std::env::current_dir()?.display().to_string();
+    let args = format!("track --watch --out {out} --machine {machine}");
+    let body = match kind {
+        "launchd" => format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.superlinked.synty</string>
@@ -350,25 +398,32 @@ fn install(kind: &str, o: &Opts) -> Result<()> {
   <key>WorkingDirectory</key><string>{cwd}</string>
 </dict></plist>
 "#,
-                args.split_whitespace().map(|a| format!("\n    <string>{a}</string>")).collect::<String>(),
-                cwd = std::env::current_dir()?.display(),
-            );
-            let path = format!("{home}/Library/LaunchAgents/com.superlinked.synty.plist");
-            std::fs::write(&path, plist)?;
-            println!("wrote {path}\nload with:  launchctl load -w {path}");
-        }
-        "systemd" => {
-            let unit = format!(
-                "[Unit]\nDescription=synty native tracker\n\n[Service]\nExecStart={exe} {args}\nWorkingDirectory={cwd}\nRestart=always\n\n[Install]\nWantedBy=default.target\n",
-                cwd = std::env::current_dir()?.display(),
-            );
-            let dir = format!("{home}/.config/systemd/user");
-            std::fs::create_dir_all(&dir)?;
-            let path = format!("{dir}/synty.service");
-            std::fs::write(&path, unit)?;
-            println!("wrote {path}\nenable with:  systemctl --user enable --now synty.service");
-        }
+            args.split_whitespace().map(|a| format!("\n    <string>{a}</string>")).collect::<String>(),
+        ),
+        "systemd" => format!(
+            "[Unit]\nDescription=synty native tracker\n\n[Service]\nExecStart={exe} {args}\nWorkingDirectory={cwd}\nRestart=always\n\n[Install]\nWantedBy=default.target\n",
+        ),
         _ => bail!("install kind must be launchd or systemd"),
+    };
+    if let Some(dir) = Path::new(path).parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, body)?;
+    Ok(())
+}
+
+/// CLI `track --install <kind>`: write the unit and print the manual load command.
+fn install(kind: &str, o: &Opts) -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let path = match kind {
+        "launchd" => format!("{home}/Library/LaunchAgents/com.superlinked.synty.plist"),
+        "systemd" => format!("{home}/.config/systemd/user/synty.service"),
+        _ => bail!("install kind must be launchd or systemd"),
+    };
+    write_unit(kind, &path, &o.out, &o.machine)?;
+    match kind {
+        "launchd" => println!("wrote {path}\nload with:  launchctl load -w {path}"),
+        _ => println!("wrote {path}\nenable with:  systemctl --user enable --now synty.service"),
     }
     let _ = ms_to_rfc3339; // reserved for future status output
     Ok(())

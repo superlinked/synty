@@ -184,9 +184,11 @@ impl App {
             sessions: 0,
             by_kind: vec![],
             by_repo: vec![],
+            by_user: vec![],
             newest_ts: String::new(),
             last_indexed: None,
             last_tracked: None,
+            autostart: false,
         });
         let (qtx, rrx) = spawn_search(model_id);
         Self {
@@ -418,6 +420,8 @@ impl App {
             // a the Acct row.
             KeyCode::Char('r') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(true),
             KeyCode::Char('a') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(false),
+            // On the Status view, a toggles the login-time autostart tracker.
+            KeyCode::Char('a') if self.view == View::Status => self.toggle_autostart(),
             _ => {}
         }
     }
@@ -473,6 +477,14 @@ impl App {
         }
     }
 
+    /// Install or remove the login-time tracker, reflecting the new state.
+    fn toggle_autostart(&mut self) {
+        if crate::track::autostart_set(!self.autostart).is_ok() {
+            self.autostart = crate::track::autostart_enabled();
+            self.status.autostart = self.autostart;
+        }
+    }
+
     // ── render ───────────────────────────────────────────────────────────
 
     fn draw(&self, f: &mut Frame) {
@@ -490,7 +502,7 @@ impl App {
             _ => body,
         };
         match self.view {
-            View::Status => f.render_widget(self.status_para(), body),
+            View::Status => self.draw_status(f, body),
             View::Topics => self.draw_topics(f, body),
             View::Work | View::Search => self.draw_master_detail(f, body),
         }
@@ -822,10 +834,66 @@ impl App {
         o
     }
 
-    fn status_para(&self) -> Paragraph<'static> {
-        Paragraph::new(crate::view::status_md(&self.status))
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)))
+    /// Status view: a totals/freshness/autostart header over two breakdown
+    /// tables — docs · GitHub objects · sessions per repo and per account.
+    fn draw_status(&self, f: &mut Frame, area: Rect) {
+        let [head, cols] = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
+        f.render_widget(
+            Paragraph::new(self.status_head())
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" synty ")),
+            head,
+        );
+        let [rcol, ucol] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(cols);
+        f.render_widget(facet_table("Repos", &self.status.by_repo), rcol);
+        f.render_widget(facet_table("Accounts", &self.status.by_user), ucol);
+    }
+
+    /// The Status header: totals, freshness, the autostart toggle state, and the
+    /// per-kind doc composition.
+    fn status_head(&self) -> Text<'static> {
+        let s = &self.status;
+        let dim = Style::new().fg(theme::DIM);
+        let strong = |n: usize, c: Color| Span::styled(n.to_string(), Style::new().fg(c).add_modifier(Modifier::BOLD));
+        let kinds = {
+            let mut sp = vec![Span::styled("kinds  ", dim)];
+            for (i, (k, n)) in s.by_kind.iter().take(8).enumerate() {
+                if i > 0 {
+                    sp.push(Span::styled(" · ", Style::new().fg(theme::BORDER)));
+                }
+                sp.push(Span::styled(format!("{k}({n})"), Style::new().fg(theme::FG)));
+            }
+            Line::from(sp)
+        };
+        Text::from(vec![
+            Line::from(vec![
+                strong(s.docs, theme::FG),
+                Span::styled(" docs · ", dim),
+                strong(s.github, theme::GITHUB),
+                Span::styled(" github · ", dim),
+                strong(s.sessions, theme::SESSION),
+                Span::styled(" sessions", dim),
+            ]),
+            Line::from(Span::styled(
+                format!(
+                    "newest {} · indexed {} · tracked {}",
+                    if s.newest_ts.is_empty() { "—" } else { &s.newest_ts },
+                    s.last_indexed.as_deref().unwrap_or("never"),
+                    s.last_tracked.as_deref().unwrap_or("never"),
+                ),
+                dim,
+            )),
+            Line::from(vec![
+                Span::styled("autostart  ", dim),
+                if self.autostart {
+                    Span::styled("ON", Style::new().fg(theme::SAGE).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled("OFF", Style::new().fg(theme::CLOSED).add_modifier(Modifier::BOLD))
+                },
+                Span::styled("  ·  press a to toggle the login-time tracker", dim),
+            ]),
+            kinds,
+        ])
     }
 
     fn footer(&self) -> String {
@@ -838,7 +906,7 @@ impl App {
             },
             _ if self.drill_topic.is_some() => "↑↓ units · Esc/h back · q quit",
             View::Topics => "↑↓ move · Enter drill · Esc reset · Tab cycle · q quit",
-            View::Status => "Tab cycle · q quit",
+            View::Status => "a autostart · Tab cycle · q quit",
             View::Work => "↑↓ move · Esc reset · Tab cycle · q quit",
         };
         format!("  {keys}")
@@ -889,6 +957,33 @@ fn styled_names(names: &[String], active: Option<&str>, base: Color, max: usize)
         spans.push(Span::styled(n.clone(), style));
     }
     spans
+}
+
+/// A Status breakdown table: name + sessions/github/docs columns, a dim "·" for
+/// zeros so the meaningful counts stand out. Rows arrive pre-sorted (most docs).
+fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
+    let dim = Style::new().fg(theme::DIM);
+    let num = |n: usize, c: Color| {
+        if n == 0 {
+            Cell::from("·").style(dim)
+        } else {
+            Cell::from(n.to_string()).style(Style::new().fg(c))
+        }
+    };
+    let body: Vec<Row> = rows
+        .iter()
+        .map(|t| {
+            Row::new(vec![
+                Cell::from(t.name.clone()).style(Style::new().fg(theme::FG)),
+                num(t.sessions, theme::SESSION),
+                num(t.github, theme::GITHUB),
+                Cell::from(t.docs.to_string()).style(dim),
+            ])
+        })
+        .collect();
+    Table::new(body, [Constraint::Min(8), Constraint::Length(5), Constraint::Length(5), Constraint::Length(6)])
+        .header(Row::new(["", "SESS", "GH", "DOCS"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
+        .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" {title} ({}) ", rows.len())))
 }
 
 /// (primary, secondary) text for a unit row: the one-line summary on top when
@@ -1124,7 +1219,7 @@ mod tests {
             sessions: vec![session],
             work,
             topics,
-            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![], by_repo: vec![], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None },
+            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false },
             view: View::Topics,
             sel: 0,
             drill_topic: None,
@@ -1307,6 +1402,22 @@ mod tests {
         assert!(a.drill_topic.is_none() && !a.quit, "Esc exits the drill without quitting");
         a.on_key(KeyCode::Esc);
         assert!(a.quit, "Esc on a clean screen quits");
+    }
+
+    // The Status view shows totals, per-repo/account breakdowns, and the
+    // autostart state. (The toggle itself has side effects, so it isn't pressed.)
+    #[test]
+    fn status_view_shows_breakdowns_and_autostart() {
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut a = app();
+        a.view = View::Status;
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("docs") && text.contains("github") && text.contains("sessions"), "totals row missing: {text}");
+        assert!(text.contains("Repos (1)") && text.contains("Accounts (1)"), "breakdown table titles missing: {text}");
+        assert!(text.contains("SESS") && text.contains("GH") && text.contains("DOCS"), "table headers missing");
+        assert!(text.contains("sie") && text.contains("alice"), "facet rows missing");
+        assert!(text.contains("autostart") && text.contains("OFF"), "autostart state missing");
     }
 
     // The facet bar has a Repos row over an Accounts row, and inverts the active.
