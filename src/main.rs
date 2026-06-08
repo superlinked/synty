@@ -14,6 +14,7 @@ mod encode;
 mod eval;
 mod event;
 mod github;
+mod identity;
 mod metrics;
 mod store;
 mod sync;

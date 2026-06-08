@@ -143,6 +143,10 @@ pub fn session_docs(text: &str) -> Vec<Doc> {
             evs.push(v);
         }
     }
+    // One identity per build — sessions on this machine are attributed to its
+    // resolved actor (GitHub login if pinned, else git email / $USER), so they
+    // merge with that person's GitHub PRs instead of a hardcoded name.
+    let actor = crate::identity::actor();
     let mut out = Vec::new();
     for v in evs {
         let kind = v["kind"].as_str().unwrap_or("");
@@ -162,7 +166,7 @@ pub fn session_docs(text: &str) -> Vec<Doc> {
                 source: "agent".into(),
                 kind: kind.into(),
                 repo,
-                author: "daniel".into(),
+                author: actor.clone(),
                 session_id: sid,
                 ts: v["ts"].as_str().unwrap_or("").into(),
                 number: None,

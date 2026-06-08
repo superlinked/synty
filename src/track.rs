@@ -93,9 +93,12 @@ impl Tracker {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
+        // "local" (the default) auto-derives a stable per-machine id; an explicit
+        // --machine is taken as-is. Keeps fleet streams from colliding.
+        let machine = crate::identity::resolve_machine(&o.machine);
         let mut streams = Vec::new();
         for src in sources(&o.which)? {
-            let name = format!("edge-{}-{}", o.machine, src.id());
+            let name = format!("edge-{}-{}", machine, src.id());
             let out = Path::new(&o.out).join(&name).join("track.jsonl");
             if let Some(p) = out.parent() {
                 std::fs::create_dir_all(p)?;

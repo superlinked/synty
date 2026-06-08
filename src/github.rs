@@ -32,6 +32,15 @@ pub fn run(owner: &str, repos: Option<String>, since_days: u64, out: &str) -> Re
         .timeout_read(Duration::from_secs(60))
         .build();
 
+    // Pin this account's login (best-effort) so local sessions attribute to the
+    // same identity as the PRs we're about to pull — reusing the token in hand.
+    let login = post(&agent, &token, "query { viewer { login } }", json!({}))
+        .ok()
+        .and_then(|d| d["viewer"]["login"].as_str().map(str::to_string));
+    if let Some(login) = login {
+        crate::identity::cache_github_login(&login);
+    }
+
     let mut tot_pr = 0;
     let mut tot_is = 0;
     for repo in &repos {
