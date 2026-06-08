@@ -89,7 +89,7 @@ pub struct Unit {
     pub summary: Option<String>, // one-line LLM summary, if cached
     pub topic: Option<i64>,
     pub struggle: f32,
-    pub author: String,    // PR/issue author; empty for sessions
+    pub author: String,    // PR/issue author, or the resolved actor for sessions
     pub doc_id: Option<i64>,    // for PR/issue → docs.jsonl
     pub session_id: Option<String>, // for sessions
 }
@@ -273,6 +273,10 @@ pub fn sessions() -> Result<Vec<Session>> {
 
 /// All work units (sessions + PRs + issues), newest first.
 pub fn units() -> Result<Vec<Unit>> {
+    // Sessions on this machine are this person's; attribute them to the same
+    // actor `ingest` stamps on session docs, so an all-sessions topic still
+    // shows an account (and merges with that person's PRs).
+    let actor = crate::identity::actor();
     let mut out: Vec<Unit> = sessions()?
         .into_iter()
         .map(|s| Unit {
@@ -284,7 +288,7 @@ pub fn units() -> Result<Vec<Unit>> {
             summary: s.summary.clone(),
             topic: s.topic,
             struggle: s.struggle,
-            author: String::new(),
+            author: actor.clone(),
             doc_id: None,
             session_id: Some(s.id),
         })
