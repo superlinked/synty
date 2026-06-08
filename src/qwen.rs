@@ -199,31 +199,44 @@ const STOPWORDS: &[&str] = &[
     "repository", "dependencies", "dependency", "data", "based", "various", "tools", "system",
 ];
 
+/// Meta-opener clauses the 0.6B stacks in front of summaries, generated as every
+/// SUBJECT × VERB combination ("this area addresses …", "the project involves …",
+/// "the cluster focuses on …") plus a bare "about". A generator beats a hand-list
+/// because the model freely mixes subjects and verbs; built once, sorted
+/// longest-first so the most specific prefix strips.
+static OPENERS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    const SUBJECTS: &[&str] = &[
+        "this theme", "the theme", "this cluster", "the cluster", "this area", "the area",
+        "this project", "the project", "this work", "the work", "this group", "the group",
+        "this collection", "the collection", "this set", "the set", "this topic", "the topic",
+        "this effort", "the effort", "this",
+    ];
+    const VERBS: &[&str] = &[
+        "focuses on", "focuses around", "is focused on", "centers on", "centers around",
+        "is centered on", "revolves around", "is about", "is", "involves", "covers",
+        "includes", "describes", "addresses", "explores", "examines", "deals with",
+        "relates to", "pertains to", "concerns", "regards", "encompasses", "captures",
+        "represents", "consists of", "comprises", "contains", "groups", "handles",
+        "details", "documents", "tracks",
+    ];
+    let mut v: Vec<String> =
+        SUBJECTS.iter().flat_map(|s| VERBS.iter().map(move |verb| format!("{s} {verb} "))).collect();
+    v.push("about ".to_string());
+    v.sort_by_key(|o| std::cmp::Reverse(o.len()));
+    v
+});
+
 /// Drop a *complete* meta-opener clause including its verb ("This theme focuses
 /// on …", "The theme is …") so the remainder stays grammatical, then
 /// re-capitalize. Removing only "This theme " (without the verb) would leave a
 /// dangling "is/includes …", so the whole clause must go.
 fn strip_opener(s: &str) -> String {
-    const OPENERS: &[&str] = &[
-        "this theme focuses on ", "this theme is about ", "this theme is ",
-        "this theme includes ", "this theme involves ", "this theme covers ",
-        "this theme explores ", "this theme describes ",
-        "the theme focuses on ", "the theme is about ", "the theme is ",
-        "the theme includes ", "the theme involves ", "the theme covers ",
-        "the theme explores ", "the theme describes ",
-        "this cluster focuses on ", "this cluster is about ", "this cluster is ",
-        "this cluster involves ", "this cluster covers ", "this cluster includes ", "this cluster describes ",
-        "this area focuses on ", "this area is about ", "this area is ",
-        "this area involves ", "this area covers ", "this area includes ", "the area is ",
-        "this work focuses on ", "this focuses on ", "this involves ", "this covers ", "this describes ",
-        "about ",
-    ];
     // Iterate: the model stacks openers ("The area is about developing …"), so
     // strip up to a few in a row. Capped to avoid eating real leading words.
     let mut s = s.to_string();
     for _ in 0..3 {
         let low = s.to_lowercase();
-        let Some(op) = OPENERS.iter().find(|op| low.starts_with(**op)) else { break };
+        let Some(op) = OPENERS.iter().find(|op| low.starts_with(op.as_str())) else { break };
         let rest = s[op.len()..].trim_start();
         let mut c = rest.chars();
         s = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
@@ -342,7 +355,8 @@ struct Job {
 }
 
 /// Salt for the topic reduce / name prompts; bump to regenerate them only.
-const TOPIC_PROMPT_VERSION: &str = "t6";
+/// t7: combinatorial opener stripping (drops "the cluster focuses …" et al.).
+const TOPIC_PROMPT_VERSION: &str = "t7";
 const TOPIC_NAME_VERSION: &str = "s3";
 
 /// Unit jobs: one per session and per PR/issue.
@@ -468,7 +482,14 @@ mod tests {
         assert_eq!(strip_opener("This area involves Terraform state locking."), "Terraform state locking.");
         assert_eq!(strip_opener("About designing the inference deck."), "Designing the inference deck.");
         assert_eq!(strip_opener("The area is about developing an RLM in a box."), "Developing an RLM in a box.");
+        // Combinations the hand-list missed: subject "project", verb "addresses",
+        // and the "the cluster" variant.
+        assert_eq!(strip_opener("This area addresses image-quality regressions."), "Image-quality regressions.");
+        assert_eq!(strip_opener("The project involves a native session tracker."), "A native session tracker.");
+        assert_eq!(strip_opener("The cluster focuses on NATS routing and health checks."), "NATS routing and health checks.");
+        // Real leading words that merely start like an opener are kept.
         assert_eq!(strip_opener("Integrated MinerU into SIE."), "Integrated MinerU into SIE.");
+        assert_eq!(strip_opener("This binary indexes documents with ColBERT."), "This binary indexes documents with ColBERT.");
     }
 
     // The faithfulness gate rejects a name that shares no salient term with its
