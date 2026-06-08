@@ -59,7 +59,8 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
                 all.push('\n');
             }
         }
-        let s = session_docs(&all);
+        let known: std::collections::HashSet<String> = crate::config::load().repos.into_iter().collect();
+        let s = session_docs(&all, &known);
         n_session = s.len();
         docs.extend(s);
     }
@@ -120,7 +121,7 @@ pub fn github_docs(json: &str, kind: &str, repo: &str) -> Vec<Doc> {
 
 /// Parse newline-joined v1 envelopes into one doc per user/assistant/thinking
 /// message. `session_start.cwd` maps a session to a repo.
-pub fn session_docs(text: &str) -> Vec<Doc> {
+pub fn session_docs(text: &str, known: &std::collections::HashSet<String>) -> Vec<Doc> {
     let mut session_repo: HashMap<String, String> = HashMap::new();
     let mut evs: Vec<Value> = Vec::new();
     for line in text.lines() {
@@ -132,7 +133,7 @@ pub fn session_docs(text: &str) -> Vec<Doc> {
                 if let (Some(sid), Some(cwd)) =
                     (v["session_id"].as_str(), v["payload"]["cwd"].as_str())
                 {
-                    session_repo.insert(sid.to_string(), crate::units::repo_from_cwd(cwd));
+                    session_repo.insert(sid.to_string(), crate::units::fold_repo(&crate::units::repo_from_cwd(cwd), known));
                 }
             }
             evs.push(v);
@@ -257,7 +258,7 @@ mod tests {
             r#"{"kind":"tool_call","session_id":"S1","payload":{"name":"Read"}}"#,
         ]
         .join("\n");
-        let docs = session_docs(&lines);
+        let docs = session_docs(&lines, &Default::default());
         assert_eq!(docs.len(), 2); // two real messages; "ok" and tool_call excluded
         assert!(docs.iter().all(|d| d.meta.session_id == "S1"));
         assert!(docs.iter().all(|d| d.meta.repo == "sie-internal"));
@@ -272,7 +273,7 @@ mod tests {
             r#"{"kind":"user_prompt","session_id":"S2","ts":"t","payload":{"text":"some real question here"}}"#,
         ]
         .join("\n");
-        let docs = session_docs(&lines);
+        let docs = session_docs(&lines, &Default::default());
         assert_eq!(docs[0].meta.repo, "");
     }
 
@@ -286,7 +287,7 @@ mod tests {
             r#"{"kind":"user_prompt","session_id":"S3","ts":"t","payload":{"text":"please refactor the auth module"}}"#,
         ]
         .join("\n");
-        let docs = session_docs(&lines);
+        let docs = session_docs(&lines, &Default::default());
         assert_eq!(docs.len(), 1);
         assert!(docs[0].text.starts_with("please refactor"));
     }

@@ -150,6 +150,8 @@ struct Agg {
 
 /// Aggregate the raw envelopes under corpus/local into per-session tallies.
 fn aggregate() -> HashMap<String, Agg> {
+    // The org's repos (from the last back-fill) — fold worktree dirs onto them.
+    let known: std::collections::HashSet<String> = crate::config::load().repos.into_iter().collect();
     let mut aggs: HashMap<String, Agg> = HashMap::new();
     for f in jsonl_files(Path::new(LOCAL_DIR)) {
         let Ok(data) = std::fs::read_to_string(&f) else { continue };
@@ -175,7 +177,7 @@ fn aggregate() -> HashMap<String, Agg> {
             match ev["kind"].as_str().unwrap_or("") {
                 "session_start" => {
                     if let Some(cwd) = ev["payload"]["cwd"].as_str() {
-                        a.repo = repo_from_cwd(cwd);
+                        a.repo = fold_repo(&repo_from_cwd(cwd), &known);
                     }
                 }
                 "user_prompt" => {
@@ -498,6 +500,22 @@ pub fn repo_from_cwd(cwd: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Fold a raw repo-dir name to a known repo: an exact match wins, else the
+/// longest known repo it extends with a `-` (a worktree or branch-aligned clone
+/// like `sie-web-backbutton` → `sie-web`, `sie-internal-m5` → `sie-internal`).
+/// An unknown name (a local-only repo) passes through unchanged.
+pub fn fold_repo(dir: &str, known: &std::collections::HashSet<String>) -> String {
+    if dir.is_empty() || known.contains(dir) {
+        return dir.to_string();
+    }
+    known
+        .iter()
+        .filter(|r| dir.len() > r.len() + 1 && dir.as_bytes()[r.len()] == b'-' && dir.starts_with(r.as_str()))
+        .max_by_key(|r| r.len())
+        .cloned()
+        .unwrap_or_else(|| dir.to_string())
+}
+
 /// Stable cache key for a GitHub PR/issue summary (repo#number is unique and
 /// survives re-indexing, unlike doc ids).
 pub fn gh_key(repo: &str, number: i64) -> String {
@@ -697,6 +715,18 @@ mod tests {
         assert_eq!(repo_from_cwd("/Users/svonava/Library/Application Support/Claude/x/outputs"), "");
         assert_eq!(repo_from_cwd("/Users/svonava"), "");
         assert_eq!(repo_from_cwd(""), "");
+    }
+
+    // Worktree / branch-aligned dirs fold to the known repo; exact + longest win.
+    #[test]
+    fn fold_repo_collapses_worktrees_to_known_repo() {
+        let known: std::collections::HashSet<String> =
+            ["sie-web", "sie", "sie-internal", "synty"].into_iter().map(String::from).collect();
+        assert_eq!(fold_repo("sie-web-backbutton", &known), "sie-web"); // longest prefix beats "sie"
+        assert_eq!(fold_repo("sie-internal-m5", &known), "sie-internal");
+        assert_eq!(fold_repo("synty", &known), "synty"); // exact
+        assert_eq!(fold_repo("acme-tool", &known), "acme-tool"); // unknown passes through
+        assert_eq!(fold_repo("", &known), "");
     }
 
     #[test]
