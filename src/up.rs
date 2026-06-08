@@ -16,9 +16,13 @@ pub fn run(bucket: &str, machine: &str, poll_secs: u64, github: bool) -> Result<
 
     // GitHub changes slowly; pull once at startup, best-effort (needs a token).
     if github {
-        match crate::github::run("superlinked", None, 90, &format!("{CORPUS_DIR}/github")) {
-            Ok(()) => {}
-            Err(e) => eprintln!("up: github pull skipped ({e})"),
+        match crate::config::load().org {
+            Some(org) => {
+                if let Err(e) = crate::github::run(&org, None, 90, &format!("{CORPUS_DIR}/github")) {
+                    eprintln!("up: github pull skipped ({e})");
+                }
+            }
+            None => eprintln!("up: no GitHub org configured — run `synty setup` to add one"),
         }
     }
 

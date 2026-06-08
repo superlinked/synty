@@ -13,19 +13,18 @@ use std::time::Duration;
 const ENDPOINT: &str = "https://api.github.com/graphql";
 const PAGE: i64 = 50;
 
-const DEFAULT_REPOS: &[&str] = &[
-    "sie-internal", "sie-web", "sie", "infrastructure", "sie-perf-lab",
-    "terraform-google-sie", "terraform-aws-sie", "gtm-intel", "VectorHub",
-    "sie-presentation", "agents", "brave-new-demos",
-];
-
 pub fn run(owner: &str, repos: Option<String>, since_days: u64, out: &str) -> Result<()> {
     let token = resolve_token()?;
     let cutoff = days_ago_rfc3339(since_days);
+    // Explicit --repos wins; otherwise pull the org's most-recently-active set.
     let repos: Vec<String> = match repos {
         Some(s) => s.split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
-        None => DEFAULT_REPOS.iter().map(|s| s.to_string()).collect(),
+        None => active_repos(owner, crate::config::load().backfill_repos.unwrap_or(crate::config::DEFAULT_REPOS))?,
     };
+    // Remember the resolved set so session-repo folding can use the real names.
+    let mut cfg = crate::config::load();
+    cfg.repos = repos.clone();
+    let _ = crate::config::save(&cfg);
     std::fs::create_dir_all(out)?;
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
@@ -162,6 +161,41 @@ fn resolve_token() -> Result<String> {
         }
     }
     bail!("no GitHub token: set GITHUB_TOKEN (a PAT with repo scope) or run `gh auth login`")
+}
+
+fn quick_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(30)).build()
+}
+
+/// The authenticated login plus every org the token can see — the accounts
+/// `synty setup` offers to backfill from (personal account first, then orgs).
+pub fn accounts() -> Result<Vec<String>> {
+    let token = resolve_token()?;
+    let data = post(&quick_agent(), &token, "query { viewer { login organizations(first:100) { nodes { login } } } }", json!({}))?;
+    let mut out = Vec::new();
+    if let Some(login) = data["viewer"]["login"].as_str() {
+        out.push(login.to_string());
+    }
+    if let Some(nodes) = data["viewer"]["organizations"]["nodes"].as_array() {
+        out.extend(nodes.iter().filter_map(|o| o["login"].as_str()).map(str::to_string));
+    }
+    Ok(out)
+}
+
+/// The `k` most-recently-pushed, non-archived repos owned by `owner` (an org or
+/// a user — tries org first, falls back to user so a personal account works).
+pub fn active_repos(owner: &str, k: usize) -> Result<Vec<String>> {
+    repos_under("organization", "", owner, k).or_else(|_| repos_under("user", ", ownerAffiliations:[OWNER]", owner, k))
+}
+
+fn repos_under(root: &str, affil: &str, owner: &str, k: usize) -> Result<Vec<String>> {
+    let token = resolve_token()?;
+    let q = format!(
+        "query($owner:String!,$k:Int!){{ {root}(login:$owner){{ repositories(first:$k, isArchived:false{affil}, orderBy:{{field:PUSHED_AT,direction:DESC}}){{ nodes{{ name }} }} }} }}"
+    );
+    let data = post(&quick_agent(), &token, &q, json!({"owner": owner, "k": k as i64}))?;
+    let nodes = data[root]["repositories"]["nodes"].as_array().ok_or_else(|| anyhow!("{owner}: no repositories"))?;
+    Ok(nodes.iter().filter_map(|n| n["name"].as_str().map(str::to_string)).collect())
 }
 
 /// RFC3339 cutoff `since_days` before now, computed from the system clock.

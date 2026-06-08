@@ -14,7 +14,7 @@ const ID_DIR: &str = ".synty";
 /// user.email → $USER. So a person's sessions merge with their GitHub PRs
 /// instead of every session reading as one hardcoded name.
 pub fn actor() -> String {
-    pick_actor(read_id("identity"), git_email_local(), env_user())
+    pick_actor(crate::config::load().github_login, git_email_local(), env_user())
 }
 
 fn pick_actor(pinned: Option<String>, git_email: Option<String>, user: Option<String>) -> String {
@@ -54,10 +54,15 @@ fn machine_name(host: &str, nonce: u64) -> String {
 /// holds a token); `actor()` then reads it offline. Idempotent.
 pub fn cache_github_login(login: &str) {
     let login = sanitize(login);
-    if login.is_empty() || read_id("identity").as_deref() == Some(login.as_str()) {
+    if login.is_empty() {
         return;
     }
-    let _ = write_id("identity", &login);
+    let mut cfg = crate::config::load();
+    if cfg.github_login.as_deref() == Some(login.as_str()) {
+        return;
+    }
+    cfg.github_login = Some(login);
+    let _ = crate::config::save(&cfg);
 }
 
 // ── sources (best-effort, offline) ──────────────────────────────────────────

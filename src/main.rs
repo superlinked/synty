@@ -13,9 +13,11 @@ mod community;
 mod encode;
 mod eval;
 mod event;
+mod config;
 mod github;
 mod identity;
 mod metrics;
+mod setup;
 mod store;
 mod sync;
 mod tail;
@@ -162,6 +164,8 @@ enum Cmd {
     },
     /// What synty holds and how fresh it is
     Status,
+    /// First-run onboarding: connect GitHub, pick an org to back-fill, enable autostart
+    Setup,
     /// Interactive terminal UI: status + browse/drill over topics, recent, search
     Tui,
     /// Session + topic summaries. With the `llm` feature, session summaries are
@@ -230,10 +234,10 @@ enum Cmd {
     },
     /// Pull GitHub PRs/issues via GraphQL (token-based, no `gh` needed)
     Github {
-        /// Repository owner / org
-        #[arg(long, default_value = "superlinked")]
-        owner: String,
-        /// Comma-separated repo names (default: the known active set)
+        /// Repository owner / org (default: the org chosen in `synty setup`)
+        #[arg(long)]
+        owner: Option<String>,
+        /// Comma-separated repo names (default: the org's most-active set)
         #[arg(long)]
         repos: Option<String>,
         /// Trailing window in days
@@ -274,6 +278,7 @@ fn main() -> Result<()> {
             print!("{}", view::work_md(&us));
         }
         Cmd::Status => print!("{}", view::status_md(&view::status()?)),
+        Cmd::Setup => setup::run()?,
         Cmd::Tui => tui::run(model_id())?,
         Cmd::Summarize { sessions, topics, cached, dump, sample } => {
             let _ = (cached, sample);
@@ -314,6 +319,9 @@ fn main() -> Result<()> {
             up::run(&bucket, &machine, poll, !no_github)?
         }
         Cmd::Github { owner, repos, since_days, out } => {
+            let owner = owner
+                .or_else(|| config::load().org)
+                .ok_or_else(|| anyhow::anyhow!("no GitHub org: run `synty setup` or pass --owner"))?;
             github::run(&owner, repos, since_days, &out)?
         }
     }
