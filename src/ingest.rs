@@ -133,7 +133,7 @@ pub fn session_docs(text: &str, known: &std::collections::HashSet<String>) -> Ve
                 if let (Some(sid), Some(cwd)) =
                     (v["session_id"].as_str(), v["payload"]["cwd"].as_str())
                 {
-                    session_repo.insert(sid.to_string(), crate::units::fold_repo(&crate::units::repo_from_cwd(cwd), known));
+                    session_repo.insert(sid.to_string(), crate::units::resolve_repo(cwd, known));
                 }
             }
             evs.push(v);
@@ -258,7 +258,8 @@ mod tests {
             r#"{"kind":"tool_call","session_id":"S1","payload":{"name":"Read"}}"#,
         ]
         .join("\n");
-        let docs = session_docs(&lines, &Default::default());
+        let known: std::collections::HashSet<String> = ["sie-internal".to_string()].into_iter().collect();
+        let docs = session_docs(&lines, &known);
         assert_eq!(docs.len(), 2); // two real messages; "ok" and tool_call excluded
         assert!(docs.iter().all(|d| d.meta.session_id == "S1"));
         assert!(docs.iter().all(|d| d.meta.repo == "sie-internal"));

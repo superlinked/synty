@@ -177,7 +177,7 @@ fn aggregate() -> HashMap<String, Agg> {
             match ev["kind"].as_str().unwrap_or("") {
                 "session_start" => {
                     if let Some(cwd) = ev["payload"]["cwd"].as_str() {
-                        a.repo = fold_repo(&repo_from_cwd(cwd), &known);
+                        a.repo = resolve_repo(cwd, &known);
                     }
                 }
                 "user_prompt" => {
@@ -484,20 +484,45 @@ pub fn session_inputs() -> Result<Vec<SessionInput>> {
         .collect())
 }
 
-/// The repo a session belongs to, parsed from its working directory: the path
-/// segment just below a workspace-parent dir (`~/c`, `~/code`, `~/src`,
-/// `~/repos`, `~/work`, `~/projects`, `~/git`, `~/dev`). So `/Users/x/c/sie-web/
-/// apps/site` → `sie-web` (the repo, not the subdir). Empty when there's no
-/// repo — a blank cwd, the home dir, or an agent scratch path — so callers drop
-/// it rather than invent a "local" repo that collides across machines.
-pub fn repo_from_cwd(cwd: &str) -> String {
-    const PARENTS: &[&str] = &["c", "code", "src", "repos", "work", "projects", "git", "dev"];
-    let segs: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
-    segs.iter()
-        .position(|s| PARENTS.contains(s))
-        .and_then(|i| segs.get(i + 1))
-        .map(|r| r.to_string())
-        .unwrap_or_default()
+/// The repo a session belongs to, from its working directory. No path-shape
+/// guessing: a cwd segment that is (or folds to) a known org repo wins — so org
+/// repos resolve from the path string alone, machine-independently — and
+/// anything else falls back to the cwd's own git remote (a local repo). Empty
+/// only when neither applies (blank cwd, agent scratch dir, missing checkout).
+pub fn resolve_repo(cwd: &str, known: &std::collections::HashSet<String>) -> String {
+    let matched = repo_from_cwd(cwd, known);
+    if matched.is_empty() { git_repo(cwd).unwrap_or_default() } else { matched }
+}
+
+/// The first cwd segment that exact-matches or folds to a known repo (empty if
+/// none) — the pure, machine-independent half of `resolve_repo`.
+pub fn repo_from_cwd(cwd: &str, known: &std::collections::HashSet<String>) -> String {
+    cwd.split('/').filter(|s| !s.is_empty()).map(|seg| fold_repo(seg, known)).find(|r| known.contains(r)).unwrap_or_default()
+}
+
+/// Repo name from a cwd's `git remote origin` (basename, no `.git`), cached per
+/// cwd; `None` if the checkout is gone or has no remote. Resolves local repos
+/// that aren't in the tracked org — locally, nothing leaves the machine.
+fn git_repo(cwd: &str) -> Option<String> {
+    use std::sync::{LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    if cwd.is_empty() {
+        return None;
+    }
+    if let Some(hit) = CACHE.lock().ok()?.get(cwd) {
+        return hit.clone();
+    }
+    let resolved = (|| {
+        let out = std::process::Command::new("git").args(["-C", cwd, "config", "--get", "remote.origin.url"]).output().ok()?;
+        out.status.success().then_some(())?;
+        let url = String::from_utf8_lossy(&out.stdout);
+        let name = url.trim().trim_end_matches(".git").rsplit(['/', ':']).next()?;
+        (!name.is_empty()).then(|| name.to_string())
+    })();
+    if let Ok(mut c) = CACHE.lock() {
+        c.insert(cwd.to_string(), resolved.clone());
+    }
+    resolved
 }
 
 /// Fold a raw repo-dir name to a known repo: an exact match wins, else the
@@ -702,19 +727,21 @@ mod tests {
     use super::*;
 
     // File tokens are repo-qualified path tails; harness/temp artifacts are dropped.
-    // The repo is the segment below a workspace parent; subdirs collapse to it,
-    // and non-repo paths (agent scratch, home, blank) yield "" not "local".
+    // A cwd segment that is (or folds to) a known repo wins, anywhere in the
+    // path; subdirs collapse to it; an unknown path matches nothing (the runtime
+    // git fallback handles local repos), never a hardcoded workspace guess.
     #[test]
-    fn repo_from_cwd_extracts_repo_not_subdir() {
-        assert_eq!(repo_from_cwd("/Users/svonava/c/synty"), "synty");
-        assert_eq!(repo_from_cwd("/Users/svonava/c/synty/server"), "synty");
-        assert_eq!(repo_from_cwd("/Users/svonava/c/sie-web/apps/site/public"), "sie-web");
-        assert_eq!(repo_from_cwd("/Users/d/c/sie-internal/x"), "sie-internal");
-        assert_eq!(repo_from_cwd("/home/ubuntu/code/myrepo"), "myrepo");
-        // no repo → empty (excluded downstream), never "local"
-        assert_eq!(repo_from_cwd("/Users/svonava/Library/Application Support/Claude/x/outputs"), "");
-        assert_eq!(repo_from_cwd("/Users/svonava"), "");
-        assert_eq!(repo_from_cwd(""), "");
+    fn repo_from_cwd_matches_known_repo_segment() {
+        let known: std::collections::HashSet<String> =
+            ["synty", "sie-web", "sie-internal"].into_iter().map(String::from).collect();
+        assert_eq!(repo_from_cwd("/Users/svonava/c/synty/server", &known), "synty");
+        assert_eq!(repo_from_cwd("/Users/svonava/c/sie-web/apps/site/public", &known), "sie-web");
+        assert_eq!(repo_from_cwd("/Users/d/c/sie-internal/x", &known), "sie-internal");
+        assert_eq!(repo_from_cwd("/Users/svonava/c/sie-web-backbutton/x", &known), "sie-web"); // folds
+        // unknown to the org / no match → empty (git fallback resolves it at runtime)
+        assert_eq!(repo_from_cwd("/Users/svonava/c/personal-thing", &known), "");
+        assert_eq!(repo_from_cwd("/Users/svonava/Library/Application Support/Claude/x/outputs", &known), "");
+        assert_eq!(repo_from_cwd("", &known), "");
     }
 
     // Worktree / branch-aligned dirs fold to the known repo; exact + longest win.
