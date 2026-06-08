@@ -12,11 +12,6 @@ use std::path::{Path, PathBuf};
 const CAP: usize = 12_000;
 const MIN_TEXT: usize = 12;
 const MAX_TEXT: usize = 6000;
-const KNOWN_REPOS: &[&str] = &[
-    "sie-internal", "sie-web", "sie-perf-lab", "sie-presentation", "sie",
-    "infrastructure", "gtm-intel", "terraform-google-sie", "terraform-aws-sie",
-    "VectorHub", "agents", "brave-new-demos",
-];
 
 pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()> {
     // Pull every device's events from the shared bucket so this build sees the
@@ -137,7 +132,7 @@ pub fn session_docs(text: &str) -> Vec<Doc> {
                 if let (Some(sid), Some(cwd)) =
                     (v["session_id"].as_str(), v["payload"]["cwd"].as_str())
                 {
-                    session_repo.insert(sid.to_string(), repo_from_cwd(cwd));
+                    session_repo.insert(sid.to_string(), crate::units::repo_from_cwd(cwd));
                 }
             }
             evs.push(v);
@@ -158,7 +153,7 @@ pub fn session_docs(text: &str) -> Vec<Doc> {
             continue;
         }
         let sid = v["session_id"].as_str().unwrap_or("").to_string();
-        let repo = session_repo.get(&sid).cloned().unwrap_or_else(|| "local".into());
+        let repo = session_repo.get(&sid).cloned().unwrap_or_default();
         out.push(Doc {
             id: 0,
             text: trunc(text, MAX_TEXT),
@@ -208,14 +203,6 @@ fn trunc(s: &str, n: usize) -> String {
     } else {
         s.chars().take(n).collect()
     }
-}
-
-fn repo_from_cwd(cwd: &str) -> String {
-    KNOWN_REPOS
-        .iter()
-        .find(|r| cwd.contains(&format!("/{r}")))
-        .map(|r| (*r).to_string())
-        .unwrap_or_else(|| "local".into())
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -277,16 +264,16 @@ mod tests {
         assert!(docs.iter().all(|d| d.meta.source == "agent"));
     }
 
-    // Unknown cwd falls back to "local" rather than guessing.
+    // A cwd outside any workspace dir has no repo — empty, not a fake "local".
     #[test]
-    fn session_unknown_cwd_is_local() {
+    fn session_unknown_cwd_has_no_repo() {
         let lines = [
             r#"{"kind":"session_start","session_id":"S2","payload":{"cwd":"/tmp/scratch"}}"#,
             r#"{"kind":"user_prompt","session_id":"S2","ts":"t","payload":{"text":"some real question here"}}"#,
         ]
         .join("\n");
         let docs = session_docs(&lines);
-        assert_eq!(docs[0].meta.repo, "local");
+        assert_eq!(docs[0].meta.repo, "");
     }
 
     // Hook echoes and tool output injected as user turns are not real prompts.

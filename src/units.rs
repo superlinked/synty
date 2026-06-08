@@ -175,7 +175,7 @@ fn aggregate() -> HashMap<String, Agg> {
             match ev["kind"].as_str().unwrap_or("") {
                 "session_start" => {
                     if let Some(cwd) = ev["payload"]["cwd"].as_str() {
-                        a.repo = cwd.rsplit('/').next().unwrap_or(cwd).to_string();
+                        a.repo = repo_from_cwd(cwd);
                     }
                 }
                 "user_prompt" => {
@@ -251,7 +251,7 @@ pub fn sessions() -> Result<Vec<Session>> {
             let a = &aggs[id];
             Session {
                 id: id.clone(),
-                repo: if a.repo.is_empty() { "local".into() } else { a.repo.clone() },
+                repo: a.repo.clone(),
                 started: a.first.clone(),
                 ended: a.last.clone(),
                 ask: a.ask.clone(),
@@ -469,13 +469,29 @@ pub fn session_inputs() -> Result<Vec<SessionInput>> {
             let a = &aggs[id];
             SessionInput {
                 id: id.clone(),
-                repo: if a.repo.is_empty() { "local".into() } else { a.repo.clone() },
+                repo: a.repo.clone(),
                 ask: a.ask.clone(),
                 files: a.files.iter().take(12).cloned().collect(),
                 turns: top_turns(&a.texts, 8),
             }
         })
         .collect())
+}
+
+/// The repo a session belongs to, parsed from its working directory: the path
+/// segment just below a workspace-parent dir (`~/c`, `~/code`, `~/src`,
+/// `~/repos`, `~/work`, `~/projects`, `~/git`, `~/dev`). So `/Users/x/c/sie-web/
+/// apps/site` → `sie-web` (the repo, not the subdir). Empty when there's no
+/// repo — a blank cwd, the home dir, or an agent scratch path — so callers drop
+/// it rather than invent a "local" repo that collides across machines.
+pub fn repo_from_cwd(cwd: &str) -> String {
+    const PARENTS: &[&str] = &["c", "code", "src", "repos", "work", "projects", "git", "dev"];
+    let segs: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
+    segs.iter()
+        .position(|s| PARENTS.contains(s))
+        .and_then(|i| segs.get(i + 1))
+        .map(|r| r.to_string())
+        .unwrap_or_default()
 }
 
 /// Stable cache key for a GitHub PR/issue summary (repo#number is unique and
@@ -664,6 +680,21 @@ mod tests {
     use super::*;
 
     // File tokens are repo-qualified path tails; harness/temp artifacts are dropped.
+    // The repo is the segment below a workspace parent; subdirs collapse to it,
+    // and non-repo paths (agent scratch, home, blank) yield "" not "local".
+    #[test]
+    fn repo_from_cwd_extracts_repo_not_subdir() {
+        assert_eq!(repo_from_cwd("/Users/svonava/c/synty"), "synty");
+        assert_eq!(repo_from_cwd("/Users/svonava/c/synty/server"), "synty");
+        assert_eq!(repo_from_cwd("/Users/svonava/c/sie-web/apps/site/public"), "sie-web");
+        assert_eq!(repo_from_cwd("/Users/d/c/sie-internal/x"), "sie-internal");
+        assert_eq!(repo_from_cwd("/home/ubuntu/code/myrepo"), "myrepo");
+        // no repo → empty (excluded downstream), never "local"
+        assert_eq!(repo_from_cwd("/Users/svonava/Library/Application Support/Claude/x/outputs"), "");
+        assert_eq!(repo_from_cwd("/Users/svonava"), "");
+        assert_eq!(repo_from_cwd(""), "");
+    }
+
     #[test]
     fn file_token_qualifies_and_filters() {
         assert_eq!(file_token("/Users/svonava/c/synty/src/topics.rs").as_deref(), Some("synty/src/topics.rs"));

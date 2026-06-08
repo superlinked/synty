@@ -767,7 +767,7 @@ impl App {
                         let (k, title) = doc_kind_title(d);
                         Row::new(vec![
                             type_cell(k),
-                            Cell::from(if d.meta.repo.is_empty() { "local".into() } else { d.meta.repo.clone() }).style(dim),
+                            Cell::from(if d.meta.repo.is_empty() { "—".into() } else { d.meta.repo.clone() }).style(dim),
                             Cell::from(title).style(Style::new().fg(kind_color(k))),
                         ])
                     })
@@ -1114,7 +1114,7 @@ fn doc_detail(d: &Doc) -> String {
             let url = d.meta.url.clone().unwrap_or_default();
             format!("{} {}#{} [{}]\n{}\n\n", d.meta.kind, d.meta.repo, d.meta.number.unwrap_or(0), d.meta.state.clone().unwrap_or_default(), url)
         }
-        _ => format!("{} · {} · {}\n\n", d.meta.kind, if d.meta.repo.is_empty() { "local" } else { &d.meta.repo }, d.meta.ts),
+        _ => format!("{} · {} · {}\n\n", d.meta.kind, if d.meta.repo.is_empty() { "—" } else { &d.meta.repo }, d.meta.ts),
     };
     o.push_str(&d.text);
     o

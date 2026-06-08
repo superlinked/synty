@@ -75,7 +75,7 @@ fn card(d: &Doc, rank: usize, score: f32) -> String {
         _ => format!(
             "{rank}. [{score:.1}] _{} · {} · {}_\n   {}\n",
             d.meta.kind,
-            if d.meta.repo.is_empty() { "local" } else { &d.meta.repo },
+            if d.meta.repo.is_empty() { "—" } else { &d.meta.repo },
             short(&d.meta.session_id),
             excerpt(&d.text, 160)
         ),
