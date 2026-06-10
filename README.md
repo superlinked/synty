@@ -19,7 +19,8 @@ ingests your dev transcripts, that is the whole point.
   are never sent anywhere.
 - **Local-first, one binary.** No server, no Python, no Docker to get value. The
   embedding model (~127 MB) downloads once and runs offline after; the optional
-  summarizer (~1.2 GB) downloads on first `summarize`.
+  summarizer (~1.2 GB) downloads the first time anything summarizes
+  (`build`, `tui`, or `summarize`).
 - **Agents are first-class readers.** The main surface is a CLI that prints
   Markdown to stdout — exactly what a coding agent reads before starting, so it
   builds on prior work instead of starting cold.
@@ -34,7 +35,8 @@ cargo run --release -- setup
 
 # Solo mode: track, ingest, and index on a loop — your machine is both the
 # tracker (lightweight, model-free) and the builder (downloads the embedding
-# model on first run). In fleet mode machines run only the tracker.
+# model on first run; `build`/`tui` also fetch the summarizer). In fleet mode
+# machines run only the tracker.
 cargo run --release -- up
 ```
 
