@@ -20,37 +20,47 @@ impl Source for Codex {
     }
     /// The `cli_version` from the first `session_meta` line.
     fn detect_version(&self, head: &[u8]) -> String {
-        for line in head.split(|&b| b == b'\n').take(20) {
-            if line.is_empty() {
-                continue;
-            }
-            #[derive(Deserialize)]
-            struct Probe {
-                #[serde(rename = "type")]
-                rtype: String,
-                payload: Option<Value>,
-            }
-            if let Ok(p) = serde_json::from_slice::<Probe>(line) {
-                if p.rtype == "session_meta" {
-                    return p
-                        .payload
-                        .and_then(|v| v.get("cli_version").and_then(Value::as_str).map(str::to_owned))
-                        .unwrap_or_default();
-                }
-            }
-        }
-        String::new()
+        head_meta(head)
+            .and_then(|p| p.get("cli_version").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_default()
     }
     /// The 0.x line shares one record vocabulary and payload shape, so one
     /// parser covers it; new payload subtypes fall through to agent_meta. An
     /// empty version (head-detection failed on a truncated file) still parses.
-    fn new_parser(&self, version: &str) -> Option<Box<dyn FileParser>> {
+    /// The session id lives only in the head's `session_meta`, so a parser
+    /// seeded mid-file (cursor resume) reads it from `head` — otherwise every
+    /// record after a tracker restart would carry an empty session_id.
+    fn new_parser(&self, version: &str, head: &[u8]) -> Option<Box<dyn FileParser>> {
         if version.is_empty() || version.starts_with("0.") {
-            Some(Box::new(CodexParser::default()))
+            let session_id = head_meta(head)
+                .and_then(|p| p.get("id").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            Some(Box::new(CodexParser { session_id }))
         } else {
             None
         }
     }
+}
+
+/// The `session_meta` payload from the head lines, if present.
+fn head_meta(head: &[u8]) -> Option<Value> {
+    for line in head.split(|&b| b == b'\n').take(20) {
+        if line.is_empty() {
+            continue;
+        }
+        #[derive(Deserialize)]
+        struct Probe {
+            #[serde(rename = "type")]
+            rtype: String,
+            payload: Option<Value>,
+        }
+        if let Ok(p) = serde_json::from_slice::<Probe>(line) {
+            if p.rtype == "session_meta" {
+                return p.payload;
+            }
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -259,7 +269,7 @@ mod tests {
 
     fn run(lines: &str, version: &str) -> Vec<Event> {
         let src = Codex;
-        let mut parser = src.new_parser(version).expect("parser");
+        let mut parser = src.new_parser(version, lines.as_bytes()).expect("parser");
         let mut seq = Sequencer::new();
         let mut started = HashSet::new();
         let mut ec = EmitCtx::new("edge-x-codex".into(), &src, &mut seq, &mut started);
@@ -272,9 +282,9 @@ mod tests {
     fn current_version_is_supported() {
         let head = br#"{"type":"session_meta","payload":{"id":"S","cli_version":"0.133.0"}}"#;
         assert_eq!(Codex.detect_version(head), "0.133.0");
-        assert!(Codex.new_parser("0.133.0").is_some());
-        assert!(Codex.new_parser("0.120.5").is_some());
-        assert!(Codex.new_parser("2.0.0").is_none());
+        assert!(Codex.new_parser("0.133.0", b"").is_some());
+        assert!(Codex.new_parser("0.120.5", b"").is_some());
+        assert!(Codex.new_parser("2.0.0", b"").is_none());
     }
 
     // session_meta → one session_start; the id threads into later records.
@@ -296,6 +306,27 @@ mod tests {
         assert_eq!(user.payload["text"], "add a test");
         assert_eq!(user.session_id, "S1"); // threaded from session_meta
         assert!(evts.iter().any(|e| e.kind == "assistant_message" && e.payload["text"] == "done"));
+    }
+
+    // A tracker restart resumes mid-file with a fresh parser: the session_meta
+    // line sits before the cursor, so the id must come from the head reseed —
+    // without it every post-resume event carries an empty session_id.
+    #[test]
+    fn cursor_resume_keeps_session_id() {
+        let meta = r#"{"type":"session_meta","timestamp":"2026-05-27T19:32:00Z","payload":{"id":"S9","cli_version":"0.133.0"}}"#;
+        let user = r#"{"type":"response_item","timestamp":"2026-05-27T19:40:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"resume me"}]}}"#;
+        let full = format!("{meta}\n{user}\n");
+        let head = full.as_bytes();
+        let offset = (meta.len() + 1) as i64; // cursor saved past session_meta
+
+        let src = Codex;
+        let mut parser = src.new_parser(&src.detect_version(head), head).expect("parser");
+        let mut seq = Sequencer::new();
+        let mut started = HashSet::new();
+        let mut ec = EmitCtx::new("edge-x-codex".into(), &src, &mut seq, &mut started);
+        let (evts, _, _) = drive(&mut *parser, &head[offset as usize..], "r.jsonl", offset, 1_700_000_000_000, &mut ec);
+        let user = evts.iter().find(|e| e.kind == "user_prompt").unwrap();
+        assert_eq!(user.session_id, "S9");
     }
 
     // apply_patch function_call → tool_call + attachment_ref with the path.

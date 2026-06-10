@@ -49,6 +49,9 @@ pub fn run(o: Opts) -> Result<()> {
         t.flush_ends(unix_ms(SystemTime::now()), true)?;
         t.save_cursors()?;
         let pushed = t.push()?;
+        let mut m = crate::metrics::Run::new("track");
+        m.set("events", n).set("sessions", t.session_count()).set("lines_skipped", t.skipped_count());
+        m.emit();
         eprintln!("track: {n} events ({} sessions) → {}", t.session_count(), o.out);
         if pushed > 0 {
             eprintln!("track: pushed {pushed} event files → {}/events/", t.bucket.as_deref().unwrap_or(""));
@@ -73,6 +76,12 @@ struct Stream {
     /// last (ts_ms, ts) seen per still-open session, for idle session_end.
     open: HashMap<String, (i64, String)>,
     n_sessions: usize,
+    /// Malformed lines the parser rejected — format drift made visible.
+    n_skipped: usize,
+    /// This machine's resolved actor, stamped into session_start payloads so a
+    /// build on another machine attributes the session to its author, not to
+    /// whoever runs the build.
+    actor: String,
 }
 
 struct Tracker {
@@ -92,10 +101,19 @@ impl Tracker {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        // Started session ids persist next to the cursors: a restart resumes
+        // mid-file, and without this every resumed session would re-emit a
+        // session_start (under a fresh deterministic id, so never deduped).
+        let started_path = started_path(&cursors_path);
+        let mut started_by_src: HashMap<String, HashSet<String>> = std::fs::read_to_string(&started_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
 
         // "local" (the default) auto-derives a stable per-machine id; an explicit
         // --machine is taken as-is. Keeps fleet streams from colliding.
         let machine = crate::identity::resolve_machine(&o.machine);
+        let actor = crate::identity::actor();
         let mut streams = Vec::new();
         for src in sources(&o.which)? {
             let name = format!("edge-{}-{}", machine, src.id());
@@ -106,15 +124,18 @@ impl Tracker {
             // Seed offsets from saved cursors so a restart resumes mid-file.
             let mut files = HashMap::new();
             let roots = default_roots(src.id(), &home);
+            let started = started_by_src.remove(src.id()).unwrap_or_default();
             streams.push(Stream {
                 roots,
                 name,
                 out,
                 seq: Sequencer::new(),
-                started: HashSet::new(),
+                started,
                 files: std::mem::take(&mut files),
                 open: HashMap::new(),
                 n_sessions: 0,
+                n_skipped: 0,
+                actor: actor.clone(),
                 src,
             });
         }
@@ -157,7 +178,12 @@ impl Tracker {
             self.save_cursors()?;
             let pushed = self.push()?;
             if n > 0 || ended > 0 || pushed > 0 {
-                eprintln!("track: +{n} events, {ended} ended, {pushed} files pushed");
+                let skipped = self.skipped_count();
+                if skipped > 0 {
+                    eprintln!("track: +{n} events, {ended} ended, {pushed} files pushed, {skipped} malformed lines skipped (total)");
+                } else {
+                    eprintln!("track: +{n} events, {ended} ended, {pushed} files pushed");
+                }
             }
             std::thread::sleep(Duration::from_secs(poll_secs));
         }
@@ -183,11 +209,18 @@ impl Tracker {
             std::fs::create_dir_all(p)?;
         }
         std::fs::write(&self.cursors_path, serde_json::to_string(&self.cursors)?)?;
+        let started: HashMap<&str, &HashSet<String>> =
+            self.streams.iter().map(|st| (st.src.id(), &st.started)).collect();
+        std::fs::write(started_path(&self.cursors_path), serde_json::to_string(&started)?)?;
         Ok(())
     }
 
     fn session_count(&self) -> usize {
         self.streams.iter().map(|s| s.n_sessions).sum()
+    }
+
+    fn skipped_count(&self) -> usize {
+        self.streams.iter().map(|s| s.n_skipped).sum()
     }
 }
 
@@ -202,7 +235,7 @@ impl Stream {
             if !self.files.contains_key(&path) {
                 let head = &content[..content.len().min(HEAD_BYTES)];
                 let version = self.src.detect_version(head);
-                let Some(parser) = self.src.new_parser(&version) else { continue };
+                let Some(parser) = self.src.new_parser(&version, head) else { continue };
                 let offset = cursors.get(&format!("{}\0{}", self.src.id(), path.display())).copied().unwrap_or(0);
                 self.files.insert(path.clone(), FileState { offset, parser });
             }
@@ -219,11 +252,17 @@ impl Stream {
             let path_str = path.to_string_lossy();
             let before = self.started.len();
             let mut ec = EmitCtx::new(self.name.clone(), &*self.src, &mut self.seq, &mut self.started);
-            let (evts, consumed) = drive(&mut *fs.parser, complete, &path_str, fs.offset, fallback_ms, &mut ec);
+            let (mut evts, consumed, skipped) = drive(&mut *fs.parser, complete, &path_str, fs.offset, fallback_ms, &mut ec);
             drop(ec);
             fs.offset += consumed;
             self.n_sessions += self.started.len() - before;
+            self.n_skipped += skipped;
 
+            for e in &mut evts {
+                if e.kind == kind::SESSION_START {
+                    e.payload["actor"] = json!(self.actor);
+                }
+            }
             for e in &evts {
                 if !e.session_id.is_empty() && e.kind != kind::SESSION_END {
                     self.open.insert(e.session_id.clone(), (fallback_ms, e.ts.clone()));
@@ -269,6 +308,11 @@ impl Stream {
         f.write_all(body.as_bytes())?;
         Ok(())
     }
+}
+
+/// The started-session-ids file, a sibling of the cursors file.
+fn started_path(cursors: &Path) -> PathBuf {
+    cursors.with_extension("started.json")
 }
 
 fn default_roots(id: &str, home: &str) -> Vec<String> {
@@ -430,4 +474,60 @@ fn install(kind: &str, o: &Opts) -> Result<()> {
     }
     let _ = ms_to_rfc3339; // reserved for future status output
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A tracker restart resumes mid-file with fresh in-memory state. The
+    // persisted started set must keep a session that simply continued across
+    // the restart from re-emitting session_start (a restart mints it under a
+    // new line offset, so event-id dedup would never catch it).
+    #[test]
+    fn restart_does_not_duplicate_session_start() {
+        let dir = std::env::temp_dir().join(format!("synty-track-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("s.jsonl");
+        let l1 = r#"{"type":"user","sessionId":"S1","version":"2.1.30","timestamp":"2026-05-31T20:00:00Z","message":{"content":"first prompt"}}"#;
+        std::fs::write(&log, format!("{l1}\n")).unwrap();
+
+        let stream = |started: HashSet<String>| Stream {
+            src: Box::new(ClaudeCode),
+            roots: vec![root.to_string_lossy().into_owned()],
+            name: "edge-t-claudecode".into(),
+            out: dir.join("out.jsonl"),
+            seq: Sequencer::new(),
+            started,
+            files: HashMap::new(),
+            open: HashMap::new(),
+            n_sessions: 0,
+            n_skipped: 0,
+            actor: "tester".into(),
+        };
+
+        // First run: parse from the top, persist cursor + started set.
+        let mut s1 = stream(HashSet::new());
+        s1.drain(0, &HashMap::new()).unwrap();
+        let offset = s1.files.values().next().unwrap().offset;
+        let started = s1.started.clone();
+
+        // Restart: the session's file grows; the new process seeds the cursor
+        // and the persisted started set.
+        let l2 = r#"{"type":"user","sessionId":"S1","version":"2.1.30","timestamp":"2026-05-31T20:05:00Z","message":{"content":"second prompt"}}"#;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(format!("{l2}\n").as_bytes()).unwrap();
+        let cursors: HashMap<String, i64> =
+            [(format!("claudecode\0{}", log.display()), offset)].into_iter().collect();
+        let mut s2 = stream(started);
+        s2.drain(0, &cursors).unwrap();
+
+        let out = std::fs::read_to_string(dir.join("out.jsonl")).unwrap();
+        let starts = out.lines().filter(|l| l.contains("\"session_start\"")).count();
+        assert_eq!(starts, 1, "restart must not re-emit session_start:\n{out}");
+        assert!(out.contains("second prompt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

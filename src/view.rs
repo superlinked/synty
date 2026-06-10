@@ -27,6 +27,8 @@ pub struct Status {
     pub last_indexed: Option<String>,
     pub last_tracked: Option<String>,
     pub autostart: bool,
+    /// Tracked events are newer than the index — answers may miss recent work.
+    pub stale: bool,
 }
 
 /// What synty holds and how fresh it is.
@@ -51,6 +53,23 @@ pub fn status() -> Result<Status> {
         last_indexed: mtime_str("index/doc_hashes.json"),
         last_tracked: mtime_str(".synty/cursors.json"),
         autostart: crate::track::autostart_enabled(),
+        stale: stale_note().is_some(),
+    })
+}
+
+/// A warning when tracked events are newer than the index — surfaces stale
+/// answers instead of silently serving them. None when fresh (or unbuilt).
+pub fn stale_note() -> Option<String> {
+    let indexed = std::fs::metadata("index/doc_hashes.json").ok()?.modified().ok()?;
+    let newest_event = walkdir::WalkDir::new("corpus/local")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .max()?;
+    // A minute of slack: `up` ticks rewrite event files moments before indexing.
+    (newest_event > indexed + std::time::Duration::from_secs(60)).then(|| {
+        "note: tracked events are newer than the index — run `synty up` or `synty build` to refresh".to_string()
     })
 }
 
@@ -113,6 +132,9 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
 
 pub fn status_md(s: &Status) -> String {
     let mut o = String::from("# status\n\n");
+    if s.stale {
+        o.push_str("⚠ index is stale — tracked events are newer; run `synty up` or `synty build`\n\n");
+    }
     o.push_str(&format!(
         "{} docs · {} GitHub · {} sessions · autostart {}\nnewest: {}\nlast indexed: {} · last tracked: {}\n\nkinds: ",
         s.docs,
@@ -133,6 +155,68 @@ pub fn status_md(s: &Status) -> String {
     block(&mut o, "repos", &s.by_repo);
     block(&mut o, "accounts", &s.by_user);
     o
+}
+
+// ── JSON renderers (CLI --json, for scripts and agents) ──────────────────
+
+fn unit_json(u: &Unit) -> serde_json::Value {
+    serde_json::json!({
+        "kind": match u.kind { Kind::Session => "session", Kind::Pr => "pr", Kind::Issue => "issue" },
+        "when": u.when,
+        "repo": u.repo,
+        "title": u.title,
+        "outcome": u.outcome,
+        "summary": u.summary,
+        "topic": u.topic,
+        "struggle": u.struggle,
+        "author": u.author,
+        "doc_id": u.doc_id,
+        "session_id": u.session_id,
+    })
+}
+
+pub fn work_json(units: &[Unit]) -> String {
+    serde_json::Value::Array(units.iter().map(unit_json).collect()).to_string()
+}
+
+pub fn topics_json(topics: &[TopicUnits]) -> String {
+    let arr: Vec<serde_json::Value> = topics
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "key": t.cache_key,
+                "title": t.title(),
+                "label": t.label,
+                "summary": t.summary,
+                "name": t.name,
+                "last_active": t.last_active,
+                "mix": {"sessions": t.mix.0, "prs": t.mix.1, "issues": t.mix.2},
+                "repos": t.repos,
+                "authors": t.authors,
+                "span": t.span,
+                "units": t.units.iter().map(unit_json).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr).to_string()
+}
+
+pub fn status_json(s: &Status) -> String {
+    serde_json::json!({
+        "docs": s.docs,
+        "github": s.github,
+        "sessions": s.sessions,
+        "by_kind": s.by_kind,
+        "by_repo": s.by_repo.iter().map(|t| serde_json::json!({"name": t.name, "docs": t.docs, "github": t.github, "sessions": t.sessions})).collect::<Vec<_>>(),
+        "by_user": s.by_user.iter().map(|t| serde_json::json!({"name": t.name, "docs": t.docs, "github": t.github, "sessions": t.sessions})).collect::<Vec<_>>(),
+        "newest_ts": s.newest_ts,
+        "last_indexed": s.last_indexed,
+        "last_tracked": s.last_tracked,
+        "autostart": s.autostart,
+        "stale": s.stale,
+    })
+    .to_string()
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────

@@ -10,16 +10,18 @@
 use crate::community::{louvain, modularity, Graph};
 use crate::store::EmbStore;
 use crate::{encode::Encoder, units};
-use anyhow::{anyhow, ensure, Result};
-use ndarray::Array2;
-use next_plaid::{IndexConfig, MmapIndex, SearchParameters, UpdateConfig};
+use anyhow::{ensure, Result};
+use ndarray::{s, Array2, Axis};
 use std::collections::HashMap;
 
 const K: usize = 6;
 const EVAL_K: usize = 16; // neighbors fetched for the quality eval (graph uses top-K)
 const FLOOR: f64 = 0.6; // keep a neighbor only if ≥60% of the best neighbor's score
 const MIN_CLUSTER: usize = 3;
-const INDEX_DIR: &str = "index/topics";
+/// Stage-1 candidates per unit for the exact-MaxSim re-rank. Pooled cosine is a
+/// high-recall filter on summary-length texts; 4×EVAL_K headroom keeps the true
+/// MaxSim top-EVAL_K inside the candidate set.
+const CANDIDATES: usize = 64;
 /// Louvain resolution scale. The base default was too coarse and produced
 /// incoherent grab-bags (the resolution limit fusing weakly-connected sub-themes);
 /// a finer resolution yields coherent topics. Calibrated against the anchor
@@ -28,7 +30,10 @@ const RES_SCALE: f64 = 2.5;
 
 pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let units = units::cluster_units()?;
-    ensure!(!units.is_empty(), "no unit summaries; run `summarize` first");
+    ensure!(
+        !units.is_empty(),
+        "no unit summaries yet — clustering groups units by their summaries.\nRun `synty summarize` first (or `synty build` for the whole pipeline)."
+    );
     let n = units.len();
     eprintln!("topics: clustering {n} units by summary embedding");
 
@@ -57,22 +62,9 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     }
     let emb: Vec<Array2<f32>> = emb.into_iter().map(|o| o.expect("every summary encoded")).collect();
 
-    // A small PLAID index over the summaries gives MaxSim kNN, same as `cluster`.
-    let _ = std::fs::remove_dir_all(INDEX_DIR);
-    std::fs::create_dir_all(INDEX_DIR)?;
-    let (idx, _) = MmapIndex::update_or_create_with_metadata(
-        &emb,
-        INDEX_DIR,
-        &IndexConfig::default(),
-        &UpdateConfig::default(),
-        None,
-    )
-    .map_err(|e| anyhow!("build summary index: {e}"))?;
-
-    // One kNN search feeds both the graph (top-K) and the quality eval (full).
-    let params = SearchParameters { top_k: EVAL_K + 1, n_full_scores: 256, n_ivf_probe: 4, ..Default::default() };
+    // One kNN pass feeds both the graph (top-K) and the quality eval (full).
     eprintln!("topics: kNN over {n} summaries");
-    let results = idx.search_batch(&emb, &params, true, None).map_err(|e| anyhow!("search: {e}"))?;
+    let results = maxsim_knn(&emb, EVAL_K);
 
     let edges = build_edges(&results);
     // Degree in the mutual-kNN graph: a unit with no edge is an outlier we abstain
@@ -195,7 +187,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
             assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "topic": stable_keys[*ci], "label": labels[*ci]}));
         }
     }
-    std::fs::write("unit_clusters.json", serde_json::to_string(&assign)?)?;
+    crate::write_atomic("unit_clusters.json", serde_json::to_string(&assign)?.as_bytes())?;
     eprintln!("topics: wrote unit_clusters.json");
     let qual = report_quality(&results, &of, &labels, &units);
     diag(&units, &results, &of, &labels);
@@ -229,10 +221,99 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     Ok(())
 }
 
+/// One unit's neighbor list, ids sorted by descending MaxSim score (self
+/// excluded). The substrate for the graph, reassignment, and quality metrics.
+pub(crate) struct Knn {
+    ids: Vec<usize>,
+    scores: Vec<f32>,
+}
+
+/// Exact MaxSim kNN in two stages: a mean-pooled, L2-normalized vector per unit
+/// ranks CANDIDATES by cosine (one blocked matmul), then true MaxSim re-scores
+/// only those candidates. This replaced a PLAID index + search_batch over the
+/// summaries that made a fresh cluster build search-bound; the scores the graph
+/// was calibrated on (exact MaxSim) are unchanged — only the candidate pruning
+/// is approximate, with 4×EVAL_K headroom.
+fn maxsim_knn(emb: &[Array2<f32>], k: usize) -> Vec<Knn> {
+    let n = emb.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let d = emb[0].ncols();
+    let mut pooled = Array2::<f32>::zeros((n, d));
+    for (i, e) in emb.iter().enumerate() {
+        if e.nrows() == 0 {
+            continue;
+        }
+        let m = e.mean_axis(Axis(0)).expect("non-empty rows");
+        let norm = m.dot(&m).sqrt();
+        if norm > 1e-6 {
+            pooled.row_mut(i).assign(&(&m / norm));
+        }
+    }
+
+    // Row-blocked so the cosine matrix never exceeds block×n, and threaded —
+    // each chunk of units is independent.
+    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(n);
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<Vec<Knn>> = std::thread::scope(|scope| {
+        let pooled = &pooled;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let (lo, hi) = (t * chunk, ((t + 1) * chunk).min(n));
+                    let mut part = Vec::with_capacity(hi.saturating_sub(lo));
+                    if lo >= hi {
+                        return part;
+                    }
+                    let sims = pooled.slice(s![lo..hi, ..]).dot(&pooled.t());
+                    for (bi, i) in (lo..hi).enumerate() {
+                        let row = sims.row(bi);
+                        let mut cand: Vec<usize> = (0..n).filter(|&j| j != i).collect();
+                        let c = CANDIDATES.min(cand.len());
+                        if c == 0 {
+                            part.push(Knn { ids: Vec::new(), scores: Vec::new() });
+                            continue;
+                        }
+                        if c < cand.len() {
+                            cand.select_nth_unstable_by(c - 1, |&a, &b| {
+                                row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            cand.truncate(c);
+                        }
+                        let mut scored: Vec<(usize, f32)> =
+                            cand.into_iter().map(|j| (j, maxsim(&emb[i], &emb[j]))).collect();
+                        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        scored.truncate(k);
+                        part.push(Knn {
+                            ids: scored.iter().map(|(j, _)| *j).collect(),
+                            scores: scored.iter().map(|(_, s)| *s).collect(),
+                        });
+                    }
+                    part
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("knn worker")).collect()
+    });
+    parts.into_iter().flatten().collect()
+}
+
+/// Late-interaction score: each query token's best doc-token dot, summed.
+fn maxsim(q: &Array2<f32>, doc: &Array2<f32>) -> f32 {
+    if q.nrows() == 0 || doc.nrows() == 0 {
+        return 0.0;
+    }
+    q.dot(&doc.t())
+        .axis_iter(Axis(0))
+        .map(|r| r.fold(f32::NEG_INFINITY, |m, &v| m.max(v)))
+        .sum()
+}
+
 /// Optional per-unit neighbor dump (`SYNTY_DIAG=<key substring>`): for each
 /// matching unit print its assigned cluster and its top MaxSim neighbors with
 /// scores and their clusters — to see *why* a unit landed where it did.
-fn diag(units: &[units::UnitClusterInput], results: &[next_plaid::QueryResult], of: &[Option<usize>], phrases: &[String]) {
+fn diag(units: &[units::UnitClusterInput], results: &[Knn], of: &[Option<usize>], phrases: &[String]) {
     let Ok(want) = std::env::var("SYNTY_DIAG") else { return };
     let label = |ci: Option<usize>| ci.map(|c| phrases.get(c).cloned().unwrap_or_default()).unwrap_or_else(|| "—".into());
     for (i, u) in units.iter().enumerate() {
@@ -242,7 +323,7 @@ fn diag(units: &[units::UnitClusterInput], results: &[next_plaid::QueryResult], 
         eprintln!("\ndiag {} → cluster {:?} [{}]", u.key, of[i], label(of[i]));
         eprintln!("  embed: {}", crate::excerpt(&u.embed, 160));
         eprintln!("  top MaxSim neighbors (score · cluster · key · embed):");
-        for (id, s) in results[i].passage_ids.iter().zip(results[i].scores.iter()).take(10) {
+        for (id, s) in results[i].ids.iter().zip(results[i].scores.iter()).take(10) {
             let j = *id as usize;
             if j == i {
                 continue;
@@ -272,14 +353,14 @@ fn snap_to_prs(of: &mut [Option<usize>], units: &[units::UnitClusterInput]) -> u
     snapped
 }
 
-fn build_edges(results: &[next_plaid::QueryResult]) -> HashMap<(usize, usize), f64> {
+fn build_edges(results: &[Knn]) -> HashMap<(usize, usize), f64> {
     let n = results.len();
     // Directed normalized weights + each unit's top-K neighbor set.
     let mut dir: HashMap<(usize, usize), f64> = HashMap::new();
     let mut topset: Vec<std::collections::HashSet<usize>> = vec![std::collections::HashSet::new(); n];
     for (i, r) in results.iter().enumerate() {
         let pairs: Vec<(usize, f32)> = r
-            .passage_ids
+            .ids
             .iter()
             .zip(r.scores.iter())
             .map(|(id, s)| (*id as usize, *s))
@@ -313,7 +394,7 @@ fn build_edges(results: &[next_plaid::QueryResult]) -> HashMap<(usize, usize), f
 /// Reassign outliers to their nearest cluster, iterating a few simultaneous
 /// passes so units left stranded when their neighbors move get cleaned up too.
 /// Capped, so it always terminates. Returns how many units ended up moved.
-fn reassign(results: &[next_plaid::QueryResult], of: &mut [Option<usize>], has_edge: &[bool]) -> usize {
+fn reassign(results: &[Knn], of: &mut [Option<usize>], has_edge: &[bool]) -> usize {
     let orig = of.to_vec();
     for _ in 0..5 {
         if reassign_once(results, of, has_edge) == 0 {
@@ -328,12 +409,12 @@ fn reassign(results: &[next_plaid::QueryResult], of: &mut [Option<usize>], has_e
 /// neighbor (degree 0), a genuine outlier we abstain on rather than force into a
 /// topic it doesn't belong to (precision over coverage). Decisions read the
 /// current assignment and apply at once. Returns how many changed.
-fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>], has_edge: &[bool]) -> usize {
+fn reassign_once(results: &[Knn], of: &mut [Option<usize>], has_edge: &[bool]) -> usize {
     let orig = of.to_vec();
     let mut moved = 0;
     for (i, r) in results.iter().enumerate() {
         let (mut a, mut b, mut other) = (0.0f32, 0.0f32, None);
-        for (id, s) in r.passage_ids.iter().zip(r.scores.iter()) {
+        for (id, s) in r.ids.iter().zip(r.scores.iter()) {
             let j = *id as usize;
             if j == i {
                 continue;
@@ -370,16 +451,16 @@ fn reassign_once(results: &[next_plaid::QueryResult], of: &mut [Option<usize>], 
 /// The cluster's medoid — the member best connected to its co-members (max summed
 /// same-cluster MaxSim). Its key seeds the cluster's stable id: a central member
 /// persists across re-clusterings even as the periphery shifts.
-fn medoid(members: &[usize], results: &[next_plaid::QueryResult], of: &[Option<usize>]) -> usize {
+fn medoid(members: &[usize], results: &[Knn], of: &[Option<usize>]) -> usize {
     *members
         .iter()
         .max_by(|&&a, &&b| same_cluster_score(a, results, of).partial_cmp(&same_cluster_score(b, results, of)).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(&members[0])
 }
 
-fn same_cluster_score(i: usize, results: &[next_plaid::QueryResult], of: &[Option<usize>]) -> f32 {
+fn same_cluster_score(i: usize, results: &[Knn], of: &[Option<usize>]) -> f32 {
     results[i]
-        .passage_ids
+        .ids
         .iter()
         .zip(results[i].scores.iter())
         .filter(|(id, _)| **id as usize != i && of[**id as usize] == of[i])
@@ -406,7 +487,7 @@ const QGATE: usize = 5;
 /// Min size for a cluster to appear in the lowest-cohesion debug.
 const COHERENCE_MIN: usize = 8;
 
-fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], labels: &[String], units: &[units::UnitClusterInput]) -> Quality {
+fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], units: &[units::UnitClusterInput]) -> Quality {
     let label = |ci: usize| labels.get(ci).cloned().unwrap_or_default();
     let mut by_a: HashMap<usize, Vec<f32>> = HashMap::new(); // ci -> each member's best same-cluster MaxSim
     let mut margins: Vec<(usize, usize, usize, f32)> = Vec::new(); // (unit, own ci, nearest other ci, a−b)
@@ -414,7 +495,7 @@ fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], lab
     for (i, r) in results.iter().enumerate() {
         let Some(ci) = of[i] else { continue };
         let (mut a, mut b, mut other, mut top1) = (None, None, ci, None);
-        for (id, s) in r.passage_ids.iter().zip(r.scores.iter()) {
+        for (id, s) in r.ids.iter().zip(r.scores.iter()) {
             let j = *id as usize;
             if j == i {
                 continue;
@@ -461,7 +542,7 @@ fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], lab
     for (i, r) in results.iter().enumerate() {
         let Some(ci) = of[i] else { continue };
         let mut votes: HashMap<usize, usize> = HashMap::new();
-        for id in &r.passage_ids {
+        for id in &r.ids {
             let j = *id as usize;
             if j != i {
                 if let Some(cj) = of[j] {
@@ -487,4 +568,59 @@ fn report_quality(results: &[next_plaid::QueryResult], of: &[Option<usize>], lab
         eprintln!("    c{ci} [ρ {r:.2}] n={sz} — {}", label(*ci));
     }
     Quality { misplaced, scored, cohesion_med, vote_disagree }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::arr2;
+
+    // Two tight groups of units: each unit's nearest neighbors must be its own
+    // group, scored by exact MaxSim, nearest first.
+    #[test]
+    fn knn_finds_the_group_neighbors() {
+        let a = arr2(&[[1.0, 0.0], [0.0, 1.0]]); // tokens on both axes
+        let a2 = arr2(&[[0.9, 0.1], [0.1, 0.9]]);
+        let b = arr2(&[[-1.0, 0.0], [0.0, -1.0]]);
+        let b2 = arr2(&[[-0.9, -0.1], [-0.1, -0.9]]);
+        let knn = maxsim_knn(&[a, a2, b, b2], 2);
+        assert_eq!(knn.len(), 4);
+        assert_eq!(knn[0].ids[0], 1, "unit 0's nearest is its twin");
+        assert_eq!(knn[2].ids[0], 3, "unit 2's nearest is its twin");
+        assert!(knn[0].scores[0] > knn[0].scores[1]);
+    }
+
+    // The pooled-candidate stage must not change the result when the candidate
+    // set covers everything: two-stage kNN == brute-force MaxSim ranking.
+    #[test]
+    fn two_stage_matches_brute_force_maxsim() {
+        // Deterministic pseudo-random token matrices (no RNG in tests).
+        let units: Vec<Array2<f32>> = (0..30)
+            .map(|u| {
+                Array2::from_shape_fn((3 + u % 4, 8), |(r, c)| {
+                    let x = ((u * 31 + r * 7 + c * 13) % 17) as f32 / 17.0 - 0.5;
+                    x
+                })
+            })
+            .collect();
+        let knn = maxsim_knn(&units, 5);
+        for i in 0..units.len() {
+            let mut brute: Vec<(usize, f32)> = (0..units.len())
+                .filter(|&j| j != i)
+                .map(|j| (j, maxsim(&units[i], &units[j])))
+                .collect();
+            brute.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let want: Vec<usize> = brute.iter().take(5).map(|(j, _)| *j).collect();
+            assert_eq!(knn[i].ids, want, "unit {i} neighbor ranking diverged");
+        }
+    }
+
+    // maxsim: per query token, best doc-token dot, summed.
+    #[test]
+    fn maxsim_is_sum_of_per_token_best() {
+        let q = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
+        let d = arr2(&[[0.8, 0.0], [0.0, 0.5]]);
+        assert!((maxsim(&q, &d) - 1.3).abs() < 1e-6);
+        assert_eq!(maxsim(&q, &Array2::zeros((0, 2))), 0.0);
+    }
 }

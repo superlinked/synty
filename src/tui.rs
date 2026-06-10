@@ -118,6 +118,54 @@ struct App {
     qtx: Option<Sender<String>>,
     rrx: Option<Receiver<SearchMsg>>,
     quit: bool,
+    cache: ViewCache,
+}
+
+/// Derived view data computed once at load: the TUI redraws several times a
+/// second, and these depend only on `topics`/`work`, which never change after
+/// load — recomputing facet tallies and parsing unit dates per frame is what
+/// made large corpora scroll sluggishly.
+#[derive(Default)]
+struct ViewCache {
+    repo_facets: Vec<String>,
+    acct_facets: Vec<String>,
+    repo_counts: HashMap<String, usize>,
+    acct_counts: HashMap<String, usize>,
+    /// Per topic, the day_num of each unit (parallel to `topics`).
+    topic_days: Vec<Vec<i32>>,
+}
+
+impl ViewCache {
+    fn build(topics: &[TopicUnits], work: &[Unit]) -> Self {
+        let facet = |repo: bool| {
+            let mut ct: HashMap<&str, usize> = HashMap::new();
+            for t in topics {
+                for n in if repo { &t.repos } else { &t.authors } {
+                    *ct.entry(n.as_str()).or_default() += 1;
+                }
+            }
+            let mut v: Vec<(&str, usize)> = ct.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            v.into_iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>()
+        };
+        let counts = |repo: bool| {
+            let mut ct: HashMap<String, usize> = HashMap::new();
+            for u in work {
+                *ct.entry(if repo { u.repo.clone() } else { u.author.clone() }).or_default() += 1;
+            }
+            ct
+        };
+        Self {
+            repo_facets: facet(true),
+            acct_facets: facet(false),
+            repo_counts: counts(true),
+            acct_counts: counts(false),
+            topic_days: topics
+                .iter()
+                .map(|t| t.units.iter().filter_map(|u| day_num(&u.when)).collect())
+                .collect(),
+        }
+    }
 }
 
 pub fn run(model_id: String) -> Result<()> {
@@ -189,9 +237,12 @@ impl App {
             last_indexed: None,
             last_tracked: None,
             autostart: false,
+            stale: false,
         });
         let (qtx, rrx) = spawn_search(model_id);
+        let cache = ViewCache::build(&topics, &work);
         Self {
+            cache,
             docs,
             doc_by_id,
             sessions,
@@ -272,17 +323,9 @@ impl App {
     }
 
     /// Distinct repos (`repo=true`) or people across topics, most-covered first —
-    /// the order `r`/`p` cycle through.
-    fn facet_names(&self, repo: bool) -> Vec<String> {
-        let mut ct: HashMap<&str, usize> = HashMap::new();
-        for t in &self.topics {
-            for n in if repo { &t.repos } else { &t.authors } {
-                *ct.entry(n.as_str()).or_default() += 1;
-            }
-        }
-        let mut v: Vec<(&str, usize)> = ct.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        v.into_iter().map(|(n, _)| n.to_string()).collect()
+    /// the order `r`/`p` cycle through (precomputed; see ViewCache).
+    fn facet_names(&self, repo: bool) -> &[String] {
+        if repo { &self.cache.repo_facets } else { &self.cache.acct_facets }
     }
 
     /// Step the repo (or person) filter to its next value, wrapping past the end
@@ -331,10 +374,7 @@ impl App {
         }
         // Unit count per facet (how active each one is), from the Work units the
         // filter would select — rendered as name(n), like the Topics UNITS column.
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for u in &self.work {
-            *counts.entry(if repo { u.repo.as_str() } else { u.author.as_str() }).or_default() += 1;
-        }
+        let counts = if repo { &self.cache.repo_counts } else { &self.cache.acct_counts };
         let chips: Vec<String> = names.iter().map(|n| format!("{n}({})", counts.get(n.as_str()).copied().unwrap_or(0))).collect();
         let active = self.filter.as_ref().filter(|f| f.is_repo() == repo).and_then(|f| names.iter().position(|n| n == f.name()));
         // Fit a window of chips that contains the active one, expanding outward.
@@ -690,9 +730,9 @@ impl App {
                 // Per-day activity over the last 4 calendar weeks (Mon-aligned),
                 // shaded on a shared scale; the header labels each week's Monday.
                 let vis = self.visible();
-                let gmax = vis.iter().flat_map(|&i| &self.topics[i].units).filter_map(|u| day_num(&u.when)).max().unwrap_or(0);
+                let gmax = vis.iter().flat_map(|&i| &self.cache.topic_days[i]).copied().max().unwrap_or(0);
                 let start = week_start(gmax);
-                let dailies: Vec<[u64; TL_DAYS]> = vis.iter().map(|&i| daily(&self.topics[i], start)).collect();
+                let dailies: Vec<[u64; TL_DAYS]> = vis.iter().map(|&i| daily(&self.cache.topic_days[i], start)).collect();
                 let cap = dailies.iter().flat_map(|d| d.iter().copied()).max().unwrap_or(0);
                 let repo_active = self.filter.as_ref().filter(|f| f.is_repo()).map(|f| f.name());
                 let person_active = self.filter.as_ref().filter(|f| !f.is_repo()).map(|f| f.name());
@@ -874,15 +914,22 @@ impl App {
                 strong(s.sessions, theme::SESSION),
                 Span::styled(" sessions", dim),
             ]),
-            Line::from(Span::styled(
-                format!(
-                    "newest {} · indexed {} · tracked {}",
-                    if s.newest_ts.is_empty() { "—" } else { &s.newest_ts },
-                    s.last_indexed.as_deref().unwrap_or("never"),
-                    s.last_tracked.as_deref().unwrap_or("never"),
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "newest {} · indexed {} · tracked {}",
+                        if s.newest_ts.is_empty() { "—" } else { &s.newest_ts },
+                        s.last_indexed.as_deref().unwrap_or("never"),
+                        s.last_tracked.as_deref().unwrap_or("never"),
+                    ),
+                    dim,
                 ),
-                dim,
-            )),
+                if s.stale {
+                    Span::styled("  ⚠ stale — events newer than index", Style::new().fg(theme::CLOSED).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::raw("")
+                },
+            ]),
             Line::from(vec![
                 Span::styled("autostart  ", dim),
                 if self.autostart {
@@ -1044,16 +1091,15 @@ fn week_header(start: i32, gmax: i32) -> String {
     format!("{:<8}{:<8}{:<8}{:<7}", label(0), label(1), label(2), label(3))
 }
 
-/// A topic's per-day unit counts over the four calendar weeks beginning at
-/// `start` (num_days_from_ce of the oldest Monday), oldest day first.
-fn daily(t: &TopicUnits, start: i32) -> [u64; TL_DAYS] {
+/// A topic's per-day unit counts (from its precomputed day numbers) over the
+/// four calendar weeks beginning at `start` (num_days_from_ce of the oldest
+/// Monday), oldest day first.
+fn daily(days: &[i32], start: i32) -> [u64; TL_DAYS] {
     let mut d = [0u64; TL_DAYS];
-    for u in &t.units {
-        if let Some(day) = day_num(&u.when) {
-            let off = day - start;
-            if (0..TL_DAYS as i32).contains(&off) {
-                d[off as usize] += 1;
-            }
+    for &day in days {
+        let off = day - start;
+        if (0..TL_DAYS as i32).contains(&off) {
+            d[off as usize] += 1;
         }
     }
     d
@@ -1206,6 +1252,7 @@ mod tests {
             topic: Some(0),
             struggle: 0.6,
             summary: Some("Added an OCR adapter to the sie pipeline.".into()),
+            author: String::new(),
         };
         let work = vec![
             Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), struggle: 0.6, author: String::new(), doc_id: None, session_id: Some("S1".into()) },
@@ -1213,13 +1260,14 @@ mod tests {
         ];
         let topics = vec![TopicUnits { id: 0, cache_key: "t0".into(), label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()), name: Some("OCR & Document Extraction".into()), span: Some(("2026-05-29".into(), "2026-05-31".into())) }];
         App {
+            cache: ViewCache::build(&topics, &work),
             docs,
             doc_by_id,
             sess_by_id: [("S1".to_string(), 0)].into_iter().collect(),
             sessions: vec![session],
             work,
             topics,
-            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false },
+            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false },
             view: View::Topics,
             sel: 0,
             drill_topic: None,
@@ -1258,6 +1306,7 @@ mod tests {
             name: Some("Infra & Terraform".into()),
             span: Some(("2026-05-28".into(), "2026-05-30".into())),
         });
+        a.cache = ViewCache::build(&a.topics, &a.work);
         a
     }
 

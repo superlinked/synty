@@ -29,6 +29,9 @@ pub struct Session {
     pub topic: Option<i64>,
     pub struggle: f32, // 0..1, normalized across sessions
     pub summary: Option<String>, // abstractive one-liner (local LLM), if cached
+    /// The actor the tracker stamped on session_start; empty for sessions
+    /// tracked before stamping (callers fall back to the local actor).
+    pub author: String,
 }
 
 /// A session's cached LLM summary, keyed by a hash of its inputs so the
@@ -41,11 +44,17 @@ pub struct CachedSummary {
 
 pub type SummaryCache = HashMap<String, CachedSummary>;
 
-const SUMMARIES_PATH: &str = "index/summaries.json";
+/// The cache lives under .synty/, NOT index/ — a full index rebuild wipes
+/// index/, and hours of local-LLM summarization must survive that.
+const SUMMARIES_PATH: &str = ".synty/summaries.json";
+const SUMMARIES_PATH_LEGACY: &str = "index/summaries.json";
 
 /// Read the on-disk summary cache (empty if the summarizer hasn't run).
+/// Falls back to the pre-relocation path so existing caches migrate on the
+/// next `save_summary_cache`.
 pub fn load_summary_cache() -> SummaryCache {
     std::fs::read_to_string(SUMMARIES_PATH)
+        .or_else(|_| std::fs::read_to_string(SUMMARIES_PATH_LEGACY))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -56,7 +65,7 @@ pub fn save_summary_cache(c: &SummaryCache) -> Result<()> {
     if let Some(parent) = Path::new(SUMMARIES_PATH).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(SUMMARIES_PATH, serde_json::to_string_pretty(c)?)?;
+    crate::write_atomic(SUMMARIES_PATH, serde_json::to_string_pretty(c)?.as_bytes())?;
     Ok(())
 }
 
@@ -135,6 +144,7 @@ pub fn topic_name_key(key: &str) -> String {
 #[derive(Default)]
 struct Agg {
     repo: String,
+    actor: String,
     first: String,
     last: String,
     ask: String,
@@ -178,6 +188,9 @@ fn aggregate() -> HashMap<String, Agg> {
                 "session_start" => {
                     if let Some(cwd) = ev["payload"]["cwd"].as_str() {
                         a.repo = resolve_repo(cwd, &known);
+                    }
+                    if let Some(actor) = ev["payload"]["actor"].as_str() {
+                        a.actor = actor.to_string();
                     }
                 }
                 "user_prompt" => {
@@ -266,6 +279,7 @@ pub fn sessions() -> Result<Vec<Session>> {
                 topic: topic_of.get(id).map(|(c, _, _)| *c),
                 struggle: scores[i],
                 summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
+                author: a.actor.clone(),
             }
         })
         .collect();
@@ -275,10 +289,10 @@ pub fn sessions() -> Result<Vec<Session>> {
 
 /// All work units (sessions + PRs + issues), newest first.
 pub fn units() -> Result<Vec<Unit>> {
-    // Sessions on this machine are this person's; attribute them to the same
-    // actor `ingest` stamps on session docs, so an all-sessions topic still
-    // shows an account (and merges with that person's PRs).
-    let actor = crate::identity::actor();
+    // Sessions carry the actor their tracker stamped on session_start (so a
+    // fleet build credits each author); pre-stamp sessions fall back to this
+    // machine's actor, matching what `ingest` stamps on session docs.
+    let local_actor = crate::identity::actor();
     let mut out: Vec<Unit> = sessions()?
         .into_iter()
         .map(|s| Unit {
@@ -290,7 +304,7 @@ pub fn units() -> Result<Vec<Unit>> {
             summary: s.summary.clone(),
             topic: s.topic,
             struggle: s.struggle,
-            author: actor.clone(),
+            author: if s.author.is_empty() { local_actor.clone() } else { s.author.clone() },
             doc_id: None,
             session_id: Some(s.id),
         })

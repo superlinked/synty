@@ -103,8 +103,11 @@ runs on CI or a server without a developer machine.
 - **TUI (humans):** `synty tui` — tabs for status, topics, recent, and search,
   with browse/drill (topic → members → full document), reusing the CLI's
   view-models. *Built.*
-- **MCP server (optional):** expose `synty_search / synty_topic / synty_session`
-  as agent tools. *Deferred to future work (after the milestones).*
+- **MCP server:** `synty mcp` serves `synty_search / synty_topics /
+  synty_recent / synty_status` as agent tools over stdio (hand-rolled JSON-RPC,
+  no new deps), so a coding agent consults past work mid-session. *Built.*
+- **JSON output:** `--json` on `search / topic / recent / status` for scripts.
+  *Built.*
 - **Team web frontend (optional):** the same view models served over HTTP for a
   shared bucket. *Planned.*
 

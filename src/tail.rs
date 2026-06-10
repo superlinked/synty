@@ -28,7 +28,10 @@ pub trait Source {
     /// Scan the head of a file and return its version stamp, or "" if unknown.
     fn detect_version(&self, head: &[u8]) -> String;
     /// Build a stateful parser for `version`, or None → format_unknown (skip).
-    fn new_parser(&self, version: &str) -> Option<Box<dyn FileParser>>;
+    /// `head` is the same file prefix `detect_version` saw; parsers whose
+    /// per-file state comes from the first lines (codex's session id) reseed
+    /// from it, so a cursor resume mid-file doesn't lose that state.
+    fn new_parser(&self, version: &str, head: &[u8]) -> Option<Box<dyn FileParser>>;
 }
 
 /// Parses one JSONL line into zero or more envelopes, owning whatever per-file
@@ -91,6 +94,19 @@ impl<'a> EmitCtx<'a> {
         self.fallback_ms
     }
 
+    /// The byte offset of the line currently being parsed (for parsers that
+    /// buffer lines to replay later).
+    pub fn line_offset(&self) -> i64 {
+        self.line_offset
+    }
+
+    /// Re-point minting at a buffered line's offset (resetting the sub-index),
+    /// so a replayed line mints the same deterministic ids it would have live.
+    pub fn replay_at(&mut self, offset: i64) {
+        self.line_offset = offset;
+        self.sub_index = 0;
+    }
+
     /// Mint an envelope. `ts_ms` and `ts` come from `resolve_ts`.
     pub fn event(&mut self, ts_ms: i64, ts: &str, kind: &str, session_id: &str, payload: Value) -> Event {
         let event_id = self.new_id(ts_ms);
@@ -135,8 +151,9 @@ pub fn ms_to_rfc3339(ms: i64) -> String {
 
 /// Drive a parser over a buffer of complete JSONL lines starting at byte
 /// `start_offset`, collecting all emitted events. Empty lines advance the
-/// offset without parsing; a malformed line is skipped. Returns (events,
-/// bytes_consumed).
+/// offset without parsing; a malformed line is skipped and counted, so format
+/// drift surfaces in metrics instead of silently thinning the data. Returns
+/// (events, bytes_consumed, lines_skipped).
 pub fn drive(
     parser: &mut dyn FileParser,
     content: &[u8],
@@ -144,9 +161,10 @@ pub fn drive(
     start_offset: i64,
     fallback_ms: i64,
     ec: &mut EmitCtx,
-) -> (Vec<Event>, i64) {
+) -> (Vec<Event>, i64, usize) {
     let mut out = Vec::new();
     let mut offset = start_offset;
+    let mut skipped = 0usize;
     for raw in split_after_newline(content) {
         let line = trim_newline(raw);
         if line.is_empty() {
@@ -155,11 +173,12 @@ pub fn drive(
         }
         ec.prepare_line(file, offset, fallback_ms);
         offset += raw.len() as i64;
-        if let Ok(evts) = parser.parse_line(line, ec) {
-            out.extend(evts);
+        match parser.parse_line(line, ec) {
+            Ok(evts) => out.extend(evts),
+            Err(_) => skipped += 1,
         }
     }
-    (out, offset - start_offset)
+    (out, offset - start_offset, skipped)
 }
 
 fn split_after_newline(b: &[u8]) -> Vec<&[u8]> {

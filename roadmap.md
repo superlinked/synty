@@ -37,4 +37,4 @@ ordered; each lists its projects as one-liners. Design detail lives in
 - Install one-liner; license; public docs; OSS release.
 
 ## Future work (after the milestones)
-- MCP server exposing `synty_search / synty_topic / synty_session` as agent tools over stdio.
+- ~~MCP server exposing agent tools over stdio~~ — done (`synty mcp`: synty_search / synty_topics / synty_recent / synty_status).

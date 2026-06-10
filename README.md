@@ -66,9 +66,24 @@ cargo run --release -- recent           # latest PRs, issues, and prompts
 cargo run --release -- status           # what's indexed and how fresh it is
 ```
 
-### Or run the steps yourself
+`search`, `topic`, `recent`, and `status` all take `--json` for scripts. For
+coding agents there's an MCP server — add it to the agent's MCP config and it
+gets `synty_search` / `synty_topics` / `synty_recent` / `synty_status` as tools:
 
-`up` is just a loop over these (handy for one-off use or scripting):
+```sh
+cargo run --release -- mcp              # MCP over stdio
+```
+
+### Or run the pipeline yourself
+
+`build` runs the whole pipeline once (track → ingest → index → summarize →
+cluster → topic summaries), so `topic` and the TUI are fully populated:
+
+```sh
+cargo run --release -- build
+```
+
+The individual steps, for scripting (and what `up` loops over):
 
 ```sh
 cargo run --release -- track     # tail agent sessions → canonical event envelopes

@@ -25,6 +25,11 @@ pub struct Config {
     /// session's worktree dir (`sie-web-backbutton`) to its repo (`sie-web`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<String>,
+    /// Recency cap on the indexed corpus (docs). Oldest docs beyond it are
+    /// dropped from the index — a memory tool should be loud about forgetting,
+    /// so `ingest` warns whenever the cap actually bites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_docs: Option<usize>,
 }
 
 pub fn load() -> Config {

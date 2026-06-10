@@ -21,9 +21,12 @@ pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
     Ok(Some(ids))
 }
 
-pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str, bucket: &str) -> Result<()> {
+pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str, bucket: &str, json: bool) -> Result<()> {
     if crate::sync::pull_if_stale(bucket, INDEX_PATH, DOCS_PATH).unwrap_or(false) {
         eprintln!("pulled published index from {bucket}/index/");
+    }
+    if let Some(note) = crate::view::stale_note() {
+        eprintln!("{note}");
     }
     let docs = load_docs(DOCS_PATH)?;
     let idx = MmapIndex::load(INDEX_PATH)
@@ -35,8 +38,38 @@ pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str, bucket: 
     let res = idx
         .search(&q, &params, subset.as_deref())
         .map_err(|e| anyhow!("search: {e}"))?;
-    print!("{}", render(&docs, query, filter, &res));
+    if json {
+        println!("{}", render_json(&docs, &res));
+    } else {
+        print!("{}", render(&docs, query, filter, &res));
+    }
     Ok(())
+}
+
+/// Results as a JSON array (`--json`), for scripts and agents.
+pub fn render_json(docs: &[Doc], res: &QueryResult) -> String {
+    let arr: Vec<serde_json::Value> = res
+        .passage_ids
+        .iter()
+        .zip(res.scores.iter())
+        .filter_map(|(id, score)| {
+            let d = docs.get(*id as usize)?;
+            Some(serde_json::json!({
+                "score": score,
+                "id": d.id,
+                "kind": d.meta.kind,
+                "repo": d.meta.repo,
+                "author": d.meta.author,
+                "session_id": d.meta.session_id,
+                "ts": d.meta.ts,
+                "number": d.meta.number,
+                "url": d.meta.url,
+                "state": d.meta.state,
+                "text": excerpt(&d.text, 400),
+            }))
+        })
+        .collect();
+    serde_json::Value::Array(arr).to_string()
 }
 
 /// Render a result set as Markdown. Shared with the eval harness.

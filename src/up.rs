@@ -36,6 +36,25 @@ pub fn run(bucket: &str, machine: &str, poll_secs: u64, github: bool) -> Result<
     }
 }
 
+/// `synty build` — the whole pipeline, once: track + ingest + index (what `up`
+/// loops), then unit summaries → cluster → topic summaries, so `topic`/`tui`
+/// are fully populated without knowing the step order.
+pub fn build(bucket: &str, machine: &str, resolution: f64) -> Result<()> {
+    tick(bucket, machine, 60)?;
+    #[cfg(feature = "llm")]
+    if let Err(e) = crate::qwen::summarize_all() {
+        eprintln!("build: unit summaries skipped ({e})");
+    }
+    crate::topics::run(resolution, &crate::model_id(), bucket)?;
+    // Second summary pass: the topic reduce consumes the clusters just written.
+    #[cfg(feature = "llm")]
+    if let Err(e) = crate::qwen::summarize_all() {
+        eprintln!("build: topic summaries skipped ({e})");
+    }
+    eprintln!("build: done — try `synty topic`, `synty search \"…\"`, or `synty tui`");
+    Ok(())
+}
+
 fn tick(bucket: &str, machine: &str, poll_secs: u64) -> Result<()> {
     track::run(track::Opts {
         which: "all".into(),

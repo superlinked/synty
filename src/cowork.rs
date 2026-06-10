@@ -46,7 +46,7 @@ impl Source for Cowork {
         }
         String::new()
     }
-    fn new_parser(&self, version: &str) -> Option<Box<dyn FileParser>> {
+    fn new_parser(&self, version: &str, _head: &[u8]) -> Option<Box<dyn FileParser>> {
         (version == "v1").then(|| Box::new(CoworkParser::default()) as Box<dyn FileParser>)
     }
 }
@@ -55,7 +55,9 @@ impl Source for Cowork {
 struct CoworkParser {
     real: HashSet<String>,
     dropped: HashSet<String>,
-    prelude: HashMap<String, usize>,
+    /// Lifecycle lines (offset, raw bytes) held back per session until a real
+    /// record proves it's a conversation; replayed then, discarded at the cap.
+    prelude: HashMap<String, Vec<(i64, Vec<u8>)>>,
 }
 
 // String fields use the null-tolerant deserializer: cowork records carry
@@ -108,30 +110,42 @@ impl FileParser for CoworkParser {
         let sid = &r.session_id;
         let is_real = r.rtype == "user" || r.rtype == "assistant";
 
-        // Drop lifecycle preludes of sessions that never produce a real record.
+        // Buffer lifecycle preludes until the session proves real; a session
+        // that overflows the cap without a real record is a heartbeat — drop it.
         if !is_real && !sid.is_empty() {
             if self.dropped.contains(sid) {
                 return Ok(vec![]);
             }
             if !self.real.contains(sid) {
-                let c = self.prelude.entry(sid.clone()).or_insert(0);
-                *c += 1;
-                if *c > HEARTBEAT_CAP {
+                let buf = self.prelude.entry(sid.clone()).or_default();
+                buf.push((ec.line_offset(), line.to_vec()));
+                if buf.len() > HEARTBEAT_CAP {
                     self.dropped.insert(sid.clone());
                     self.prelude.remove(sid);
                 }
                 return Ok(vec![]);
             }
         }
+        // First real record: replay the held-back prelude at its original
+        // offsets (same deterministic ids as a live emit), then continue.
+        let mut out = Vec::new();
         if is_real && !sid.is_empty() {
             self.real.insert(sid.clone());
-            self.prelude.remove(sid);
             self.dropped.remove(sid);
+            if let Some(buf) = self.prelude.remove(sid) {
+                let cur = ec.line_offset();
+                for (off, l) in buf {
+                    ec.replay_at(off);
+                    if let Ok(evts) = self.parse_line(&l, ec) {
+                        out.extend(evts);
+                    }
+                }
+                ec.replay_at(cur);
+            }
         }
 
         let raw_ts = if r.audit_timestamp.is_empty() { &r.timestamp } else { &r.audit_timestamp };
         let (ts_ms, ts) = resolve_ts(raw_ts, ec.fallback_ms());
-        let mut out = Vec::new();
 
         if !sid.is_empty() && ec.first_seen(sid) {
             out.push(ec.event(
@@ -215,7 +229,7 @@ mod tests {
 
     fn run(lines: &str) -> Vec<Event> {
         let src = Cowork;
-        let mut parser = src.new_parser("v1").expect("parser");
+        let mut parser = src.new_parser("v1", b"").expect("parser");
         let mut seq = Sequencer::new();
         let mut started = HashSet::new();
         let mut ec = EmitCtx::new("edge-x-cowork".into(), &src, &mut seq, &mut started);
@@ -227,7 +241,7 @@ mod tests {
         assert_eq!(Cowork.detect_version(br#"{"type":"system","_audit_hmac":"abc123"}"#), "v1");
         // No _audit_hmac (e.g. an inner Claude Code file) → not cowork, skip.
         assert_eq!(Cowork.detect_version(br#"{"type":"user","sessionId":"x"}"#), "");
-        assert!(Cowork.new_parser("").is_none());
+        assert!(Cowork.new_parser("", b"").is_none());
     }
 
     // A real user turn yields session_start + user_prompt, and the envelope
@@ -268,15 +282,40 @@ mod tests {
     }
 
     // A real record rescues a session whose prelude was still under the cap:
-    // the prelude is abandoned but the conversation flows.
+    // the held-back prelude replays (it carries cwd/model context), then the
+    // conversation flows.
     #[test]
-    fn real_record_after_short_prelude_flows() {
+    fn real_record_after_short_prelude_replays_it() {
         let evts = run(&[
-            r#"{"type":"system","subtype":"init","session_id":"S2","_audit_hmac":"h"}"#,
+            r#"{"type":"system","subtype":"init","session_id":"S2","_audit_hmac":"h","cwd":"/c/proj"}"#,
             r#"{"type":"user","session_id":"S2","_audit_hmac":"h","message":{"content":"real work"}}"#,
         ].join("\n"));
-        // prelude system record abandoned; session_start + user_prompt present
-        assert!(evts.iter().any(|e| e.kind == "session_start"));
+        assert_eq!(evts[0].kind, "session_start");
+        let init = evts.iter().find(|e| e.payload.get("subtype").and_then(|v| v.as_str()) == Some("cowork_init")).expect("replayed prelude");
+        assert_eq!(init.payload["cwd"], "/c/proj");
         assert!(evts.iter().any(|e| e.kind == "user_prompt" && e.payload["text"] == "real work"));
+    }
+
+    // Replayed prelude lines mint the same deterministic ids they would have
+    // live: parsing the same file in one pass and with the user line arriving
+    // later must produce identical event ids.
+    #[test]
+    fn replayed_prelude_ids_are_deterministic() {
+        let l1 = r#"{"type":"system","subtype":"init","session_id":"S3","_audit_hmac":"h"}"#;
+        let l2 = r#"{"type":"user","session_id":"S3","_audit_hmac":"h","message":{"content":"go"}}"#;
+        let one_pass = run(&format!("{l1}\n{l2}"));
+
+        // Two drives over the same file: the prelude alone, then the user line.
+        let src = Cowork;
+        let mut parser = src.new_parser("v1", b"").expect("parser");
+        let mut seq = Sequencer::new();
+        let mut started = HashSet::new();
+        let mut ec = EmitCtx::new("edge-x-cowork".into(), &src, &mut seq, &mut started);
+        let (first, consumed, _) = drive(&mut *parser, format!("{l1}\n").as_bytes(), "audit.jsonl", 0, 1_700_000_000_000, &mut ec);
+        assert!(first.is_empty(), "prelude held back");
+        let (second, _, _) = drive(&mut *parser, format!("{l2}\n").as_bytes(), "audit.jsonl", consumed, 1_700_000_000_000, &mut ec);
+
+        let ids = |evts: &[Event]| evts.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&one_pass), ids(&second));
     }
 }

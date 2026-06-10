@@ -39,7 +39,7 @@ impl Source for ClaudeCode {
         }
         String::new()
     }
-    fn new_parser(&self, version: &str) -> Option<Box<dyn FileParser>> {
+    fn new_parser(&self, version: &str, _head: &[u8]) -> Option<Box<dyn FileParser>> {
         if version.starts_with("2.1.") || version == "2.1" {
             Some(Box::new(ParserV21::default()))
         } else {
@@ -229,7 +229,7 @@ mod tests {
 
     fn run(lines: &str) -> Vec<Event> {
         let src = ClaudeCode;
-        let mut parser = src.new_parser("2.1.119").expect("parser");
+        let mut parser = src.new_parser("2.1.119", b"").expect("parser");
         let mut seq = Sequencer::new();
         let mut started = HashSet::new();
         let mut ec = EmitCtx::new("edge-x-claudecode".into(), &src, &mut seq, &mut started);
@@ -240,8 +240,8 @@ mod tests {
     fn version_detection_skips_stub_first_line() {
         let head = b"{\"type\":\"permission-mode\",\"permissionMode\":\"default\"}\n{\"type\":\"user\",\"version\":\"2.1.119\"}";
         assert_eq!(ClaudeCode.detect_version(head), "2.1.119");
-        assert!(ClaudeCode.new_parser("2.1.119").is_some());
-        assert!(ClaudeCode.new_parser("1.0.0").is_none());
+        assert!(ClaudeCode.new_parser("2.1.119", b"").is_some());
+        assert!(ClaudeCode.new_parser("1.0.0", b"").is_none());
     }
 
     #[test]

@@ -26,7 +26,8 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str, bucket: &str) -> R
 
     // Unchanged corpus → the local index already matches; skip the rebuild but
     // still ensure the bucket has it (publish is a no-op if already current).
-    if load_manifest(path).as_deref() == Some(hashes.as_slice()) && MmapIndex::load(index_path).is_ok() {
+    let prev = load_manifest(path);
+    if prev.as_deref() == Some(hashes.as_slice()) && MmapIndex::load(index_path).is_ok() {
         eprintln!("index up to date ({} docs, corpus unchanged)", docs.len());
         let published = crate::sync::publish(bucket, index_path, docs_path)?;
         if published > 0 {
@@ -35,17 +36,36 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str, bucket: &str) -> R
         return Ok(());
     }
 
+    // docs.jsonl is oldest-first, so new work extends the tail: when the
+    // previous build is a strict prefix, append only the tail to the existing
+    // index. Anything else (recency-cap drop, edited history) → full rebuild.
+    let start = match &prev {
+        Some(p)
+            if p.len() < hashes.len()
+                && p[..] == hashes[..p.len()]
+                && MmapIndex::load(index_path).is_ok() =>
+        {
+            p.len()
+        }
+        _ => {
+            let _ = std::fs::remove_dir_all(path);
+            std::fs::create_dir_all(path)?;
+            0
+        }
+    };
+
     // Pull every known embedding from the store; encode only the rest.
     let store = EmbStore::open(bucket)?;
-    let mut embeddings: Vec<Option<Array2<f32>>> = vec![None; texts.len()];
+    let n_new = texts.len() - start;
+    let mut embeddings: Vec<Option<Array2<f32>>> = vec![None; n_new];
     let mut miss: Vec<usize> = Vec::new();
-    for i in 0..texts.len() {
+    for i in start..texts.len() {
         match store.get(hashes[i])? {
-            Some(e) => embeddings[i] = Some(e),
+            Some(e) => embeddings[i - start] = Some(e),
             None => miss.push(i),
         }
     }
-    let reused = texts.len() - miss.len();
+    let reused = n_new - miss.len();
 
     let t0 = Instant::now();
     if miss.is_empty() {
@@ -59,7 +79,7 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str, bucket: &str) -> R
             let chunk_texts: Vec<String> = chunk.iter().map(|&i| texts[i].clone()).collect();
             for (&i, e) in chunk.iter().zip(enc.encode_docs(&chunk_texts)?) {
                 store.put(hashes[i], &e)?; // share to the fleet
-                embeddings[i] = Some(e);
+                embeddings[i - start] = Some(e);
             }
             done += chunk.len();
             eprint!("\rencoded {done}/{}", miss.len());
@@ -69,23 +89,20 @@ pub fn run(docs_path: &str, index_path: &str, model_id: &str, bucket: &str) -> R
     let embeddings: Vec<Array2<f32>> =
         embeddings.into_iter().map(|o| o.expect("every doc filled")).collect();
 
-    let _ = std::fs::remove_dir_all(path);
-    std::fs::create_dir_all(path)?;
-
+    if start > 0 {
+        eprintln!("index: appending {n_new} new docs ({start} already indexed)");
+    }
     let t1 = Instant::now();
     let (idx, _ids) = MmapIndex::update_or_create_with_metadata(
         &embeddings,
         index_path,
         &IndexConfig::default(),
         &UpdateConfig::default(),
-        Some(&metas),
+        Some(&metas[start..]),
     )
     .context("build next-plaid index")?;
 
-    // embeddings.npy feeds `cluster`; doc_hashes.json is the build manifest the
-    // fast-path above reads.
-    next_plaid::update::save_embeddings_npy(path, &embeddings)
-        .map_err(|e| anyhow::anyhow!("save embeddings: {e}"))?;
+    // doc_hashes.json is the build manifest the fast/append paths above read.
     std::fs::write(path.join("doc_hashes.json"), serde_json::to_string(&hashes)?)?;
 
     eprintln!(
