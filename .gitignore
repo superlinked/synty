@@ -29,3 +29,4 @@ tmp/
 
 # corpus-specific eval gold set (per-machine)
 eval_queries.json
+.*.swp
