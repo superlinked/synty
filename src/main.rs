@@ -167,7 +167,7 @@ enum Cmd {
     },
     /// Cluster units (sessions, PRs, issues) by their summary embedding (MaxSim
     /// kNN + Louvain) into topics. --resolution >1 yields more/smaller topics.
-    /// Run `summarize` first. Writes unit_clusters.json.
+    /// Run `summarize` first. Writes the clusters into the current build.
     Cluster {
         #[arg(long, default_value_t = 1.0)]
         resolution: f64,

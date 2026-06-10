@@ -1,6 +1,6 @@
 # synty — System Design
 
-**Status:** v0.8 (post-pivot) · **Date:** 2026-05-31 · **Owner:** Daniel Svonava
+**Status:** v0.9 (fleet) · **Date:** 2026-06-11 · **Owner:** Daniel Svonava
 
 synty is a passively-collected memory of how work actually happens: it ingests
 coding-agent sessions (Claude Code, Codex, Cowork) and GitHub activity, and makes
@@ -91,7 +91,8 @@ runs on CI or a server without a developer machine.
   keyphrase labels).*
 - **Summaries.** Per session: opening ask, c-TF-IDF keyphrases, files touched,
   effort, linked PR, and a one-line abstractive summary from a local Qwen3-0.6B
-  (greedy decode, cached by input hash next to the index so the reader never runs
+  (greedy decode, cached by input hash in `.synty/` — and shared fleet-wide as
+  write-once bucket objects — so the reader never runs
   the model at view time; falls back to an extractive representative line without
   the `llm` feature). Per topic: counts, repos, notable titles — extractive.
   *Built (extractive + local LLM session summaries).*
@@ -178,15 +179,15 @@ one-shot fleet-aware build.
 
 ## What's built (kernel)
 
-A working binary: `up` (one-command solo loop), `track` (native tailers →
-envelope streams, `--bucket` to push), `github` (GraphQL backfill), `ingest`
-(envelopes + GitHub → `corpus/docs.jsonl`, `--bucket` to pull), `index` (encode
-+ build + content-addressed store + publish), `search [--filter col=value]`
-(pulls the published read-model), `topic`, `recent`, `status`, `tui`,
-`cluster [--resolution]`, `summarize`, `eval`, plus 55 scenario tests. The
-bucket backplane (local always, S3/GCS opt-in) gives fleet-wide encode-once and
-build-once-read-many.
-Validated on real data (3,938 docs / 770 K embeddings): retrieval 12/12 relevant
+A working binary: `up` (solo loop), `build` (one-shot fleet-aware pipeline),
+`track` (native tailers → envelope streams, `--bucket` to push), `github`
+(GraphQL backfill), `ingest` (envelopes + GitHub → `corpus/docs.jsonl`,
+`--bucket` to pull), `index` (encode + content-addressed store + versioned
+build + publish), `search [--filter col=value] [--json]`, `topic`, `recent`,
+`status`, `tui`, `mcp`, `cluster [--resolution]`, `summarize`, `eval`, plus the
+scenario test suite (`cargo test`, pure). The bucket backplane (local always,
+S3/GCS opt-in) gives fleet-wide encode-once and collaborative builds.
+Validated at M0/M1 on real data (3,938 docs / 770 K embeddings): retrieval 12/12 relevant
 top-3, agent task-start dogfood 3/3, session summaries specific and accurate
 (extractive in the core; one-line abstractive from a local Qwen3-0.6B under the
 `llm` feature, with retrieval and clustering staying LLM-free). Clustering (M1) is Louvain over the

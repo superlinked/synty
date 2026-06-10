@@ -5,7 +5,8 @@
 // separate) — MaxSim kNN
 // + Louvain, the same late-interaction substrate as retrieval, one level up. A
 // topic is then a coherent set of units, so its members/facets/label/summary are
-// consistent by construction. Writes unit_clusters.json; reports anchor-validated coherence.
+// consistent by construction. Writes the clusters as a new rev in the current
+// build (see readmodel); reports anchor-validated coherence.
 
 use crate::community::{louvain, modularity, Graph};
 use crate::store::EmbStore;
