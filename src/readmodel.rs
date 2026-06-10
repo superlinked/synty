@@ -15,11 +15,33 @@ use std::path::{Path, PathBuf};
 const ROOT: &str = "index";
 const POINTER: &str = "index/current.json";
 
+/// The read-model layout version. Bumped only for breaking layout changes;
+/// a reader that meets a NEWER format refuses to pull it (and says to upgrade)
+/// instead of misparsing it.
+pub const FORMAT: u32 = 1;
+
 /// The build a reader should open, resolved through the pointer.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Current {
     pub build: String,
     pub rev: u64,
+    #[serde(default = "format_default")]
+    pub format: u32,
+    /// The synty version that wrote this pointer — for debugging mixed fleets.
+    #[serde(default)]
+    pub writer: String,
+}
+
+fn format_default() -> u32 {
+    1 // pointers from before the field are format 1
+}
+
+/// Identity is (build, rev): the same read-model regardless of which binary
+/// version wrote the pointer — mixed-version fleets must not churn on it.
+impl PartialEq for Current {
+    fn eq(&self, o: &Self) -> bool {
+        self.build == o.build && self.rev == o.rev
+    }
 }
 
 impl Current {
@@ -63,14 +85,19 @@ pub fn current() -> Option<Current> {
     Path::new(ROOT)
         .join("doc_hashes.json")
         .exists()
-        .then(|| Current { build: LEGACY.into(), rev: 0 })
+        .then(|| Current { build: LEGACY.into(), rev: 0, format: 1, writer: String::new() })
 }
 
 /// Atomically repoint readers at `build`/`rev`. The build directory must be
 /// complete before this is called — the pointer move IS the publish.
 pub fn repoint(build: &str, rev: u64) -> Result<()> {
     std::fs::create_dir_all(ROOT)?;
-    let cur = Current { build: build.into(), rev };
+    let cur = Current {
+        build: build.into(),
+        rev,
+        format: FORMAT,
+        writer: env!("CARGO_PKG_VERSION").into(),
+    };
     crate::write_atomic(POINTER, serde_json::to_string(&cur)?.as_bytes())
 }
 
@@ -167,7 +194,7 @@ mod tests {
     // docs/clusters paths through it (rev selects the clusters file).
     #[test]
     fn pointer_resolves_versioned_paths() {
-        let c = Current { build: "abc123".into(), rev: 2 };
+        let c = Current { build: "abc123".into(), rev: 2, format: FORMAT, writer: String::new() };
         assert_eq!(c.dir(), Path::new("index/builds/abc123"));
         assert!(c.docs().ends_with("index/builds/abc123/docs.jsonl"));
         assert!(c.clusters().ends_with("index/builds/abc123/unit_clusters.2.json"));
@@ -176,10 +203,23 @@ mod tests {
     // Legacy installs (flat index/, no pointer) keep resolving to the old paths.
     #[test]
     fn legacy_fallback_paths() {
-        let c = Current { build: LEGACY.into(), rev: 0 };
+        let c = Current { build: LEGACY.into(), rev: 0, format: 1, writer: String::new() };
         assert_eq!(c.dir(), Path::new("index"));
         assert_eq!(c.docs(), Path::new(crate::DOCS_PATH));
         assert_eq!(c.clusters(), Path::new("unit_clusters.json"));
+    }
+
+    // Pointers from before the format field read as format 1; identity ignores
+    // the writer (mixed binary versions must not churn the pointer); a newer
+    // format is detectable for the upgrade gate.
+    #[test]
+    fn pointer_versioning_contract() {
+        let old: Current = serde_json::from_str(r#"{"build":"abc","rev":1}"#).unwrap();
+        assert_eq!(old.format, 1);
+        let newer: Current =
+            serde_json::from_str(r#"{"build":"abc","rev":1,"format":9,"writer":"9.9.9"}"#).unwrap();
+        assert!(newer.format > FORMAT, "upgrade gate can see the newer format");
+        assert_eq!(old, newer, "identity is (build, rev) only");
     }
 
     #[test]

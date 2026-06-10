@@ -33,9 +33,21 @@ pub mod kind {
     pub const AGENT_META: &str = "agent_meta";
 }
 
+/// Envelope schema version. The contract that keeps raw tracked data useful
+/// forever: evolution is ADD-ONLY — fields are never renamed or repurposed,
+/// readers skip unknown kinds and fields, absent fields default. This bumps
+/// only for a breaking change we intend never to make.
+pub const ENVELOPE_V: u32 = 1;
+
+fn envelope_v() -> u32 {
+    1 // envelopes from before the field
+}
+
 /// The canonical envelope.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Event {
+    #[serde(default = "envelope_v")]
+    pub v: u32,
     pub event_id: String,
     pub stream: String,
     pub seq: i64,
@@ -182,6 +194,7 @@ mod tests {
     #[test]
     fn event_json_uses_canonical_field_names() {
         let e = Event {
+            v: ENVELOPE_V,
             event_id: "E".into(),
             stream: "edge-x-claudecode".into(),
             seq: 3,
@@ -196,9 +209,20 @@ mod tests {
         assert!(j.contains(r#""kind":"user_prompt""#));
         assert!(j.contains(r#""session_id":"S1""#));
         assert!(j.contains(r#""source":"claude_code""#));
+        assert!(j.contains(r#""v":1"#)); // envelope schema version, always written
         assert!(!j.contains("rollup_dim")); // empty → omitted
         let back: Event = serde_json::from_str(&j).unwrap();
         assert_eq!(back.seq, 3);
         assert_eq!(back.payload["text"], "hi");
+    }
+
+    // Pre-versioning envelopes (no `v`, unknown extra fields) stay readable
+    // forever — the add-only contract.
+    #[test]
+    fn old_and_future_envelopes_parse() {
+        let old = r#"{"event_id":"E","stream":"s","seq":0,"ts":"t","source":"codex_cli","kind":"user_prompt","payload":{}}"#;
+        assert_eq!(serde_json::from_str::<Event>(old).unwrap().v, 1);
+        let future = r#"{"v":1,"event_id":"E","stream":"s","seq":0,"ts":"t","source":"codex_cli","kind":"user_prompt","payload":{},"some_future_field":42}"#;
+        assert!(serde_json::from_str::<Event>(future).is_ok());
     }
 }

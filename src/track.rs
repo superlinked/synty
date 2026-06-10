@@ -296,6 +296,7 @@ impl Stream {
             let (ts_ms, ts) = crate::tail::resolve_ts(&last_ts, 0);
             let key = format!("{}\0session_end\0{sid}\0{ts}", self.src.id());
             events.push(Event {
+                v: crate::event::ENVELOPE_V,
                 event_id: crate::event::deterministic_ulid(ts_ms.max(0) as u64, &key),
                 stream: self.name.clone(),
                 seq: self.seq.next(&self.name),

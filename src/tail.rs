@@ -112,6 +112,7 @@ impl<'a> EmitCtx<'a> {
         let event_id = self.new_id(ts_ms);
         let seq = self.seq.next(&self.stream);
         Event {
+            v: crate::event::ENVELOPE_V,
             event_id,
             stream: self.stream.clone(),
             seq,

@@ -149,16 +149,32 @@ lease/build                            soft TTL lease electing one index builder
 A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
 `--features s3/gcs`, with conditional PUT for write-once and the lease). The
 fleet model is **no designated builder**: every tracker pushes events; whoever
-opens a viewer pulls the published read-model instantly, then contributes a
-build — encoding/summarizing only what no other machine has done (the
-write-once stores are the collaboration primitive; concurrent viewers shuffle
-the pending list with per-machine seeds and split it). The lease only prevents
-duplicate index builds; losing it can't corrupt anything because publishes are
-immutable-prefix + pointer-swap. Locally the same shape: builds live under
-`index/builds/<build>/`, `index/current.json` repoints atomically, incremental
-appends clone the previous build (CoW), and readers — including a TUI holding
-a live mmap — are never mutated under. `synty up` runs the loop locally for
-solo use; `synty build` is the one-shot fleet-aware build.
+opens a viewer pulls the published read-model, then contributes a build.
+Write-once stores are the collaboration primitive — a viewer encodes and
+summarizes only what no other machine has (pending lists shuffle per machine,
+so concurrent viewers split the work). The lease only prevents duplicate index
+builds; losing it wastes compute, never corrupts, because publishes are
+immutable-prefix + pointer-swap. The local layout mirrors this:
+`index/builds/<build>/` + an atomically repointed `index/current.json`;
+incremental appends clone the previous build (CoW), so a reader's live mmap is
+never mutated under it. `synty up` loops locally; `synty build` is the
+one-shot fleet-aware build.
+
+## Data compatibility
+
+- **Envelopes are add-only, forever.** Fields are never renamed or repurposed;
+  readers skip unknown kinds and fields and default absent ones. Each envelope
+  carries `v` (currently 1), bumped only for a breaking change we intend never
+  to make. This is the contract that keeps raw tracked data useful forever —
+  everything else is a regenerable projection of it.
+- **Derived artifacts are versioned by what produced them.** Embeddings are
+  namespaced by encoder model (the default model keeps the original layout);
+  summary hashes are salted by prompt version and any non-default summarizer
+  model. Different models never share artifacts; changing a version
+  regenerates exactly the affected entries, fleet-wide, once.
+- **The read-model pointer carries `format` + the writer's version.** A reader
+  meeting a newer format refuses to pull it and says to upgrade; an unreadable
+  derived blob is a cache miss, never an error.
 
 ## What's built (kernel)
 

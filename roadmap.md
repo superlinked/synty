@@ -37,16 +37,15 @@ ordered; each lists its projects as one-liners. Design detail lives in
 - Install one-liner; license; public docs; OSS release.
 
 ## M7 — Fleet: collaborative build over a shared bucket · done
-No designated builder and no processing infra: lightweight trackers everywhere
-push raw events; whoever opens a viewer contributes compute, incrementally
-building the shared derived artifacts in the bucket.
-- Multi-writer safety: envelopes dedup by event_id on read (session_end ids made deterministic), so overlapping trackers can never double-count.
-- Versioned read-model: immutable builds (local `index/builds/<build>/`, bucket content-addressed blobs + per-(build,rev) manifests) behind an atomically swapped pointer — no torn publishes, no mutating a reader's live mmap; incremental appends clone the previous build (CoW).
-- Bucket-shared derived artifacts: per-(unit, input-hash) write-once summary objects (first viewer generates for the fleet); clusters travel with the build as additive revs, prev-cluster key lineage read from the published build.
-- Collaborative summarize: machine-seeded shuffle of the pending list + a store re-check per job — lock-free unit-level parallelism; a soft TTL lease (conditional PUT; S3 needs ETag conditional-put enabled, wired in) serializes only the index build + publish.
-- Viewer loop: `tui` pulls the read-model and renders instantly, freshens via a background `build --no-track` child (stderr → .synty/build.log, `@phase` markers), hot-reloads with selection remapped by stable topic key and the search index reloaded behind an ack; footer shows ⟳ phase / ⚠ stale / ✓ fresh.
-- Tracker rollout: `install.sh` one-liner (binary + ~/.synty home + bucket config + login-time tracker) for laptops and dev-VM/Modal images; `config.bucket` is the default everywhere (flag still wins); `$SYNTY_HOME`/~/.synty resolution makes every command work from any directory.
-- Deferred: Cursor tailer (needs a machine with Cursor session data); hosted agents (Claude Code web, Devin) need per-platform log-export exploration.
+No designated builder, no processing infra: trackers everywhere push raw
+events; whoever opens a viewer contributes the compute.
+- Multi-writer safety: readers dedup envelopes by event_id; session_end ids made deterministic.
+- Versioned read-model: immutable builds behind an atomically swapped pointer, locally (`index/builds/<build>/`, CoW-cloned appends) and in the bucket (content-addressed blobs + per-(build,rev) manifests) — no torn publishes, no mutating a reader's mmap.
+- Write-once shared summaries (first viewer generates for the fleet) + machine-seeded work splitting; a soft TTL lease serializes only the index build; cluster key lineage reads from the published build.
+- Viewer loop: `tui` pulls, renders, freshens via a background `build --no-track` child; hot-reload keeps the user's place; footer shows ⟳ phase / ⚠ stale / ✓ fresh.
+- Rollout: `install.sh` (binary + ~/.synty home + bucket config + login tracker); `config.bucket` as the default everywhere; `$SYNTY_HOME` resolution.
+- Compatibility: add-only envelopes (`v` field), model-namespaced embedding/summary stores, `format` gate on the read-model pointer (see design.md "Data compatibility").
+- Deferred: Cursor tailer (needs a machine with Cursor data); hosted agents (Claude Code web, Devin) need per-platform log-export exploration.
 
 ## Future work (after the milestones)
 - ~~MCP server exposing agent tools over stdio~~ — done (`synty mcp`: synty_search / synty_topics / synty_recent / synty_status).

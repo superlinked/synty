@@ -133,6 +133,13 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
     else {
         return Ok(false); // nothing published yet
     };
+    if remote.format > readmodel::FORMAT {
+        eprintln!(
+            "bucket read-model is format {} (written by synty {}) — newer than this binary understands; upgrade synty",
+            remote.format, remote.writer
+        );
+        return Ok(false);
+    }
     let local = readmodel::current();
     if local.as_ref() == Some(&remote) {
         return Ok(false);

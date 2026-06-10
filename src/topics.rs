@@ -39,7 +39,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
 
     // Encode the per-unit text, content-addressed in the shared store
     // (encode-once per text, reused across runs/devices like doc embeddings).
-    let store = EmbStore::open(bucket)?;
+    let store = EmbStore::open(bucket, model_id)?;
     let hashes: Vec<u64> = units.iter().map(|u| crate::index::fnv1a(u.embed.as_bytes())).collect();
     let mut emb: Vec<Option<Array2<f32>>> = vec![None; n];
     let mut miss = Vec::new();

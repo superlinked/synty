@@ -320,11 +320,19 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
-/// 8-byte content hash of arbitrary parts, salted by the prompt version so a
-/// prompt change invalidates the cache.
+/// 8-byte content hash of arbitrary parts, salted by the prompt version (a
+/// prompt change invalidates the cache) and by the summarizer model when it
+/// is not the default — different models must not share fleet summaries. The
+/// default is pinned to an empty salt, so this costs existing caches nothing;
+/// a deliberate default-model change comes with retuned prompts, i.e. a
+/// PROMPT_VERSION bump, which regenerates everything anyway.
 fn hash_parts(parts: &[&str]) -> String {
     let mut h = Sha256::new();
     h.update(PROMPT_VERSION.as_bytes());
+    let spec = std::env::var("SYNTY_LLM").unwrap_or_else(|_| REPO.to_string());
+    if spec != REPO {
+        h.update(spec.as_bytes());
+    }
     for p in parts {
         h.update(b"\0");
         h.update(p.as_bytes());
@@ -687,7 +695,16 @@ pub fn sample(n: usize) -> Result<()> {
 pub fn summarize_all(bucket: &str) -> Result<()> {
     let mut cache = units::load_summary_cache();
     let store = crate::store::SummaryStore::open(bucket)?;
-    match store.sync_cache(&mut cache) {
+    // Topic entries are only valid for the current clustering: the same rule
+    // gates fleet pulls (or orphans would cycle pull → prune → pull) and the
+    // prune at the end of the pass.
+    let valid: std::collections::HashSet<String> =
+        units::topic_units(12)?.iter().map(|t| t.cache_key.clone()).collect();
+    let keep = |key: &str| match key.strip_prefix("topic:").or_else(|| key.strip_prefix("topicname:")) {
+        Some(stable) => valid.contains(stable),
+        None => true,
+    };
+    match store.sync_cache(&mut cache, &keep) {
         Ok((pulled, pushed)) if pulled + pushed > 0 => {
             eprintln!("summarize: fleet store — pulled {pulled}, shared {pushed}");
             if pulled > 0 {
@@ -719,14 +736,10 @@ pub fn summarize_all(bucket: &str) -> Result<()> {
         let (i, o) = run_jobs(&ttodo, &mut cache, &mut llm, &store, "topic")?;
         (in_tok, out_tok) = (in_tok + i, out_tok + o);
     }
-    // Prune orphaned topic entries — stable keys from superseded clusterings, left
-    // behind when re-clustering changes a cluster's medoid/membership. Session and
-    // doc summaries (keyed by id / gh:repo#n) are untouched.
-    let valid: std::collections::HashSet<String> = units::topic_units(12)?.iter().map(|t| t.cache_key.clone()).collect();
-    cache.retain(|k, _| match k.strip_prefix("topic:").or_else(|| k.strip_prefix("topicname:")) {
-        Some(stable) => valid.contains(stable),
-        None => true,
-    });
+    // Prune orphaned topic entries — stable keys from superseded clusterings,
+    // left behind when re-clustering changes a cluster's medoid/membership.
+    // Session and doc summaries (keyed by id / gh:repo#n) are untouched.
+    cache.retain(|k, _| keep(k));
     units::save_summary_cache(&cache)?;
 
     let n = utodo.len() + ttodo.len();

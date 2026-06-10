@@ -68,7 +68,7 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     let path = dir.as_path();
 
     // Pull every known embedding from the store; encode only the rest.
-    let store = EmbStore::open(bucket)?;
+    let store = EmbStore::open(bucket, model_id)?;
     let n_new = texts.len() - start;
     let mut embeddings: Vec<Option<Array2<f32>>> = vec![None; n_new];
     let mut miss: Vec<usize> = Vec::new();

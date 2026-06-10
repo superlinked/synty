@@ -102,38 +102,29 @@ cargo run --release -- summarize                  # again: reduce each topic fro
 ## Fleet mode (optional)
 
 Solo, the "bucket" is a local directory. For a team, every machine shares one
-S3/GCS bucket — **with no build server and no cron anywhere**:
+S3/GCS bucket — no build server, no cron:
 
-- **Trackers everywhere, tiny.** Each laptop / dev VM / sandbox runs the
-  model-free tracker at login; it tails local agent session files and pushes
-  raw events to the bucket. Install is one line per machine (bake it into VM
-  images the same way):
+```sh
+SYNTY_BUCKET=s3://my-team ./install.sh   # per machine (or baked into VM images)
+```
 
-  ```sh
-  SYNTY_BUCKET=s3://my-team ./install.sh
-  ```
+That installs the model-free tracker at login: it tails local agent session
+files and pushes raw events to the bucket. The compute comes from viewers —
+whoever opens `synty tui` (or runs `synty build`) pulls the latest published
+read-model, then freshens in the background. Embeddings and summaries are
+write-once shared objects (the first machine to need one generates it for the
+fleet; concurrent viewers split the pending work), a soft lease elects one
+index builder at a time, and published builds swap in atomically — a reader
+never sees a torn build. If nobody opens a viewer for a week, events just
+accumulate until the next one pays an incremental catch-up.
 
-- **Viewers contribute the compute.** Whoever opens `synty tui` (or runs
-  `synty build`) pulls the latest published read-model instantly, then
-  freshens in the background: embeddings and LLM summaries are write-once,
-  content-addressed objects — the first machine to need one generates it for
-  the whole fleet, and concurrent viewers split the pending work between them.
-  A soft lease elects one builder at a time for the index itself; everyone
-  else just pulls the winner's output. Published builds are immutable and
-  swap in atomically via a pointer, so a reader can never see a torn build.
+The bucket from `synty setup` (or install time) is the default everywhere;
+`--bucket` overrides per call. Cloud buckets need `--features s3` / `gcs`.
+The TUI footer shows the state: `⟳ encoding 120/470` · `⚠ stale` · `✓ fresh`.
 
-- **Nothing else to operate.** If nobody opens a viewer for a week, events
-  simply accumulate; the next viewer pays one (incremental) catch-up build.
-
-Set the bucket once in `synty setup` (or `SYNTY_BUCKET` at install time) and
-every command defaults to it; `--bucket` still overrides per call. Use
-`--features s3` / `gcs` builds for cloud buckets. The TUI's footer shows what's
-happening: `⟳ encoding 120/470`, `⚠ stale · u to refresh`, or `✓ fresh`.
-
-One honest caveat: this model gives every fleet member raw bucket access —
-anyone with credentials can read everyone's sessions. Suitable for high-trust
-teams; the mediated-frontend tier (publication delay, redaction) is the
-planned answer where that's not acceptable.
+Caveat: every fleet member has raw bucket access and can read everyone's
+sessions. Fine for high-trust teams; the mediated-frontend tier (publication
+delay, redaction) is the planned answer where it isn't.
 
 ## How it works
 

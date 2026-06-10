@@ -47,8 +47,12 @@ pub const CORPUS_DIR: &str = "corpus";
 pub const DOCS_PATH: &str = "corpus/docs.jsonl";
 pub const INDEX_PATH: &str = "index";
 
+/// The default encoder. Pinned by the stores: its vectors live in the
+/// original, unprefixed namespace; any other model gets its own (see store.rs).
+pub const DEFAULT_MODEL: &str = "mixedbread-ai/mxbai-edge-colbert-v0-32m";
+
 pub fn model_id() -> String {
-    std::env::var("SYNTY_MODEL").unwrap_or_else(|_| "mixedbread-ai/mxbai-edge-colbert-v0-32m".into())
+    std::env::var("SYNTY_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into())
 }
 
 /// Document metadata. Serialized both as the per-doc JSON next-plaid stores for

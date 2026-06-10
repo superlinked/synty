@@ -15,17 +15,23 @@ use ndarray::Array2;
 
 pub struct EmbStore {
     bucket: Box<dyn Bucket>,
+    /// Model namespace: vectors from different encoders are incompatible, so a
+    /// non-default model gets its own prefix — a mixed-model fleet can never
+    /// silently share wrong vectors. The default model is pinned to the
+    /// original unprefixed layout, so upgrading to this scheme migrates nothing.
+    ns: String,
 }
 
 impl EmbStore {
-    /// Open the store at `uri` (a bucket URI or local path). Solo runs default
-    /// to a local dir so re-indexing reuses embeddings even without a bucket.
-    pub fn open(uri: &str) -> Result<Self> {
-        Ok(Self { bucket: bucket::open(uri)? })
+    /// Open the store at `uri` (a bucket URI or local path) for `model`. Solo
+    /// runs default to a local dir so re-indexing reuses embeddings even
+    /// without a bucket.
+    pub fn open(uri: &str, model: &str) -> Result<Self> {
+        Ok(Self { bucket: bucket::open(uri)?, ns: model_ns(model) })
     }
 
     pub fn get(&self, hash: u64) -> Result<Option<Array2<f32>>> {
-        match self.bucket.get(&key(hash))? {
+        match self.bucket.get(&self.key(hash))? {
             // An unreadable blob (e.g. an older f32 entry) is treated as a miss,
             // so a format change just re-encodes rather than failing the build.
             Some(bytes) => Ok(decode(&bytes).ok()),
@@ -36,17 +42,25 @@ impl EmbStore {
     /// Store an embedding if absent (write-once; another device may have raced
     /// to write the same content, which is fine — the bytes are identical).
     pub fn put(&self, hash: u64, emb: &Array2<f32>) -> Result<()> {
-        let k = key(hash);
+        let k = self.key(hash);
         if self.bucket.exists(&k)? {
             return Ok(());
         }
         self.bucket.put(&k, &encode(emb))
     }
+
+    /// Sharded key so a directory/prefix never holds the whole fleet's vectors.
+    fn key(&self, hash: u64) -> String {
+        format!("embeddings/{}{:02x}/{:016x}.emb", self.ns, hash & 0xff, hash)
+    }
 }
 
-/// Sharded key so a directory/prefix never holds the whole fleet's vectors.
-fn key(hash: u64) -> String {
-    format!("embeddings/{:02x}/{:016x}.emb", hash & 0xff, hash)
+fn model_ns(model: &str) -> String {
+    if model == crate::DEFAULT_MODEL {
+        String::new()
+    } else {
+        format!("m{:08x}/", crate::index::fnv1a(model.as_bytes()) as u32)
+    }
 }
 
 /// Content-addressed summary store over a `Bucket`: one write-once object per
@@ -92,9 +106,15 @@ impl SummaryStore {
     /// listing: pull objects this machine can't account for (never overwriting
     /// an existing local entry — its hash may be newer; the pending pass
     /// resolves that per job), and push local entries the fleet lacks (e.g. a
-    /// cache built before this machine joined the bucket). Returns
+    /// cache built before this machine joined the bucket). `keep` filters
+    /// pulls — without it, orphaned topic summaries from superseded
+    /// clusterings would cycle forever through pull → prune → pull. Returns
     /// (pulled, pushed).
-    pub fn sync_cache(&self, cache: &mut crate::units::SummaryCache) -> Result<(usize, usize)> {
+    pub fn sync_cache(
+        &self,
+        cache: &mut crate::units::SummaryCache,
+        keep: &dyn Fn(&str) -> bool,
+    ) -> Result<(usize, usize)> {
         let listed: std::collections::HashSet<String> =
             self.bucket.list("summaries")?.into_iter().collect();
         let have: std::collections::HashSet<String> =
@@ -107,7 +127,7 @@ impl SummaryStore {
             }
             let Some(raw) = self.bucket.get(obj)? else { continue };
             let Ok(b) = serde_json::from_slice::<SummaryBody>(&raw) else { continue };
-            if !cache.contains_key(&b.key) {
+            if !cache.contains_key(&b.key) && keep(&b.key) {
                 cache.insert(b.key, crate::units::CachedSummary { hash: b.hash, summary: b.summary });
                 pulled += 1;
             }
@@ -173,20 +193,29 @@ mod tests {
     fn store_is_write_once_and_shared() {
         let dir = std::env::temp_dir().join(format!("synty-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let s = EmbStore::open(dir.to_str().unwrap()).unwrap();
+        let s = EmbStore::open(dir.to_str().unwrap(), crate::DEFAULT_MODEL).unwrap();
         let a = Array2::from_shape_vec((1, 2), vec![7.0, 8.0]).unwrap();
         assert!(s.get(42).unwrap().is_none());
         s.put(42, &a).unwrap();
         // A second "device" opening the same store reads the cached vector.
-        let s2 = EmbStore::open(dir.to_str().unwrap()).unwrap();
+        let s2 = EmbStore::open(dir.to_str().unwrap(), crate::DEFAULT_MODEL).unwrap();
         assert_eq!(s2.get(42).unwrap().unwrap(), a);
+        // A different encoder's vectors are incompatible — its store is a
+        // separate namespace, never a silent hit on the default's.
+        let other = EmbStore::open(dir.to_str().unwrap(), "some/other-encoder").unwrap();
+        assert!(other.get(42).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Sharded, content-addressed keys.
+    // Sharded, content-addressed keys: the default model keeps the original
+    // layout (zero migration); others are namespaced.
     #[test]
-    fn key_is_sharded() {
-        assert_eq!(key(0xABCD), "embeddings/cd/000000000000abcd.emb");
+    fn key_is_sharded_and_model_namespaced() {
+        let def = EmbStore { bucket: bucket::open("/tmp").unwrap(), ns: model_ns(crate::DEFAULT_MODEL) };
+        assert_eq!(def.key(0xABCD), "embeddings/cd/000000000000abcd.emb");
+        let other = EmbStore { bucket: bucket::open("/tmp").unwrap(), ns: model_ns("some/other-encoder") };
+        assert!(other.key(0xABCD).starts_with("embeddings/m"));
+        assert!(other.key(0xABCD).ends_with("/cd/000000000000abcd.emb"));
     }
 
     // The collaboration contract: the first viewer's summary serves the fleet —
@@ -206,13 +235,13 @@ mod tests {
 
         // A fresh viewer materializes its local cache without knowing any keys.
         let mut cache = crate::units::SummaryCache::default();
-        assert_eq!(b.sync_cache(&mut cache).unwrap(), (1, 0));
+        assert_eq!(b.sync_cache(&mut cache, &|_: &str| true).unwrap(), (1, 0));
         assert_eq!(cache["S1"].summary, "Fixed the login redirect.");
         // A second sync is a no-op.
-        assert_eq!(b.sync_cache(&mut cache).unwrap(), (0, 0));
+        assert_eq!(b.sync_cache(&mut cache, &|_: &str| true).unwrap(), (0, 0));
         // A machine with a pre-fleet cache shares it on its first sync.
         cache.insert("S2".into(), crate::units::CachedSummary { hash: "h9".into(), summary: "Added keyset pagination.".into() });
-        assert_eq!(b.sync_cache(&mut cache).unwrap(), (0, 1));
+        assert_eq!(b.sync_cache(&mut cache, &|_: &str| true).unwrap(), (0, 1));
         let fresh = SummaryStore::open(dir.to_str().unwrap()).unwrap();
         assert_eq!(fresh.get("S2", "h9").unwrap().as_deref(), Some("Added keyset pagination."));
         let _ = std::fs::remove_dir_all(&dir);
