@@ -27,6 +27,11 @@ pub fn open(kind: &str, rest: &str) -> Result<Box<dyn Bucket>> {
         "s3" => Arc::new(
             object_store::aws::AmazonS3Builder::from_env()
                 .with_bucket_name(&bucket)
+                // S3 supports If-None-Match natively (since 2024), but
+                // object_store 0.11 returns NotImplemented for PutMode::Create
+                // unless conditional put is switched on explicitly — and
+                // put_if_absent is what leases and write-once stores run on.
+                .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
                 .build()
                 .map_err(|e| anyhow!("s3 init: {e}"))?,
         ),
@@ -114,5 +119,26 @@ impl Bucket for Cloud {
         let mut rel: Vec<String> = keys.iter().map(|k| self.relative(k)).collect();
         rel.sort();
         Ok(rel)
+    }
+
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        use object_store::{PutMode, PutOptions};
+        let p = self.full(key);
+        let payload = bytes.to_vec().into();
+        let opts = PutOptions::from(PutMode::Create);
+        match self.rt.block_on(self.store.put_opts(&p, payload, opts)) {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(e) => Err(anyhow!("put_if_absent {key}: {e}")),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let p = self.full(key);
+        match self.rt.block_on(self.store.delete(&p)) {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(anyhow!("delete {key}: {e}")),
+        }
     }
 }

@@ -30,6 +30,20 @@ pub struct Config {
     /// so `ingest` warns whenever the cap actually bites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_docs: Option<usize>,
+    /// The fleet's shared bucket (s3://…, gs://…, or a path). Every command
+    /// defaults to it; an explicit --bucket flag still wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+}
+
+/// Bucket precedence: explicit flag > config > the local default.
+pub fn resolve_bucket(flag: Option<String>) -> String {
+    flag.or_else(|| load().bucket).unwrap_or_else(|| ".synty".into())
+}
+
+/// Same for commands where "no bucket" is meaningful (track's event push).
+pub fn resolve_bucket_opt(flag: Option<String>) -> Option<String> {
+    flag.or_else(|| load().bucket)
 }
 
 pub fn load() -> Config {

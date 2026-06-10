@@ -49,6 +49,87 @@ fn key(hash: u64) -> String {
     format!("embeddings/{:02x}/{:016x}.emb", hash & 0xff, hash)
 }
 
+/// Content-addressed summary store over a `Bucket`: one write-once object per
+/// (unit key, input hash) — the first viewer to need a summary generates it
+/// for the whole fleet, exactly like embeddings. The body carries the unit key
+/// in clear (the object name only has its hash), so a viewer can materialize
+/// its local cache from the bucket without knowing the keys in advance. An
+/// empty summary is also a result worth sharing: it records "generated and
+/// gate-rejected", which stops every other viewer from retrying.
+pub struct SummaryStore {
+    bucket: Box<dyn Bucket>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SummaryBody {
+    key: String,
+    hash: String,
+    summary: String,
+}
+
+impl SummaryStore {
+    pub fn open(uri: &str) -> Result<Self> {
+        Ok(Self { bucket: bucket::open(uri)? })
+    }
+
+    /// The fleet's summary for (key, input-hash), if any viewer generated it.
+    pub fn get(&self, key: &str, hash: &str) -> Result<Option<String>> {
+        match self.bucket.get(&skey(key, hash))? {
+            Some(raw) => Ok(serde_json::from_slice::<SummaryBody>(&raw).ok().map(|b| b.summary)),
+            None => Ok(None),
+        }
+    }
+
+    /// Share a generated summary (write-once; a racing viewer's identical work
+    /// simply loses the race, which is fine).
+    pub fn put(&self, key: &str, hash: &str, summary: &str) -> Result<()> {
+        let body = SummaryBody { key: key.into(), hash: hash.into(), summary: summary.into() };
+        self.bucket.put_if_absent(&skey(key, hash), &serde_json::to_vec(&body)?)?;
+        Ok(())
+    }
+
+    /// Two-way sync between the local cache and the fleet store, off one
+    /// listing: pull objects this machine can't account for (never overwriting
+    /// an existing local entry — its hash may be newer; the pending pass
+    /// resolves that per job), and push local entries the fleet lacks (e.g. a
+    /// cache built before this machine joined the bucket). Returns
+    /// (pulled, pushed).
+    pub fn sync_cache(&self, cache: &mut crate::units::SummaryCache) -> Result<(usize, usize)> {
+        let listed: std::collections::HashSet<String> =
+            self.bucket.list("summaries")?.into_iter().collect();
+        let have: std::collections::HashSet<String> =
+            cache.iter().map(|(k, v)| skey(k, &v.hash)).collect();
+
+        let mut pulled = 0;
+        for obj in &listed {
+            if have.contains(obj) {
+                continue;
+            }
+            let Some(raw) = self.bucket.get(obj)? else { continue };
+            let Ok(b) = serde_json::from_slice::<SummaryBody>(&raw) else { continue };
+            if !cache.contains_key(&b.key) {
+                cache.insert(b.key, crate::units::CachedSummary { hash: b.hash, summary: b.summary });
+                pulled += 1;
+            }
+        }
+        let mut pushed = 0;
+        for (k, v) in cache.iter() {
+            if !listed.contains(&skey(k, &v.hash)) {
+                self.put(k, &v.hash, &v.summary)?;
+                pushed += 1;
+            }
+        }
+        Ok((pulled, pushed))
+    }
+}
+
+/// Sharded by the unit key's hash; the input hash makes the object immutable —
+/// changed inputs are a NEW object, never an overwrite.
+fn skey(key: &str, hash: &str) -> String {
+    let kf = crate::index::fnv1a(key.as_bytes());
+    format!("summaries/{:02x}/{:016x}-{hash}.json", kf & 0xff, kf)
+}
+
 fn encode(a: &Array2<f32>) -> Vec<u8> {
     let (rows, cols) = (a.nrows() as u32, a.ncols() as u32);
     let mut out = Vec::with_capacity(8 + a.len() * 2);
@@ -106,5 +187,34 @@ mod tests {
     #[test]
     fn key_is_sharded() {
         assert_eq!(key(0xABCD), "embeddings/cd/000000000000abcd.emb");
+    }
+
+    // The collaboration contract: the first viewer's summary serves the fleet —
+    // a second store sees it by (key, hash) and via blind pull, and a changed
+    // input is a different object, never an overwrite.
+    #[test]
+    fn summary_store_is_write_once_and_pullable() {
+        let dir = std::env::temp_dir().join(format!("synty-sumstore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = SummaryStore::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(a.get("S1", "h1").unwrap(), None);
+        a.put("S1", "h1", "Fixed the login redirect.").unwrap();
+        a.put("S1", "h1", "A racing different text").unwrap(); // loses: write-once
+        let b = SummaryStore::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(b.get("S1", "h1").unwrap().as_deref(), Some("Fixed the login redirect."));
+        assert_eq!(b.get("S1", "h2").unwrap(), None, "changed input = different object");
+
+        // A fresh viewer materializes its local cache without knowing any keys.
+        let mut cache = crate::units::SummaryCache::default();
+        assert_eq!(b.sync_cache(&mut cache).unwrap(), (1, 0));
+        assert_eq!(cache["S1"].summary, "Fixed the login redirect.");
+        // A second sync is a no-op.
+        assert_eq!(b.sync_cache(&mut cache).unwrap(), (0, 0));
+        // A machine with a pre-fleet cache shares it on its first sync.
+        cache.insert("S2".into(), crate::units::CachedSummary { hash: "h9".into(), summary: "Added keyset pagination.".into() });
+        assert_eq!(b.sync_cache(&mut cache).unwrap(), (0, 1));
+        let fresh = SummaryStore::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(fresh.get("S2", "h9").unwrap().as_deref(), Some("Added keyset pagination."));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,7 +4,7 @@
 // clusters.json (for PRs/issues and topic membership). Consumed by both the CLI
 // and the TUI so they stay at parity.
 
-use crate::{first_line, load_docs, DOCS_PATH};
+use crate::{first_line, load_docs, readmodel};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -163,6 +163,9 @@ fn aggregate() -> HashMap<String, Agg> {
     // The org's repos (from the last back-fill) — fold worktree dirs onto them.
     let known: std::collections::HashSet<String> = crate::config::load().repos.into_iter().collect();
     let mut aggs: HashMap<String, Agg> = HashMap::new();
+    // Overlapping trackers can append the same envelope twice; ids are
+    // deterministic, so count each event once.
+    let mut seen = std::collections::HashSet::new();
     for f in jsonl_files(Path::new(LOCAL_DIR)) {
         let Ok(data) = std::fs::read_to_string(&f) else { continue };
         for line in data.lines() {
@@ -170,6 +173,9 @@ fn aggregate() -> HashMap<String, Agg> {
                 continue;
             }
             let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
+            if !crate::event::first_sighting(&mut seen, ev["event_id"].as_str().unwrap_or("")) {
+                continue;
+            }
             let sid = ev["session_id"].as_str().unwrap_or("");
             if sid.is_empty() {
                 continue;
@@ -310,7 +316,7 @@ pub fn units() -> Result<Vec<Unit>> {
         })
         .collect();
 
-    if let Ok(docs) = load_docs(DOCS_PATH) {
+    if let Ok(docs) = load_docs(readmodel::docs_path()) {
         let topic_of = unit_topics();
         let cache = load_summary_cache();
         for d in &docs {
@@ -414,7 +420,7 @@ fn struggle_scores(raw: &[[f64; 4]]) -> Vec<f32> {
 /// (written by `cluster`). Empty until clustering has run. The stable key falls
 /// back to the index string for pre-I1 files.
 fn unit_topics() -> HashMap<String, (i64, String, String)> {
-    let Ok(raw) = std::fs::read_to_string("unit_clusters.json") else { return HashMap::new() };
+    let Ok(raw) = std::fs::read_to_string(readmodel::clusters_path()) else { return HashMap::new() };
     let arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
     arr.iter()
         .filter_map(|it| {
@@ -587,7 +593,7 @@ pub struct DocInput {
 
 /// PR/issue docs as summarizer inputs, so every work unit can get a summary.
 pub fn doc_inputs() -> Result<Vec<DocInput>> {
-    let docs = load_docs(DOCS_PATH).unwrap_or_default();
+    let docs = load_docs(readmodel::docs_path()).unwrap_or_default();
     Ok(docs
         .iter()
         .filter_map(|d| {
@@ -638,7 +644,7 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
         }
     }
     let cache = load_summary_cache();
-    for d in load_docs(DOCS_PATH).unwrap_or_default() {
+    for d in load_docs(readmodel::docs_path()).unwrap_or_default() {
         if matches!(d.meta.kind.as_str(), "pull_request" | "issue") {
             let key = gh_key(&d.meta.repo, d.meta.number.unwrap_or(0));
             if let Some(c) = cache.get(&key).filter(|c| !c.summary.is_empty()) {

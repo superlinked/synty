@@ -419,7 +419,11 @@ fn topic_jobs() -> Result<Vec<Job>> {
 }
 
 /// Jobs whose cached hash is missing or stale, narrowed by the debug knobs
-/// `SYNTY_LLM_ONLY=<substr,...>` and `SYNTY_LLM_LIMIT=N`.
+/// `SYNTY_LLM_ONLY=<substr,...>` and `SYNTY_LLM_LIMIT=N`, then shuffled with a
+/// per-machine seed: viewers working the same fleet-wide pending list start
+/// from different ends, so concurrent summarize passes divide the units
+/// between them (the write-once store de-duplicates the overlap) instead of
+/// generating the same ones in the same order.
 fn pending<'a>(jobs: &'a [Job], cache: &units::SummaryCache) -> Vec<&'a Job> {
     let mut todo: Vec<&Job> = jobs.iter().filter(|j| cache.get(&j.key).map(|c| c.hash != j.hash).unwrap_or(true)).collect();
     if let Ok(only) = std::env::var("SYNTY_LLM_ONLY") {
@@ -431,7 +435,20 @@ fn pending<'a>(jobs: &'a [Job], cache: &units::SummaryCache) -> Vec<&'a Job> {
             todo.truncate(n);
         }
     }
+    shuffle(&mut todo, crate::index::fnv1a(crate::identity::machine_id().as_bytes()));
     todo
+}
+
+/// Deterministic Fisher–Yates with an xorshift stream — vary the seed, vary
+/// the order; no RNG dependency.
+fn shuffle<T>(v: &mut [T], seed: u64) {
+    let mut s = seed | 1;
+    for i in (1..v.len()).rev() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        v.swap(i, (s as usize) % (i + 1));
+    }
 }
 
 /// Clean a raw generation per the job type and apply the faithfulness gate: a
@@ -463,6 +480,25 @@ fn llm_workers(jobs: usize) -> usize {
     )
 }
 
+/// Resolve one job: the fleet store first (another viewer may have generated
+/// it — a GET beats a generation), the model only on a store miss, sharing the
+/// result back. Returns (summary, prompt_tok, out_tok, from_store).
+fn resolve(j: &Job, llm: &mut Summarizer, store: &crate::store::SummaryStore) -> (String, usize, usize, bool) {
+    if let Ok(Some(s)) = store.get(&j.key, &j.hash) {
+        return (s, 0, 0, true);
+    }
+    let (raw, pt, ot) = match llm.generate(&j.prompt) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("  {} failed: {e}", j.label);
+            (String::new(), 0, 0)
+        }
+    };
+    let summary = finish(j, &raw);
+    let _ = store.put(&j.key, &j.hash, &summary);
+    (summary, pt, ot, false)
+}
+
 /// Generate `todo`, updating and periodically persisting the cache. One worker
 /// runs in place (reusing `llm` across passes); more fan out over scoped
 /// threads, each owning its own model, pulling jobs from a shared counter.
@@ -470,6 +506,7 @@ fn run_jobs(
     todo: &[&Job],
     cache: &mut units::SummaryCache,
     llm: &mut Option<Summarizer>,
+    store: &crate::store::SummaryStore,
     kind: &str,
 ) -> Result<(usize, usize)> {
     let workers = llm_workers(todo.len());
@@ -480,17 +517,12 @@ fn run_jobs(
         let llm = llm.as_mut().expect("summarizer loaded");
         let (mut in_tok, mut out_tok) = (0usize, 0usize);
         for (n, j) in todo.iter().enumerate() {
-            let (raw, pt, ot) = match llm.generate(&j.prompt) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("  {} failed: {e}", j.label);
-                    (String::new(), 0, 0)
-                }
-            };
-            let summary = finish(j, &raw);
+            let (summary, pt, ot, fetched) = resolve(j, llm, store);
             in_tok += pt;
             out_tok += ot;
-            eprintln!("  [{kind} {}/{}] {} — {}", n + 1, todo.len(), j.label, summary);
+            let tag = if fetched { " (fleet)" } else { "" };
+            eprintln!("  [{kind} {}/{}] {}{tag} — {}", n + 1, todo.len(), j.label, summary);
+            crate::progress::phase(&format!("summarizing {kind}s"), n + 1, todo.len());
             cache.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
             if (n + 1) % 10 == 0 {
                 units::save_summary_cache(cache)?;
@@ -514,18 +546,13 @@ fn run_jobs(
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(j) = todo.get(i) else { break };
-                        let (raw, pt, ot) = match llm.generate(&j.prompt) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                eprintln!("  {} failed: {e}", j.label);
-                                (String::new(), 0, 0)
-                            }
-                        };
-                        let summary = finish(j, &raw);
+                        let (summary, pt, ot, fetched) = resolve(j, &mut llm, store);
                         in_tok += pt;
                         out_tok += ot;
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        eprintln!("  [{kind} {n}/{}] {} — {}", todo.len(), j.label, summary);
+                        let tag = if fetched { " (fleet)" } else { "" };
+                        eprintln!("  [{kind} {n}/{}] {}{tag} — {}", todo.len(), j.label, summary);
+                        crate::progress::phase(&format!("summarizing {kind}s"), n, todo.len());
                         let mut c = shared.lock().expect("cache lock");
                         c.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
                         if n % 10 == 0 {
@@ -588,6 +615,22 @@ mod tests {
         assert!(!name_grounded("Update Dependencies", &terms)); // generic words, not cluster terms
     }
 
+    // Two machines shuffle the same pending list differently (so concurrent
+    // viewers split the work), and one machine's order is stable.
+    #[test]
+    fn shuffle_is_seeded_and_machine_varied() {
+        let base: Vec<usize> = (0..50).collect();
+        let (mut a, mut a2, mut b) = (base.clone(), base.clone(), base.clone());
+        shuffle(&mut a, 0x1111);
+        shuffle(&mut a2, 0x1111);
+        shuffle(&mut b, 0x2222);
+        assert_eq!(a, a2, "same seed, same order");
+        assert_ne!(a, b, "different machines, different order");
+        let mut sorted = a.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, base, "a permutation, nothing lost");
+    }
+
     // Worker policy: Metal stays single (one GPU), CPU scales by cores/4, an
     // explicit override wins, and we never spawn more workers than jobs.
     #[test]
@@ -638,9 +681,22 @@ pub fn sample(n: usize) -> Result<()> {
 
 /// Refresh summaries in two passes — units (sessions, PRs, issues), then topics
 /// reduced from each cluster's representative documents. The model loads once,
-/// lazily, only if there is work.
-pub fn summarize_all() -> Result<()> {
+/// lazily, only if there is work the fleet hasn't already done: summaries are
+/// shared write-once through the bucket, so this machine first materializes
+/// what other viewers generated, then resolves each remaining job store-first.
+pub fn summarize_all(bucket: &str) -> Result<()> {
     let mut cache = units::load_summary_cache();
+    let store = crate::store::SummaryStore::open(bucket)?;
+    match store.sync_cache(&mut cache) {
+        Ok((pulled, pushed)) if pulled + pushed > 0 => {
+            eprintln!("summarize: fleet store — pulled {pulled}, shared {pushed}");
+            if pulled > 0 {
+                units::save_summary_cache(&cache)?;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("summarize: fleet sync skipped ({e})"),
+    }
     let mut llm: Option<Summarizer> = None;
     let t = std::time::Instant::now();
     let (mut in_tok, mut out_tok) = (0usize, 0usize);
@@ -650,7 +706,7 @@ pub fn summarize_all() -> Result<()> {
     let utodo = pending(&ujobs, &cache);
     if !utodo.is_empty() {
         eprintln!("summarizing {} unit(s) with {REPO}…", utodo.len());
-        let (i, o) = run_jobs(&utodo, &mut cache, &mut llm, "unit")?;
+        let (i, o) = run_jobs(&utodo, &mut cache, &mut llm, &store, "unit")?;
         (in_tok, out_tok) = (in_tok + i, out_tok + o);
         units::save_summary_cache(&cache)?;
     }
@@ -660,7 +716,7 @@ pub fn summarize_all() -> Result<()> {
     let ttodo = pending(&tjobs, &cache);
     if !ttodo.is_empty() {
         eprintln!("summarizing {} topic(s)…", ttodo.len());
-        let (i, o) = run_jobs(&ttodo, &mut cache, &mut llm, "topic")?;
+        let (i, o) = run_jobs(&ttodo, &mut cache, &mut llm, &store, "topic")?;
         (in_tok, out_tok) = (in_tok + i, out_tok + o);
     }
     // Prune orphaned topic entries — stable keys from superseded clusterings, left

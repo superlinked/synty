@@ -285,11 +285,27 @@ impl Stream {
         if due.is_empty() {
             return Ok(0);
         }
+        // session_end is synthesized (no source line), so its id is minted from
+        // (source, session, last event ts) — deterministic, unlike the file
+        // mtime/batch order it used before, so a re-emission by an overlapping
+        // tracker dedups on read like every other event. Its ts is the last
+        // activity, which is when the session effectively ended anyway.
         let mut events = Vec::new();
-        let mut ec = EmitCtx::new(self.name.clone(), &*self.src, &mut self.seq, &mut self.started);
         for sid in &due {
-            let (ms, ts) = self.open.remove(sid).unwrap();
-            events.push(ec.event(ms, &ts, kind::SESSION_END, sid, json!({"reason": if all {"shutdown"} else {"idle"}})));
+            let (_, last_ts) = self.open.remove(sid).unwrap();
+            let (ts_ms, ts) = crate::tail::resolve_ts(&last_ts, 0);
+            let key = format!("{}\0session_end\0{sid}\0{ts}", self.src.id());
+            events.push(Event {
+                event_id: crate::event::deterministic_ulid(ts_ms.max(0) as u64, &key),
+                stream: self.name.clone(),
+                seq: self.seq.next(&self.name),
+                ts,
+                source: self.src.envelope_source().to_string(),
+                session_id: sid.clone(),
+                kind: kind::SESSION_END.to_string(),
+                payload: json!({"reason": if all {"shutdown"} else {"idle"}}),
+                rollup_dim: String::new(),
+            });
         }
         self.append(&events)?;
         Ok(due.len())
@@ -403,6 +419,20 @@ pub fn autostart_set(on: bool) -> Result<()> {
     Ok(())
 }
 
+/// The directory the autostart unit runs from. The current home when it holds
+/// synty state (the dev-checkout case), else ~/.synty — created so a fresh
+/// install's tracker has a stable, machine-wide home instead of whatever
+/// directory `setup` happened to run in.
+fn unit_workdir() -> Result<String> {
+    if Path::new(".synty").exists() {
+        return Ok(std::env::current_dir()?.display().to_string());
+    }
+    let home = std::env::var("HOME").map_err(|_| anyhow!("no $HOME"))?;
+    let d = Path::new(&home).join(".synty");
+    std::fs::create_dir_all(&d)?;
+    Ok(d.display().to_string())
+}
+
 /// (un)load the unit via launchctl / systemctl, swallowing all output and errors.
 fn loader(kind: &str, path: &str, on: bool) {
     let run = |cmd: &str, args: &[&str]| {
@@ -426,11 +456,15 @@ fn loader(kind: &str, path: &str, on: bool) {
 }
 
 /// Write the autostart unit file for `kind` (no output) — runs `synty track
-/// --watch` at login.
+/// --watch` at login, from a stable home, pushing to the configured fleet
+/// bucket when one is set.
 fn write_unit(kind: &str, path: &str, out: &str, machine: &str) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
-    let cwd = std::env::current_dir()?.display().to_string();
-    let args = format!("track --watch --out {out} --machine {machine}");
+    let cwd = unit_workdir()?;
+    let mut args = format!("track --watch --out {out} --machine {machine}");
+    if let Some(b) = crate::config::resolve_bucket_opt(None) {
+        args.push_str(&format!(" --bucket {b}"));
+    }
     let body = match kind {
         "launchd" => format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -479,6 +513,43 @@ fn install(kind: &str, o: &Opts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Two trackers seeing the same session must synthesize session_end under
+    // the SAME deterministic id (minted from the last event ts, not file mtime
+    // or batch order), so readers dedup the re-emission.
+    #[test]
+    fn session_end_id_is_deterministic_across_trackers() {
+        let dir = std::env::temp_dir().join(format!("synty-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let l1 = r#"{"type":"user","sessionId":"S1","version":"2.1.30","timestamp":"2026-05-31T20:00:00Z","message":{"content":"only prompt"}}"#;
+        std::fs::write(root.join("s.jsonl"), format!("{l1}\n")).unwrap();
+
+        let end_id = |out: &str| {
+            let mut st = Stream {
+                src: Box::new(ClaudeCode),
+                roots: vec![root.to_string_lossy().into_owned()],
+                name: "edge-t-claudecode".into(),
+                out: dir.join(out),
+                seq: Sequencer::new(),
+                started: HashSet::new(),
+                files: HashMap::new(),
+                open: HashMap::new(),
+                n_sessions: 0,
+                n_skipped: 0,
+                actor: "tester".into(),
+            };
+            st.drain(0, &HashMap::new()).unwrap();
+            st.flush_ends(i64::MAX - 1, true).unwrap();
+            let body = std::fs::read_to_string(dir.join(out)).unwrap();
+            let line = body.lines().find(|l| l.contains("session_end")).expect("session_end emitted");
+            serde_json::from_str::<Event>(line).unwrap().event_id
+        };
+        let (a, b) = (end_id("a.jsonl"), end_id("b.jsonl"));
+        assert_eq!(a, b, "session_end must mint the same id from the same last-event ts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // A tracker restart resumes mid-file with fresh in-memory state. The
     // persisted started set must keep a session that simply continued across

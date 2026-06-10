@@ -16,8 +16,11 @@ mod event;
 mod config;
 mod github;
 mod identity;
+mod lease;
 mod mcp;
 mod metrics;
+mod progress;
+mod readmodel;
 mod setup;
 mod store;
 mod sync;
@@ -79,9 +82,10 @@ pub struct Doc {
     pub meta: Meta,
 }
 
-pub fn load_docs(path: &str) -> Result<Vec<Doc>> {
+pub fn load_docs(path: impl AsRef<std::path::Path>) -> Result<Vec<Doc>> {
+    let path = path.as_ref();
     let data = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("read {path}: {e} (run `ingest` first)"))?;
+        .map_err(|e| anyhow::anyhow!("read {}: {e} (run `ingest` first)", path.display()))?;
     let mut v = Vec::new();
     for line in data.lines() {
         if line.trim().is_empty() {
@@ -139,9 +143,9 @@ enum Cmd {
     /// Encode docs (pylate-rs) and build the next-plaid index
     Index {
         /// Bucket holding the content-addressed embedding store (file path or
-        /// s3://, gs:// with the matching feature). Shared across devices.
-        #[arg(long, default_value = ".synty")]
-        bucket: String,
+        /// s3://, gs:// with the matching feature). Default: config, then .synty.
+        #[arg(long)]
+        bucket: Option<String>,
     },
     /// Semantic search; --filter is a SQL WHERE over metadata
     Search {
@@ -151,8 +155,8 @@ enum Cmd {
         #[arg(long, default_value_t = 5)]
         k: usize,
         /// Bucket to pull the published index from when local is stale/absent
-        #[arg(long, default_value = ".synty")]
-        bucket: String,
+        #[arg(long)]
+        bucket: Option<String>,
         /// Print results as JSON (for scripts and agents)
         #[arg(long)]
         json: bool,
@@ -163,8 +167,8 @@ enum Cmd {
     Cluster {
         #[arg(long, default_value_t = 1.0)]
         resolution: f64,
-        #[arg(long, default_value = ".synty")]
-        bucket: String,
+        #[arg(long)]
+        bucket: Option<String>,
     },
     /// List emergent topics (from the last `cluster` run); optional substring filter
     Topic {
@@ -191,8 +195,13 @@ enum Cmd {
     },
     /// First-run onboarding: connect GitHub, pick an org to back-fill, enable autostart
     Setup,
-    /// Interactive terminal UI: status + browse/drill over topics, recent, search
-    Tui,
+    /// Interactive terminal UI: status + browse/drill over topics, recent, search.
+    /// Pulls the fleet's read-model at startup and freshens in the background.
+    Tui {
+        /// Bucket to pull from and contribute builds to
+        #[arg(long)]
+        bucket: Option<String>,
+    },
     /// MCP server over stdio: synty_search / synty_topics / synty_recent /
     /// synty_status as agent tools (add to a coding agent's MCP config)
     Mcp,
@@ -203,6 +212,9 @@ enum Cmd {
         sessions: usize,
         #[arg(long, default_value_t = 5)]
         topics: usize,
+        /// Bucket holding the fleet's shared write-once summary store
+        #[arg(long)]
+        bucket: Option<String>,
         /// Skip LLM generation; show cached/extractive summaries only.
         #[arg(long)]
         cached: bool,
@@ -249,20 +261,23 @@ enum Cmd {
     /// cluster + topic summaries — no step order to remember
     Build {
         /// Bucket for the embedding store + published index
-        #[arg(long, default_value = ".synty")]
-        bucket: String,
+        #[arg(long)]
+        bucket: Option<String>,
         /// Machine id used in stream names
         #[arg(long, default_value = "local")]
         machine: String,
         /// Louvain resolution for the cluster step (>1 = more/smaller topics)
         #[arg(long, default_value_t = 1.0)]
         resolution: f64,
+        /// Skip the local tailer pass (when an autostart tracker already runs)
+        #[arg(long)]
+        no_track: bool,
     },
     /// One-command solo mode: track + ingest + index on a loop, zero config
     Up {
         /// Bucket for the embedding store + published index
-        #[arg(long, default_value = ".synty")]
-        bucket: String,
+        #[arg(long)]
+        bucket: Option<String>,
         /// Machine id used in stream names
         #[arg(long, default_value = "local")]
         machine: String,
@@ -290,15 +305,43 @@ enum Cmd {
     },
 }
 
+/// Run from the synty home: an explicit $SYNTY_HOME wins; a cwd that already
+/// holds synty state (.synty/) is its own home (the dev-checkout case); else
+/// fall back to ~/.synty when the installer created it. Every state path in
+/// the binary is home-relative, so this one chdir makes `synty tui` work from
+/// any directory.
+fn resolve_home() {
+    if let Ok(h) = std::env::var("SYNTY_HOME") {
+        if let Err(e) = std::env::set_current_dir(&h) {
+            eprintln!("synty: cannot use SYNTY_HOME={h}: {e}");
+        }
+        return;
+    }
+    if std::path::Path::new(".synty").exists() {
+        return;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let d = std::path::Path::new(&home).join(".synty");
+        if d.is_dir() && std::env::set_current_dir(&d).is_ok() {
+            eprintln!("synty: home {}", d.display());
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    resolve_home();
     match cli.cmd {
-        Cmd::Ingest { bucket } => ingest::run(CORPUS_DIR, DOCS_PATH, bucket.as_deref())?,
-        Cmd::Index { bucket } => index::run(DOCS_PATH, INDEX_PATH, &model_id(), &bucket)?,
-        Cmd::Search { query, filter, k, bucket, json } => {
-            search::run(&query, filter.as_deref(), k, &model_id(), &bucket, json)?
+        Cmd::Ingest { bucket } => {
+            ingest::run(CORPUS_DIR, DOCS_PATH, config::resolve_bucket_opt(bucket).as_deref())?
         }
-        Cmd::Cluster { resolution, bucket } => topics::run(resolution, &model_id(), &bucket)?,
+        Cmd::Index { bucket } => index::run(DOCS_PATH, &model_id(), &config::resolve_bucket(bucket))?,
+        Cmd::Search { query, filter, k, bucket, json } => {
+            search::run(&query, filter.as_deref(), k, &model_id(), &config::resolve_bucket(bucket), json)?
+        }
+        Cmd::Cluster { resolution, bucket } => {
+            topics::run(resolution, &model_id(), &config::resolve_bucket(bucket))?
+        }
         Cmd::Topic { query, json } => {
             let mut topics = units::topic_units(12)?;
             if let Some(q) = query {
@@ -335,10 +378,11 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Setup => setup::run()?,
-        Cmd::Tui => tui::run(model_id())?,
+        Cmd::Tui { bucket } => tui::run(model_id(), config::resolve_bucket(bucket))?,
         Cmd::Mcp => mcp::run(model_id())?,
-        Cmd::Summarize { sessions, topics, cached, dump, sample } => {
-            let _ = (cached, sample);
+        Cmd::Summarize { sessions, topics, bucket, cached, dump, sample } => {
+            let bucket = config::resolve_bucket(bucket);
+            let _ = (cached, sample, &bucket);
             if dump {
                 summarize::dump_inputs()?;
             } else {
@@ -347,7 +391,7 @@ fn main() -> Result<()> {
                     Some(n) => qwen::sample(n)?,
                     None => {
                         if !cached {
-                            if let Err(e) = qwen::summarize_all() {
+                            if let Err(e) = qwen::summarize_all(&bucket) {
                                 eprintln!("llm summarize skipped: {e}");
                             }
                         }
@@ -369,12 +413,14 @@ fn main() -> Result<()> {
                 poll_secs: poll,
                 install,
                 cursors,
-                bucket,
+                bucket: config::resolve_bucket_opt(bucket),
             })?
         }
-        Cmd::Build { bucket, machine, resolution } => up::build(&bucket, &machine, resolution)?,
+        Cmd::Build { bucket, machine, resolution, no_track } => {
+            up::build(&config::resolve_bucket(bucket), &machine, resolution, no_track)?
+        }
         Cmd::Up { bucket, machine, poll, no_github } => {
-            up::run(&bucket, &machine, poll, !no_github)?
+            up::run(&config::resolve_bucket(bucket), &machine, poll, !no_github)?
         }
         Cmd::Github { owner, repos, since_days, out } => {
             let owner = owner

@@ -6,7 +6,7 @@
 //    must retrieve that PR. Scored automatically (hit@5), grows with the
 //    corpus instead of being frozen to one snapshot.
 
-use crate::{encode::Encoder, load_docs, search, units, DOCS_PATH, INDEX_PATH};
+use crate::{encode::Encoder, load_docs, readmodel, search, units};
 use anyhow::{anyhow, Result};
 use next_plaid::{MmapIndex, SearchParameters};
 use serde::Deserialize;
@@ -31,8 +31,9 @@ pub fn run(model_id: &str) -> Result<()> {
             Vec::new()
         }
     };
-    let docs = load_docs(DOCS_PATH)?;
-    let idx = MmapIndex::load(INDEX_PATH).map_err(|e| anyhow!("load index: {e}"))?;
+    let docs = load_docs(readmodel::docs_path())?;
+    let idx = MmapIndex::load(&readmodel::index_dir().to_string_lossy())
+        .map_err(|e| anyhow!("load index: {e}"))?;
     let mut enc = Encoder::load(model_id)?;
     let mut out = String::from("# retrieval probe runs\n\n");
     for p in &probes {

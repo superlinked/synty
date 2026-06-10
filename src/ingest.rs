@@ -87,10 +87,11 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
         }
     }
     let mut n_session = 0usize;
+    let mut seen = std::collections::HashSet::new();
     for f in &local_files {
         if let Ok(d) = std::fs::read_to_string(f) {
             let before = docs.len();
-            docs_from_events(&d, &maps, &local_actor, &mut docs);
+            docs_from_events(&d, &maps, &local_actor, &mut seen, &mut docs);
             n_session += docs.len() - before;
         }
     }
@@ -207,14 +208,24 @@ pub fn scan_starts(text: &str, known: &std::collections::HashSet<String>, maps: 
     }
 }
 
-/// Second pass: one doc per user/assistant/thinking message. Sessions are
-/// attributed to the actor their tracker stamped into session_start — a build
-/// pulls many machines' streams from the bucket, and each session belongs to
-/// its author, not to whoever runs the build. Events from before actor
-/// stamping fall back to `local_actor`.
-pub fn docs_from_events(text: &str, maps: &SessionMaps, local_actor: &str, out: &mut Vec<Doc>) {
+/// Second pass: one doc per user/assistant/thinking message, each event taken
+/// once (`seen` dedups re-emissions by overlapping trackers across the whole
+/// pass). Sessions are attributed to the actor their tracker stamped into
+/// session_start — a build pulls many machines' streams from the bucket, and
+/// each session belongs to its author, not to whoever runs the build. Events
+/// from before actor stamping fall back to `local_actor`.
+pub fn docs_from_events(
+    text: &str,
+    maps: &SessionMaps,
+    local_actor: &str,
+    seen: &mut std::collections::HashSet<u64>,
+    out: &mut Vec<Doc>,
+) {
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if !crate::event::first_sighting(seen, v["event_id"].as_str().unwrap_or("")) {
+            continue;
+        }
         let kind = v["kind"].as_str().unwrap_or("");
         if !matches!(kind, "user_prompt" | "assistant_message" | "thinking") {
             continue;
@@ -252,7 +263,8 @@ pub fn session_docs(text: &str, known: &std::collections::HashSet<String>) -> (V
     let mut maps = SessionMaps::default();
     scan_starts(text, known, &mut maps);
     let mut out = Vec::new();
-    docs_from_events(text, &maps, &crate::identity::actor(), &mut out);
+    let mut seen = std::collections::HashSet::new();
+    docs_from_events(text, &maps, &crate::identity::actor(), &mut seen, &mut out);
     (out, maps.skipped)
 }
 
@@ -404,6 +416,15 @@ mod tests {
         run(&corpus_s, &out_s, None).unwrap();
         assert!(std::fs::read_to_string(&out).unwrap().contains("a follow-up prompt arrives"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Overlapping trackers (autostart + a manual run) append the same envelope
+    // twice under its deterministic id — readers must count it once.
+    #[test]
+    fn duplicated_envelopes_become_one_doc() {
+        let line = r#"{"event_id":"01ABC","kind":"user_prompt","session_id":"S9","ts":"t","payload":{"text":"a prompt emitted twice by two trackers"}}"#;
+        let (docs, _) = session_docs(&format!("{line}\n{line}"), &Default::default());
+        assert_eq!(docs.len(), 1);
     }
 
     // A corrupt envelope line (truncated write, disk hiccup) is counted, not

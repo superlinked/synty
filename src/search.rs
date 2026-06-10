@@ -3,7 +3,7 @@
 // resolved to a doc-id subset via next-plaid's filtering module, then passed
 // to MaxSim search. Renders Markdown to stdout — the agent-facing surface.
 
-use crate::{encode::Encoder, excerpt, first_line, load_docs, short, Doc, DOCS_PATH, INDEX_PATH};
+use crate::{encode::Encoder, excerpt, first_line, load_docs, readmodel, short, Doc};
 use anyhow::{anyhow, Result};
 use next_plaid::{MmapIndex, QueryResult, SearchParameters};
 
@@ -13,7 +13,7 @@ pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
     let Some(f) = filter else { return Ok(None) };
     let (col, val) = f.split_once('=').ok_or_else(|| anyhow!("filter must be col=value: {f}"))?;
     let ids = next_plaid::filtering::where_condition(
-        INDEX_PATH,
+        &readmodel::index_dir().to_string_lossy(),
         &format!("{} = ?", col.trim()),
         &[serde_json::json!(val.trim())],
     )
@@ -22,14 +22,14 @@ pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
 }
 
 pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str, bucket: &str, json: bool) -> Result<()> {
-    if crate::sync::pull_if_stale(bucket, INDEX_PATH, DOCS_PATH).unwrap_or(false) {
-        eprintln!("pulled published index from {bucket}/index/");
+    if crate::sync::pull_if_stale(bucket).unwrap_or(false) {
+        eprintln!("pulled published read-model from {bucket}");
     }
     if let Some(note) = crate::view::stale_note() {
         eprintln!("{note}");
     }
-    let docs = load_docs(DOCS_PATH)?;
-    let idx = MmapIndex::load(INDEX_PATH)
+    let docs = load_docs(readmodel::docs_path())?;
+    let idx = MmapIndex::load(&readmodel::index_dir().to_string_lossy())
         .map_err(|e| anyhow!("load index: {e} (run `index` first)"))?;
     let mut enc = Encoder::load(model_id)?;
     let q = enc.encode_query(query)?;

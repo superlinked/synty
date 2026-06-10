@@ -99,22 +99,41 @@ cargo run --release -- summarize                  # again: reduce each topic fro
 `cluster` groups *units of work* (sessions, PRs, issues) by their summary, so run
 `summarize` first; the topic summaries are then a second `summarize` pass.
 
-## Team mode (optional)
+## Fleet mode (optional)
 
-Solo, the "bucket" is a local directory. For a team, point every command at a
-shared S3/GCS bucket and many machines, VMs, and sandboxes converge there:
+Solo, the "bucket" is a local directory. For a team, every machine shares one
+S3/GCS bucket — **with no build server and no cron anywhere**:
 
-```sh
-cargo run --release --features s3 -- track  --bucket s3://my-team   # each device pushes
-cargo run --release --features s3 -- ingest --bucket s3://my-team   # a builder pulls all
-cargo run --release --features s3 -- index  --bucket s3://my-team   # build once
-cargo run --release --features s3 -- search "..." --bucket s3://my-team  # others just query
-```
+- **Trackers everywhere, tiny.** Each laptop / dev VM / sandbox runs the
+  model-free tracker at login; it tails local agent session files and pushes
+  raw events to the bucket. Install is one line per machine (bake it into VM
+  images the same way):
 
-Every device's events coexist in the bucket, each message is encoded only once
-across the whole fleet (content-addressed), and one machine builds the index
-while the rest download and query it. Use `gs://` with `--features gcs`. Register
-the tracker to start at login with `track --install launchd|systemd`.
+  ```sh
+  SYNTY_BUCKET=s3://my-team ./install.sh
+  ```
+
+- **Viewers contribute the compute.** Whoever opens `synty tui` (or runs
+  `synty build`) pulls the latest published read-model instantly, then
+  freshens in the background: embeddings and LLM summaries are write-once,
+  content-addressed objects — the first machine to need one generates it for
+  the whole fleet, and concurrent viewers split the pending work between them.
+  A soft lease elects one builder at a time for the index itself; everyone
+  else just pulls the winner's output. Published builds are immutable and
+  swap in atomically via a pointer, so a reader can never see a torn build.
+
+- **Nothing else to operate.** If nobody opens a viewer for a week, events
+  simply accumulate; the next viewer pays one (incremental) catch-up build.
+
+Set the bucket once in `synty setup` (or `SYNTY_BUCKET` at install time) and
+every command defaults to it; `--bucket` still overrides per call. Use
+`--features s3` / `gcs` builds for cloud buckets. The TUI's footer shows what's
+happening: `⟳ encoding 120/470`, `⚠ stale · u to refresh`, or `✓ fresh`.
+
+One honest caveat: this model gives every fleet member raw bucket access —
+anyone with credentials can read everyone's sessions. Suitable for high-trust
+teams; the mediated-frontend tier (publication delay, redaction) is the
+planned answer where that's not acceptable.
 
 ## How it works
 

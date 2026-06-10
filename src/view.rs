@@ -3,7 +3,7 @@
 // two surfaces stay at parity.
 
 use crate::units::{Kind, TopicUnits, Unit};
-use crate::{load_docs, Doc, DOCS_PATH};
+use crate::{load_docs, readmodel, Doc};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -34,7 +34,7 @@ pub struct Status {
 /// What synty holds and how fresh it is.
 pub fn status() -> Result<Status> {
     use std::collections::HashSet;
-    let docs = load_docs(DOCS_PATH).unwrap_or_default();
+    let docs = load_docs(readmodel::docs_path()).unwrap_or_default();
     let github = docs.iter().filter(|d| d.meta.source == "github").count();
     let sessions = docs
         .iter()
@@ -50,7 +50,7 @@ pub fn status() -> Result<Status> {
         by_repo: tally(&docs, true),
         by_user: tally(&docs, false),
         newest_ts: docs.iter().map(|d| d.meta.ts.as_str()).max().unwrap_or("").split('T').next().unwrap_or("").to_string(),
-        last_indexed: mtime_str("index/doc_hashes.json"),
+        last_indexed: readmodel::last_updated().map(fmt_time),
         last_tracked: mtime_str(".synty/cursors.json"),
         autostart: crate::track::autostart_enabled(),
         stale: stale_note().is_some(),
@@ -60,7 +60,7 @@ pub fn status() -> Result<Status> {
 /// A warning when tracked events are newer than the index — surfaces stale
 /// answers instead of silently serving them. None when fresh (or unbuilt).
 pub fn stale_note() -> Option<String> {
-    let indexed = std::fs::metadata("index/doc_hashes.json").ok()?.modified().ok()?;
+    let indexed = readmodel::last_updated()?;
     let newest_event = walkdir::WalkDir::new("corpus/local")
         .into_iter()
         .filter_map(|e| e.ok())
@@ -264,9 +264,12 @@ fn tally(docs: &[Doc], by_repo: bool) -> Vec<Tally> {
 }
 
 fn mtime_str(path: &str) -> Option<String> {
-    let m = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(fmt_time(std::fs::metadata(path).ok()?.modified().ok()?))
+}
+
+fn fmt_time(m: std::time::SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Utc> = m.into();
-    Some(dt.format("%Y-%m-%d %H:%M").to_string())
+    dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
 #[cfg(test)]

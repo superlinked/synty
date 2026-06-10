@@ -130,20 +130,35 @@ never by person.
 ## Storage layout (bucket)
 
 ```
-events/<stream>/…                    append-only envelopes (source of truth);
-                                       stream = edge-<machine>-<source>, so many
-                                       trackers' files coexist without collision
-embeddings/<hash[..2]>/<hash>.emb     content-addressed f16 vectors (write-once)
-index/  docs.jsonl                    published read-model (derived projection)
+events/<stream>/…                     append-only envelopes (source of truth);
+                                        stream = edge-<machine>-<source>, so many
+                                        trackers' files coexist without collision
+embeddings/<hash[..2]>/<hash>.emb      content-addressed f16 vectors (write-once)
+summaries/<kh[..2]>/<kh>-<ihash>.json  per-(unit, input-hash) LLM summaries
+                                        (write-once: first viewer generates for
+                                        the fleet; empty = tried + gate-rejected)
+blobs/<fnv>                            content-addressed build files (index
+                                        chunks, docs snapshot, clusters) — shared
+                                        across builds, so appends upload deltas
+builds/<build>.<rev>.json              manifest: filename → blob, per (build, rev)
+current.json                           the pointer, PUT last — readers never see
+                                        a torn build; rev versions the clusters
+lease/build                            soft TTL lease electing one index builder
 ```
 
-A `Bucket` trait abstracts this store: a local directory always, S3/GCS behind
-`--features s3/gcs`. The design is **build-once-read-many**, made cheap by two
-content-addressed layers: every tracker pushes events to the bucket; a build
-pulls all devices' events, encodes only text not already in `embeddings/` (so a
-message is encoded once across the whole fleet), and publishes `index/` +
-`docs.jsonl`; clients pull the read-model when their copy is stale and query
-locally. `synty up` runs the loop locally for solo use.
+A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
+`--features s3/gcs`, with conditional PUT for write-once and the lease). The
+fleet model is **no designated builder**: every tracker pushes events; whoever
+opens a viewer pulls the published read-model instantly, then contributes a
+build — encoding/summarizing only what no other machine has done (the
+write-once stores are the collaboration primitive; concurrent viewers shuffle
+the pending list with per-machine seeds and split it). The lease only prevents
+duplicate index builds; losing it can't corrupt anything because publishes are
+immutable-prefix + pointer-swap. Locally the same shape: builds live under
+`index/builds/<build>/`, `index/current.json` repoints atomically, incremental
+appends clone the previous build (CoW), and readers — including a TUI holding
+a live mmap — are never mutated under. `synty up` runs the loop locally for
+solo use; `synty build` is the one-shot fleet-aware build.
 
 ## What's built (kernel)
 

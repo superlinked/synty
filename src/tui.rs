@@ -6,7 +6,7 @@
 // first query is instant and the UI never blocks.
 
 use crate::units::{self, Kind, Session, TopicUnits, Unit};
-use crate::{first_line, load_docs, short, Doc, DOCS_PATH, INDEX_PATH};
+use crate::{first_line, load_docs, readmodel, short, Doc};
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -45,10 +45,20 @@ const VIEWS: [View; 4] = [View::Topics, View::Work, View::Search, View::Status];
 const VIEW_NAMES: [&str; 4] = ["Topics[1]", "Work[2]", "Search[3]", "Status[4]"];
 const TL_DAYS: usize = 28; // topic activity strip: current + 3 prior weeks, by day
 
+/// Commands into the search actor: a query, or "the pointer moved — reopen
+/// the index" (the encoder stays loaded; only the mmap is swapped).
+enum SearchCmd {
+    Query(String),
+    Reload,
+}
+
 enum SearchMsg {
     Ready,
     Searching,
     Results(Vec<i64>),
+    /// Ack for SearchCmd::Reload — until it arrives, Results from the old
+    /// index are dropped (its doc ids may not match the new docs).
+    Reloaded,
     Err(String),
 }
 
@@ -115,10 +125,107 @@ struct App {
     results: Vec<i64>, // doc ids
     engine: Engine,
     autostart: bool,
-    qtx: Option<Sender<String>>,
+    qtx: Option<Sender<SearchCmd>>,
     rrx: Option<Receiver<SearchMsg>>,
     quit: bool,
     cache: ViewCache,
+    /// Fleet bucket for the background freshen + pulls.
+    bucket: String,
+    /// The running freshen child, if any; its latest phase shows in the footer.
+    freshen: Option<Freshen>,
+    freshen_note: Option<String>,
+    last_freshen: Option<std::time::Instant>,
+    /// Bundle reloads arrive on this channel (built off-thread, swapped between
+    /// frames). `reload_pending` gates stale search Results until the actor
+    /// acks the index reload.
+    btx: Sender<Bundle>,
+    brx: Receiver<Bundle>,
+    reload_pending: bool,
+}
+
+/// Everything the views render, loaded as one unit so a hot reload swaps
+/// atomically between frames.
+struct Bundle {
+    docs: Vec<Doc>,
+    sessions: Vec<Session>,
+    work: Vec<Unit>,
+    topics: Vec<TopicUnits>,
+    status: crate::view::Status,
+}
+
+impl Bundle {
+    fn load() -> Self {
+        let docs = load_docs(readmodel::docs_path()).unwrap_or_default();
+        let sessions = units::sessions().unwrap_or_default();
+        let work = units::units().unwrap_or_default();
+        let topics = units::topic_units(12).unwrap_or_default();
+        let status = crate::view::status().unwrap_or_else(|_| crate::view::Status {
+            docs: docs.len(),
+            github: 0,
+            sessions: 0,
+            by_kind: vec![],
+            by_repo: vec![],
+            by_user: vec![],
+            newest_ts: String::new(),
+            last_indexed: None,
+            last_tracked: None,
+            autostart: false,
+            stale: false,
+        });
+        Self { docs, sessions, work, topics, status }
+    }
+}
+
+/// The background freshen: a child `synty build --no-track` with stderr routed
+/// to `.synty/build.log` — a file, never a pipe, so the child can't block on a
+/// full buffer and an orphan finishes its build harmlessly. The TUI tails the
+/// log for `@phase` markers (see progress.rs). Dropped (TUI quit) → the child
+/// is killed; the bucket lease expires on its own.
+struct Freshen {
+    child: std::process::Child,
+    log: std::fs::File,
+}
+
+const BUILD_LOG: &str = ".synty/build.log";
+
+impl Freshen {
+    fn spawn(bucket: &str) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(".synty")?;
+        let log_w = std::fs::File::create(BUILD_LOG)?;
+        let child = std::process::Command::new(std::env::current_exe()?)
+            .args(["build", "--no-track", "--bucket", bucket])
+            .env("SYNTY_PROGRESS", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(log_w)
+            .spawn()?;
+        Ok(Self { child, log: std::fs::File::open(BUILD_LOG)? })
+    }
+
+    /// Read any new log lines (returning the latest phase note) and report
+    /// Some(success) once the child has exited.
+    fn poll(&mut self) -> (Option<String>, Option<bool>) {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = self.log.read_to_string(&mut buf);
+        let note = buf
+            .lines()
+            .rev()
+            .find_map(crate::progress::parse)
+            .map(|(name, d, t)| crate::progress::describe(&name, d, t));
+        let done = match self.child.try_wait() {
+            Ok(Some(st)) => Some(st.success()),
+            _ => None,
+        };
+        (note, done)
+    }
+}
+
+impl Drop for Freshen {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Derived view data computed once at load: the TUI redraws several times a
@@ -168,18 +275,30 @@ impl ViewCache {
     }
 }
 
-pub fn run(model_id: String) -> Result<()> {
+pub fn run(model_id: String, bucket: String) -> Result<()> {
+    // Show the fleet's latest published read-model immediately; the background
+    // freshen catches up on anything newer after the UI is on screen.
+    if crate::sync::pull_if_stale(&bucket).unwrap_or(false) {
+        eprintln!("pulled published read-model from {bucket}");
+    }
     // Gag stderr first: the background model load (and candle/pylate-rs) write
     // device/diagnostic lines to stderr, which would scroll the alternate screen
     // and shove the header off the top. Restored when `_gag` drops.
     let _gag = StderrGag::new();
-    let mut app = App::load(model_id);
+    let mut app = App::load(model_id, bucket);
+    if app.status.stale {
+        app.start_freshen();
+    }
     let mut term = ratatui::init();
     let _ = term.clear();
     let res = app.run_loop(&mut term);
     ratatui::restore();
     res
 }
+
+/// Re-freshen this often while the TUI stays open (a no-op build is ~a second;
+/// a real one runs in the child, never blocking the UI).
+const FRESHEN_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Redirects fd 2 (stderr) to /dev/null while alive, restoring it on drop.
 struct StderrGag {
@@ -219,37 +338,22 @@ impl Drop for StderrGag {
 }
 
 impl App {
-    fn load(model_id: String) -> Self {
-        let docs = load_docs(DOCS_PATH).unwrap_or_default();
-        let doc_by_id = docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
-        let sessions = units::sessions().unwrap_or_default();
-        let sess_by_id = sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
-        let work = units::units().unwrap_or_default();
-        let topics = units::topic_units(12).unwrap_or_default();
-        let status = crate::view::status().unwrap_or_else(|_| crate::view::Status {
-            docs: docs.len(),
-            github: 0,
-            sessions: 0,
-            by_kind: vec![],
-            by_repo: vec![],
-            by_user: vec![],
-            newest_ts: String::new(),
-            last_indexed: None,
-            last_tracked: None,
-            autostart: false,
-            stale: false,
-        });
+    fn load(model_id: String, bucket: String) -> Self {
+        let b = Bundle::load();
+        let doc_by_id = b.docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
+        let sess_by_id = b.sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
         let (qtx, rrx) = spawn_search(model_id);
-        let cache = ViewCache::build(&topics, &work);
+        let cache = ViewCache::build(&b.topics, &b.work);
+        let (btx, brx) = channel::<Bundle>();
         Self {
             cache,
-            docs,
+            docs: b.docs,
             doc_by_id,
-            sessions,
+            sessions: b.sessions,
             sess_by_id,
-            work,
-            topics,
-            status,
+            work: b.work,
+            topics: b.topics,
+            status: b.status,
             view: View::Topics,
             sel: 0,
             drill_topic: None,
@@ -261,6 +365,13 @@ impl App {
             qtx: Some(qtx),
             rrx: Some(rrx),
             quit: false,
+            bucket,
+            freshen: None,
+            freshen_note: None,
+            last_freshen: None,
+            btx,
+            brx,
+            reload_pending: false,
         }
     }
 
@@ -275,8 +386,87 @@ impl App {
                 }
             }
             self.drain_search();
+            self.tick_freshen();
+            if let Ok(bundle) = self.brx.try_recv() {
+                self.apply(bundle);
+            }
         }
         Ok(())
+    }
+
+    // ── background freshen ───────────────────────────────────────────────
+
+    fn start_freshen(&mut self) {
+        if self.freshen.is_some() {
+            return;
+        }
+        self.last_freshen = Some(std::time::Instant::now());
+        match Freshen::spawn(&self.bucket) {
+            Ok(f) => {
+                self.freshen = Some(f);
+                self.freshen_note = Some("⟳ freshening".into());
+            }
+            Err(e) => self.freshen_note = Some(format!("freshen failed: {e}")),
+        }
+    }
+
+    /// Drive the freshen child: surface its latest phase, and when it exits
+    /// successfully, rebuild the data bundle off-thread (swapped in by
+    /// run_loop when it lands).
+    fn tick_freshen(&mut self) {
+        if let Some(f) = &mut self.freshen {
+            let (note, done) = f.poll();
+            if let Some(n) = note {
+                self.freshen_note = Some(n);
+            }
+            if let Some(ok) = done {
+                self.freshen = None;
+                if ok {
+                    self.freshen_note = Some("⟳ reloading".into());
+                    let tx = self.btx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(Bundle::load());
+                    });
+                } else {
+                    self.freshen_note = Some(format!("build failed — see {BUILD_LOG}"));
+                }
+            }
+        } else if self.last_freshen.is_none_or(|t| t.elapsed() > FRESHEN_EVERY) {
+            self.start_freshen();
+        }
+    }
+
+    /// Swap in a freshly loaded bundle between frames, carrying the user's
+    /// place across it: the drilled topic re-found by its stable key, the
+    /// selection clamped, the search index reloaded (stale results gated
+    /// until the actor acks) and the live query re-run.
+    fn apply(&mut self, b: Bundle) {
+        let drill_key = self
+            .drill_topic
+            .and_then(|vi| self.drilled(vi))
+            .map(|t| t.cache_key.clone());
+
+        self.cache = ViewCache::build(&b.topics, &b.work);
+        self.doc_by_id = b.docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
+        self.sess_by_id = b.sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
+        self.docs = b.docs;
+        self.sessions = b.sessions;
+        self.work = b.work;
+        self.topics = b.topics;
+        self.status = b.status;
+        self.freshen_note = None;
+
+        if let Some(key) = drill_key {
+            let vis = self.visible();
+            self.drill_topic = vis.iter().position(|&i| self.topics[i].cache_key == key);
+        }
+        self.sel = self.sel.min(self.list_len().saturating_sub(1));
+
+        if let Some(tx) = &self.qtx {
+            if tx.send(SearchCmd::Reload).is_ok() {
+                self.reload_pending = true;
+            }
+        }
     }
 
     fn drain_search(&mut self) {
@@ -285,10 +475,22 @@ impl App {
             match msg {
                 SearchMsg::Ready => self.engine = Engine::Ready,
                 SearchMsg::Searching => self.engine = Engine::Searching,
+                // Results racing an index reload may carry the OLD build's doc
+                // ids — silently wrong against new docs, so drop them; the
+                // query re-runs on the ack below.
+                SearchMsg::Results(_) if self.reload_pending => {}
                 SearchMsg::Results(ids) => {
                     self.results = ids.into_iter().filter(|id| self.doc_by_id.contains_key(id)).collect();
                     self.sel = 0;
                     self.engine = Engine::Ready;
+                }
+                SearchMsg::Reloaded => {
+                    self.reload_pending = false;
+                    if !self.query.trim().is_empty() {
+                        if let Some(tx) = &self.qtx {
+                            let _ = tx.send(SearchCmd::Query(self.query.clone()));
+                        }
+                    }
                 }
                 SearchMsg::Err(e) => self.engine = Engine::Err(e),
             }
@@ -462,6 +664,8 @@ impl App {
             KeyCode::Char('a') if matches!(self.view, View::Topics | View::Work) && self.drill_topic.is_none() => self.cycle_facet(false),
             // On the Status view, a toggles the login-time autostart tracker.
             KeyCode::Char('a') if self.view == View::Status => self.toggle_autostart(),
+            // u kicks a freshen (build child) immediately; the footer shows it.
+            KeyCode::Char('u') => self.start_freshen(),
             _ => {}
         }
     }
@@ -475,7 +679,7 @@ impl App {
             KeyCode::Enter => {
                 if !self.query.trim().is_empty() {
                     if let Some(tx) = &self.qtx {
-                        let _ = tx.send(self.query.clone());
+                        let _ = tx.send(SearchCmd::Query(self.query.clone()));
                     }
                 }
             }
@@ -546,15 +750,41 @@ impl App {
             View::Topics => self.draw_topics(f, body),
             View::Work | View::Search => self.draw_master_detail(f, body),
         }
-        // footer: contextual keys (left) · autostart status (right)
+        // footer: contextual keys (left) · freshness (middle) · autostart (right)
         let auto = if self.autostart { " autostart ✓ " } else { " autostart ✗ " };
-        let [fkeys, fauto] =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(auto.chars().count() as u16)]).areas(footer);
+        let fresh = format!(" {} ", self.fresh_status());
+        let [fkeys, ffresh, fauto] = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(fresh.chars().count() as u16),
+            Constraint::Length(auto.chars().count() as u16),
+        ])
+        .areas(footer);
         f.render_widget(Line::from(self.footer()).fg(theme::DIM), fkeys);
+        let fresh_color = if self.freshen.is_some() || self.reload_pending {
+            theme::ACCENT
+        } else if self.status.stale {
+            theme::CLOSED
+        } else {
+            theme::SAGE
+        };
+        f.render_widget(Line::from(fresh).fg(fresh_color).right_aligned(), ffresh);
         f.render_widget(
             Line::from(auto).fg(if self.autostart { theme::SAGE } else { theme::DIM }).right_aligned(),
             fauto,
         );
+    }
+
+    /// The freshness segment: the running build's phase, a stale warning, or a
+    /// quiet ✓ — the data on screen always says where it stands.
+    fn fresh_status(&self) -> String {
+        if let Some(n) = &self.freshen_note {
+            return n.clone();
+        }
+        if self.status.stale {
+            "⚠ stale · u to refresh".into()
+        } else {
+            "✓ fresh".into()
+        }
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -1170,13 +1400,13 @@ fn day(ts: &str) -> String {
     ts.split('T').next().unwrap_or("").to_string()
 }
 
-fn spawn_search(model_id: String) -> (Sender<String>, Receiver<SearchMsg>) {
-    let (qtx, qrx) = channel::<String>();
+fn spawn_search(model_id: String) -> (Sender<SearchCmd>, Receiver<SearchMsg>) {
+    let (qtx, qrx) = channel::<SearchCmd>();
     let (rtx, rrx) = channel::<SearchMsg>();
     std::thread::spawn(move || {
         use crate::encode::Encoder;
         use next_plaid::{MmapIndex, SearchParameters};
-        let (mut enc, idx) = match (Encoder::load(&model_id), MmapIndex::load(INDEX_PATH)) {
+        let (mut enc, mut idx) = match (Encoder::load(&model_id), MmapIndex::load(&readmodel::index_dir().to_string_lossy())) {
             (Ok(e), Ok(i)) => (e, i),
             _ => {
                 let _ = rtx.send(SearchMsg::Err("index/model unavailable (run `index`)".into()));
@@ -1184,7 +1414,22 @@ fn spawn_search(model_id: String) -> (Sender<String>, Receiver<SearchMsg>) {
             }
         };
         let _ = rtx.send(SearchMsg::Ready);
-        while let Ok(q) = qrx.recv() {
+        while let Ok(cmd) = qrx.recv() {
+            let q = match cmd {
+                SearchCmd::Reload => {
+                    match MmapIndex::load(&readmodel::index_dir().to_string_lossy()) {
+                        Ok(new) => {
+                            idx = new;
+                            let _ = rtx.send(SearchMsg::Reloaded);
+                        }
+                        Err(e) => {
+                            let _ = rtx.send(SearchMsg::Err(format!("reload index: {e}")));
+                        }
+                    }
+                    continue;
+                }
+                SearchCmd::Query(q) => q,
+            };
             let _ = rtx.send(SearchMsg::Searching);
             match enc.encode_query(&q) {
                 Ok(qe) => {
@@ -1279,6 +1524,13 @@ mod tests {
             qtx: None,
             rrx: None,
             quit: false,
+            bucket: ".synty".into(),
+            freshen: None,
+            freshen_note: None,
+            last_freshen: Some(std::time::Instant::now()),
+            btx: channel::<Bundle>().0,
+            brx: channel::<Bundle>().1,
+            reload_pending: false,
         }
     }
 
@@ -1318,6 +1570,46 @@ mod tests {
             a.view = v;
             term.draw(|f| a.draw(f)).unwrap();
         }
+    }
+
+    // The footer's freshness segment narrates the background build's phase,
+    // warns when stale, and goes quiet when current.
+    #[test]
+    fn footer_shows_freshness_state() {
+        let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        let text = |a: &App, term: &mut Terminal<TestBackend>| -> String {
+            term.draw(|f| a.draw(f)).unwrap();
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+        };
+        let mut a = app();
+        a.freshen_note = Some("⟳ encoding 120/470".into());
+        assert!(text(&a, &mut term).contains("encoding 120/470"), "running phase missing");
+        a.freshen_note = None;
+        a.status.stale = true;
+        assert!(text(&a, &mut term).contains("stale"), "stale warning missing");
+        a.status.stale = false;
+        assert!(text(&a, &mut term).contains("✓ fresh"), "fresh state missing");
+    }
+
+    // A hot reload re-finds the drilled topic by its stable key even when the
+    // new clustering reordered the topic list.
+    #[test]
+    fn reload_keeps_the_drilled_topic_by_key() {
+        let mut a = app2();
+        a.drill_topic = Some(0); // drilled into "t0" (OCR), first in the list
+        let mut donor = app2();
+        donor.topics.reverse(); // new build orders t1 first
+        let b = Bundle {
+            docs: donor.docs,
+            sessions: donor.sessions,
+            work: donor.work,
+            topics: donor.topics,
+            status: donor.status,
+        };
+        a.apply(b);
+        let vi = a.drill_topic.expect("drill survives the reload");
+        let drilled = a.drilled(vi).expect("drilled topic resolves");
+        assert_eq!(drilled.cache_key, "t0", "remap follows the stable key, not the position");
     }
 
     // The nav bar shows every tab's full label, not a clipped "5".

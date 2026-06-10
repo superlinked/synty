@@ -53,7 +53,17 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // 4. Autostart.
+    // 4. Fleet bucket (optional): the shared backplane every machine's tracker
+    // pushes to and every viewer builds from. Blank = solo (local only).
+    let cur = cfg.bucket.clone().unwrap_or_default();
+    let hint = if cur.is_empty() { "blank = solo".to_string() } else { format!("current: {cur}") };
+    let b = prompt(&format!("Shared fleet bucket (s3://… / gs://… / path) [{hint}]: "));
+    let b = b.trim();
+    if !b.is_empty() {
+        cfg.bucket = Some(b.to_string());
+    }
+
+    // 5. Autostart.
     if yes_no("Start synty's tracker at login (keeps your memory fresh)?", true) {
         match track::autostart_set(true) {
             Ok(()) => println!("autostart enabled — synty tracks in the background from now on."),

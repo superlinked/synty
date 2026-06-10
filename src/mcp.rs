@@ -5,7 +5,7 @@
 // small (initialize, tools/list, tools/call, ping), so it's hand-rolled — no
 // new dependencies, and stdout carries protocol JSON only (logs go to stderr).
 
-use crate::{encode::Encoder, load_docs, search, units, view, DOCS_PATH, INDEX_PATH};
+use crate::{encode::Encoder, load_docs, readmodel, search, units, view};
 use anyhow::Result;
 use next_plaid::{MmapIndex, SearchParameters};
 use serde_json::{json, Value};
@@ -32,8 +32,9 @@ pub fn run(model_id: String) -> Result<()> {
 
 struct Server {
     model_id: String,
-    /// Encoder + index, loaded on the first search call and kept warm.
-    engine: Option<(Encoder, MmapIndex)>,
+    /// The build the engine serves + encoder + index — loaded on the first
+    /// search call, kept warm, reopened when the pointer moves.
+    engine: Option<(readmodel::Current, Encoder, MmapIndex)>,
 }
 
 impl Server {
@@ -84,13 +85,21 @@ impl Server {
         anyhow::ensure!(!query.is_empty(), "query is required");
         let k = a["k"].as_u64().unwrap_or(5) as usize;
         let filter = a["filter"].as_str().filter(|f| !f.is_empty());
-        if self.engine.is_none() {
-            let idx = MmapIndex::load(INDEX_PATH)
+        // Reopen the index when the pointer moved (a builder published a new
+        // read-model while we were serving); the encoder stays loaded.
+        let cur = readmodel::current();
+        if self.engine.as_ref().is_none_or(|(b, _, _)| Some(b) != cur.as_ref()) {
+            let cur = cur.ok_or_else(|| anyhow::anyhow!("no index yet (run `synty build` first)"))?;
+            let idx = MmapIndex::load(&cur.dir().to_string_lossy())
                 .map_err(|e| anyhow::anyhow!("load index: {e} (run `synty build` first)"))?;
-            self.engine = Some((Encoder::load(&self.model_id)?, idx));
+            let enc = match self.engine.take() {
+                Some((_, e, _)) => e,
+                None => Encoder::load(&self.model_id)?,
+            };
+            self.engine = Some((cur, enc, idx));
         }
-        let (enc, idx) = self.engine.as_mut().expect("engine loaded");
-        let docs = load_docs(DOCS_PATH)?;
+        let (_, enc, idx) = self.engine.as_mut().expect("engine loaded");
+        let docs = load_docs(readmodel::docs_path())?;
         let q = enc.encode_query(query)?;
         let subset = search::subset_for(filter)?;
         let params = SearchParameters { top_k: k, ..Default::default() };

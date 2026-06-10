@@ -69,6 +69,17 @@ impl Sequencer {
     }
 }
 
+/// Read-side dedup: true the first time an event_id is seen. Overlapping
+/// trackers (autostart + a manual run) can append the same envelope twice —
+/// ids are deterministic, so readers collapse re-emissions instead of
+/// double-counting. Events without an id (foreign lines) always pass.
+pub fn first_sighting(seen: &mut std::collections::HashSet<u64>, event_id: &str) -> bool {
+    if event_id.is_empty() {
+        return true;
+    }
+    seen.insert(crate::index::fnv1a(event_id.as_bytes()))
+}
+
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// A deterministic ULID: 48-bit millisecond timestamp + 80-bit entropy taken

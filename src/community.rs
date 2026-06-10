@@ -26,6 +26,10 @@ impl Graph {
 
     /// Build from an accumulated edge map keyed by an unordered `(a,b)` pair
     /// (`a <= b`); `a == b` is a self-loop. Weights are taken verbatim.
+    /// Adjacency lists are sorted: the map iterates in hash order, which varies
+    /// per process, and float accumulation downstream (to_comm sums, aggregate)
+    /// follows adjacency order — sorting makes a partition reproducible across
+    /// machines from the same edges.
     pub fn from_edges(n: usize, edges: &HashMap<(usize, usize), f64>) -> Self {
         let mut g = Graph::new(n);
         for (&(a, b), &w) in edges {
@@ -38,6 +42,9 @@ impl Graph {
                 g.adj[a].push((b, w));
                 g.adj[b].push((a, w));
             }
+        }
+        for adj in &mut g.adj {
+            adj.sort_by(|x, y| x.0.cmp(&y.0));
         }
         g
     }

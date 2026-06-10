@@ -22,6 +22,12 @@ pub trait Bucket: Send + Sync {
     fn size(&self, key: &str) -> Result<Option<u64>>;
     /// All keys under `prefix` (recursive), relative to the bucket root.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// Create the object only if absent; Ok(true) = we created it, Ok(false) =
+    /// someone else holds it. The atomic primitive under leases and write-once
+    /// stores (local: hard-link-if-absent; cloud: conditional PUT).
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool>;
+    /// Remove an object; absent is not an error.
+    fn delete(&self, key: &str) -> Result<()>;
 }
 
 /// Open the bucket named by `uri`. A bare path or `file://` is local.
@@ -48,6 +54,21 @@ impl LocalFs {
     fn path(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }
+    /// A process-unique temp sibling for `p` — a fixed name would let two
+    /// concurrent writers of the same key rename each other's half-written tmp
+    /// into place.
+    fn tmp_for(p: &Path) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        p.with_file_name(format!("{name}.part.{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+    }
+}
+
+/// Tmp-file marker — `list` skips these so a killed writer's leftovers never
+/// read as real objects.
+fn is_part(name: &str) -> bool {
+    name.ends_with(".part") || name.contains(".part.")
 }
 
 impl Bucket for LocalFs {
@@ -58,7 +79,7 @@ impl Bucket for LocalFs {
         }
         // Write to a temp sibling then rename, so a reader never sees a partial
         // object (atomic on the same filesystem).
-        let tmp = p.with_extension("part");
+        let tmp = Self::tmp_for(&p);
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &p)?;
         Ok(())
@@ -85,7 +106,7 @@ impl Bucket for LocalFs {
         let start = if base.is_dir() { base } else { self.root.join(prefix) };
         let mut out = Vec::new();
         for e in walkdir::WalkDir::new(&start).into_iter().filter_map(|e| e.ok()) {
-            if !e.file_type().is_file() {
+            if !e.file_type().is_file() || is_part(&e.file_name().to_string_lossy()) {
                 continue;
             }
             if let Ok(rel) = e.path().strip_prefix(&self.root) {
@@ -94,6 +115,35 @@ impl Bucket for LocalFs {
         }
         out.sort();
         Ok(out)
+    }
+
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        let p = self.path(key);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // hard_link is atomic fail-if-exists on APFS/ext4 — the local stand-in
+        // for a conditional PUT.
+        let tmp = Self::tmp_for(&p);
+        std::fs::write(&tmp, bytes)?;
+        let created = match std::fs::hard_link(&tmp, &p) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        };
+        let _ = std::fs::remove_file(&tmp);
+        Ok(created)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        match std::fs::remove_file(self.path(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

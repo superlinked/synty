@@ -64,6 +64,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
 
     // One kNN pass feeds both the graph (top-K) and the quality eval (full).
     eprintln!("topics: kNN over {n} summaries");
+    crate::progress::phase("clustering", 0, 1);
     let results = maxsim_knn(&emb, EVAL_K);
 
     let edges = build_edges(&results);
@@ -135,11 +136,14 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         .collect();
 
     // Stable content-addressed key per cluster, so the summary/name cache survives
-    // renumbering. Read the PREVIOUS clusters (stable key → member set) before
-    // overwriting unit_clusters.json. A new cluster inherits the previous key it
-    // overlaps most (Jaccard ≥ 0.5, robust to membership drift); otherwise it gets
-    // a fresh key hashed from its medoid. Greedy match — exact at this cluster count.
-    let prev: Vec<(String, std::collections::HashSet<String>)> = std::fs::read_to_string("unit_clusters.json")
+    // renumbering. Read the PREVIOUS clusters (stable key → member set) from the
+    // current build before writing the next rev. A new cluster inherits the
+    // previous key it overlaps most (Jaccard ≥ 0.5, robust to membership drift);
+    // otherwise it gets a fresh key hashed from its medoid. Greedy match — exact
+    // at this cluster count.
+    let cur = crate::readmodel::current()
+        .ok_or_else(|| anyhow::anyhow!("no index build yet — run `synty index` (or `synty build`) first"))?;
+    let prev: Vec<(String, std::collections::HashSet<String>)> = std::fs::read_to_string(cur.clusters())
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
         .map(|a| {
@@ -187,8 +191,19 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
             assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "topic": stable_keys[*ci], "label": labels[*ci]}));
         }
     }
-    crate::write_atomic("unit_clusters.json", serde_json::to_string(&assign)?.as_bytes())?;
-    eprintln!("topics: wrote unit_clusters.json");
+    // Clusters are a derived artifact OF a build: write the next rev as a new
+    // file in the build dir (additive — never rewrites what a reader holds)
+    // and repoint. Legacy layouts keep the flat path until the next `index`.
+    let dest = if cur.build == "legacy" {
+        "unit_clusters.json".to_string()
+    } else {
+        cur.dir().join(format!("unit_clusters.{}.json", cur.rev + 1)).to_string_lossy().into_owned()
+    };
+    crate::write_atomic(&dest, serde_json::to_string(&assign)?.as_bytes())?;
+    if cur.build != "legacy" {
+        crate::readmodel::repoint(&cur.build, cur.rev + 1)?;
+    }
+    eprintln!("topics: wrote {dest}");
     let qual = report_quality(&results, &of, &labels, &units);
     diag(&units, &results, &of, &labels);
 
