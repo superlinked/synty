@@ -29,14 +29,21 @@ ingests your dev transcripts, that is the whole point.
 ```sh
 cargo build --release
 
-# Track your existing agent sessions + GitHub and build a fresh index, on a loop.
+# One-time: connect GitHub, pick the org to track, enable login-time tracking.
+cargo run --release -- setup
+
+# Track your agent sessions + GitHub and rebuild a fresh index, on a loop.
 # (The embedding model downloads automatically on first run.)
 cargo run --release -- up
 ```
 
-`up` tails your local Claude Code / Codex / Cowork session files, pulls recent
-GitHub PRs/issues, and rebuilds the search index every minute. Once you see
-`indexed N docs`, query it from another terminal:
+`setup` verifies your GitHub token, lists the orgs (and your own account) it can
+see, and lets you pick one — its most-recently-active repos are what gets
+back-filled — then offers to start the tracker at login. `up` tails your local Claude Code / Codex / Cowork
+session files, pulls the org's recent PRs/issues, and rebuilds the search index
+every minute. (No GitHub yet? `up` still tracks local sessions; run `setup`
+anytime to add it.) Once you see `indexed N docs`, query it from another
+terminal:
 
 ```sh
 cargo run --release -- search "OCR document parsing adapter"
@@ -47,9 +54,11 @@ Results are ranked Markdown cards — PRs, issues, and session moments — that 
 or an agent can read directly. No accounts, no network calls.
 
 Prefer to browse? `cargo run --release -- tui` opens an interactive terminal UI:
-tabs for **status**, **topics**, **recent**, and **search**, with drill-down
-from a topic into its sessions and the full document text. The CLI has the same
-surface for agents and scripts:
+tabs for **Topics**, **Work**, **Search**, and **Status**, with drill-down from
+a topic into its sessions and the full document text. Filter any list to one
+repo or person with `r`/`p`, and the Status tab breaks activity down per repo
+and account and toggles login-time tracking. The CLI has the same surface for
+agents and scripts:
 
 ```sh
 cargo run --release -- topic            # emergent topics (or `topic ocr` to filter)
@@ -63,7 +72,7 @@ cargo run --release -- status           # what's indexed and how fresh it is
 
 ```sh
 cargo run --release -- track     # tail agent sessions → canonical event envelopes
-cargo run --release -- github    # pull PRs/issues via GitHub GraphQL ($GITHUB_TOKEN, or gh)
+cargo run --release -- github    # pull the org's active PRs/issues (org from `setup`; $GITHUB_TOKEN or gh)
 cargo run --release -- ingest    # turn events + GitHub into searchable documents
 cargo run --release -- index     # encode with ColBERT and build the index
 cargo run --release -- search "<query>" [--filter col=value]
@@ -102,9 +111,11 @@ the tracker to start at login with `track --install launchd|systemd`.
   queries with MaxSim, backed by SQLite for exact metadata filters
   (`--filter repo=...`, `kind=pull_request`, …).
 - **Topics** — units of work (sessions, PRs, issues) clustered by the embedding
-  of their one-line summary (Louvain over a MaxSim kNN graph), labeled with
-  extractive keyphrases; a `--resolution` knob trades more, smaller topics for
-  fewer, larger ones. A topic is a coherent set of units, not a bag of messages.
+  of their one-line summary (Louvain over a MaxSim kNN graph), each named by the
+  local model with a short title that's checked for faithfulness to its members
+  (grounded fallback if it drifts); a `--resolution` knob trades more, smaller
+  topics for fewer, larger ones. A topic is a coherent set of units, not a bag
+  of messages.
 - **Source of truth** — sessions and GitHub items become append-only event
   envelopes; the index and its metadata are derived projections, rebuildable
   from the events at any time (and shareable through a bucket).
