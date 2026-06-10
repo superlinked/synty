@@ -3,8 +3,8 @@
 **A passive memory of how your work actually happens.** synty quietly watches
 your coding-agent sessions (Claude Code, Codex, Cowork) and your GitHub activity,
 and makes all of it searchable — by you, and by the agents you work with. Before
-starting a task, ask *"has anyone touched the OCR adapter?"* or *"what did we
-decide about the queue isolation?"* and get the relevant prior sessions and PRs
+starting a task, ask *"has anyone touched the auth flow?"* or *"what did we
+decide about rate limiting?"* and get the relevant prior sessions and PRs
 back in seconds.
 
 It runs as a single local binary. **No API keys, nothing leaves your machine** —
@@ -46,8 +46,8 @@ anytime to add it.) Once you see `indexed N docs`, query it from another
 terminal:
 
 ```sh
-cargo run --release -- search "OCR document parsing adapter"
-cargo run --release -- search "docs search fix" --filter repo=sie-web
+cargo run --release -- search "rate limiting middleware"
+cargo run --release -- search "fix flaky login test" --filter repo=api
 ```
 
 Results are ranked Markdown cards — PRs, issues, and session moments — that you
@@ -61,7 +61,7 @@ and account and toggles login-time tracking. The CLI has the same surface for
 agents and scripts:
 
 ```sh
-cargo run --release -- topic            # emergent topics (or `topic ocr` to filter)
+cargo run --release -- topic            # emergent topics (or `topic auth` to filter)
 cargo run --release -- recent           # latest PRs, issues, and prompts
 cargo run --release -- status           # what's indexed and how fresh it is
 ```
