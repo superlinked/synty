@@ -434,33 +434,115 @@ fn pending<'a>(jobs: &'a [Job], cache: &units::SummaryCache) -> Vec<&'a Job> {
     todo
 }
 
-/// Generate `todo`, updating and periodically persisting the cache.
-fn run_jobs(todo: &[&Job], cache: &mut units::SummaryCache, llm: &mut Summarizer, kind: &str) -> Result<(usize, usize)> {
-    let (mut in_tok, mut out_tok) = (0usize, 0usize);
-    for (n, j) in todo.iter().enumerate() {
-        let (raw, pt, ot) = match llm.generate(&j.prompt) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("  {} failed: {e}", j.label);
-                (String::new(), 0, 0)
-            }
-        };
-        let summary = if j.short { clean_name(&raw) } else { clean(&raw) };
-        // Faithfulness gate: a topic name sharing no salient term with its cluster
-        // is rejected (→ empty → title() falls through to the grounded summary).
-        let summary = match &j.gate {
-            Some(terms) if !name_grounded(&summary, terms) => String::new(),
-            _ => summary,
-        };
-        in_tok += pt;
-        out_tok += ot;
-        eprintln!("  [{kind} {}/{}] {} — {}", n + 1, todo.len(), j.label, summary);
-        cache.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
-        if (n + 1) % 10 == 0 {
-            units::save_summary_cache(cache)?;
-        }
+/// Clean a raw generation per the job type and apply the faithfulness gate: a
+/// topic name sharing no salient term with its cluster is rejected (→ empty →
+/// `title()` falls through to the grounded summary).
+fn finish(j: &Job, raw: &str) -> String {
+    let summary = if j.short { clean_name(raw) } else { clean(raw) };
+    match &j.gate {
+        Some(terms) if !name_grounded(&summary, terms) => String::new(),
+        _ => summary,
     }
-    Ok((in_tok, out_tok))
+}
+
+/// How many model workers to run. `SYNTY_LLM_WORKERS` wins; Metal builds
+/// default to 1 (one GPU — parallel workers contend, not compound); CPU
+/// defaults to cores/4 (each candle matmul already spreads over ~4 threads),
+/// capped so the f32 weights (~2.4 GB per worker) stay reasonable.
+fn worker_count(env: Option<usize>, metal: bool, cores: usize, jobs: usize) -> usize {
+    let def = if metal { 1 } else { (cores / 4).max(1).min(4) };
+    env.unwrap_or(def).clamp(1, 8).min(jobs.max(1))
+}
+
+fn llm_workers(jobs: usize) -> usize {
+    worker_count(
+        std::env::var("SYNTY_LLM_WORKERS").ok().and_then(|v| v.parse().ok()),
+        cfg!(feature = "metal"),
+        std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+        jobs,
+    )
+}
+
+/// Generate `todo`, updating and periodically persisting the cache. One worker
+/// runs in place (reusing `llm` across passes); more fan out over scoped
+/// threads, each owning its own model, pulling jobs from a shared counter.
+fn run_jobs(
+    todo: &[&Job],
+    cache: &mut units::SummaryCache,
+    llm: &mut Option<Summarizer>,
+    kind: &str,
+) -> Result<(usize, usize)> {
+    let workers = llm_workers(todo.len());
+    if workers <= 1 {
+        if llm.is_none() {
+            *llm = Some(Summarizer::load()?);
+        }
+        let llm = llm.as_mut().expect("summarizer loaded");
+        let (mut in_tok, mut out_tok) = (0usize, 0usize);
+        for (n, j) in todo.iter().enumerate() {
+            let (raw, pt, ot) = match llm.generate(&j.prompt) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("  {} failed: {e}", j.label);
+                    (String::new(), 0, 0)
+                }
+            };
+            let summary = finish(j, &raw);
+            in_tok += pt;
+            out_tok += ot;
+            eprintln!("  [{kind} {}/{}] {} — {}", n + 1, todo.len(), j.label, summary);
+            cache.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
+            if (n + 1) % 10 == 0 {
+                units::save_summary_cache(cache)?;
+            }
+        }
+        return Ok((in_tok, out_tok));
+    }
+
+    eprintln!("summarize: {workers} model workers");
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let shared = std::sync::Mutex::new(&mut *cache);
+    let mut totals = (0usize, 0usize);
+    std::thread::scope(|s| -> Result<()> {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| -> Result<(usize, usize)> {
+                    let mut llm = Summarizer::load()?;
+                    let (mut in_tok, mut out_tok) = (0usize, 0usize);
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(j) = todo.get(i) else { break };
+                        let (raw, pt, ot) = match llm.generate(&j.prompt) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("  {} failed: {e}", j.label);
+                                (String::new(), 0, 0)
+                            }
+                        };
+                        let summary = finish(j, &raw);
+                        in_tok += pt;
+                        out_tok += ot;
+                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprintln!("  [{kind} {n}/{}] {} — {}", todo.len(), j.label, summary);
+                        let mut c = shared.lock().expect("cache lock");
+                        c.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
+                        if n % 10 == 0 {
+                            units::save_summary_cache(&c)?;
+                        }
+                    }
+                    Ok((in_tok, out_tok))
+                })
+            })
+            .collect();
+        for h in handles {
+            let (i, o) = h.join().expect("summary worker")?;
+            totals = (totals.0 + i, totals.1 + o);
+        }
+        Ok(())
+    })?;
+    Ok(totals)
 }
 
 #[cfg(test)]
@@ -504,6 +586,18 @@ mod tests {
         assert!(name_grounded("Overflow Policy Handling", &terms)); // shares "overflow"/"policy"
         assert!(!name_grounded("Colpali Visual Retrieval", &terms)); // shares nothing
         assert!(!name_grounded("Update Dependencies", &terms)); // generic words, not cluster terms
+    }
+
+    // Worker policy: Metal stays single (one GPU), CPU scales by cores/4, an
+    // explicit override wins, and we never spawn more workers than jobs.
+    #[test]
+    fn worker_count_policy() {
+        assert_eq!(worker_count(None, true, 12, 1000), 1); // metal: one GPU
+        assert_eq!(worker_count(None, false, 12, 1000), 3); // cpu: cores/4
+        assert_eq!(worker_count(None, false, 32, 1000), 4); // capped at 4
+        assert_eq!(worker_count(Some(6), true, 12, 1000), 6); // override wins
+        assert_eq!(worker_count(Some(99), false, 12, 1000), 8); // hard clamp
+        assert_eq!(worker_count(None, false, 32, 2), 2); // never more than jobs
     }
 
     #[test]
@@ -556,8 +650,7 @@ pub fn summarize_all() -> Result<()> {
     let utodo = pending(&ujobs, &cache);
     if !utodo.is_empty() {
         eprintln!("summarizing {} unit(s) with {REPO}…", utodo.len());
-        llm = Some(Summarizer::load()?);
-        let (i, o) = run_jobs(&utodo, &mut cache, llm.as_mut().unwrap(), "unit")?;
+        let (i, o) = run_jobs(&utodo, &mut cache, &mut llm, "unit")?;
         (in_tok, out_tok) = (in_tok + i, out_tok + o);
         units::save_summary_cache(&cache)?;
     }
@@ -567,10 +660,7 @@ pub fn summarize_all() -> Result<()> {
     let ttodo = pending(&tjobs, &cache);
     if !ttodo.is_empty() {
         eprintln!("summarizing {} topic(s)…", ttodo.len());
-        if llm.is_none() {
-            llm = Some(Summarizer::load()?);
-        }
-        let (i, o) = run_jobs(&ttodo, &mut cache, llm.as_mut().unwrap(), "topic")?;
+        let (i, o) = run_jobs(&ttodo, &mut cache, &mut llm, "topic")?;
         (in_tok, out_tok) = (in_tok + i, out_tok + o);
     }
     // Prune orphaned topic entries — stable keys from superseded clusterings, left
