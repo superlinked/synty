@@ -32,8 +32,9 @@ cargo build --release
 # One-time: connect GitHub, pick the org to track, enable login-time tracking.
 cargo run --release -- setup
 
-# Track your agent sessions + GitHub and rebuild a fresh index, on a loop.
-# (The embedding model downloads automatically on first run.)
+# Solo mode: track, ingest, and index on a loop — your machine is both the
+# tracker (lightweight, model-free) and the builder (downloads the embedding
+# model on first run). In fleet mode machines run only the tracker.
 cargo run --release -- up
 ```
 
