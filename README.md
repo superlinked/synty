@@ -59,9 +59,10 @@ or an agent can read directly. No accounts, no network calls.
 Prefer to browse? `cargo run --release -- tui` opens an interactive terminal UI:
 tabs for **Topics**, **Work**, **Search**, and **Status**, with drill-down from
 a topic into its sessions and the full document text. Filter any list to one
-repo or person with `r`/`p`, and the Status tab breaks activity down per repo
-and account and toggles login-time tracking. The CLI has the same surface for
-agents and scripts:
+repo or account with `r`/`a`, refresh on demand with `u` (the footer shows
+build progress and staleness), and the Status tab breaks activity down per
+repo and account and toggles login-time tracking. The CLI has the same surface
+for agents and scripts:
 
 ```sh
 cargo run --release -- topic            # emergent topics (or `topic auth` to filter)

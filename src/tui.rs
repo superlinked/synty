@@ -71,7 +71,7 @@ enum Engine {
 }
 
 /// Active topic-list filter: show only topics that touch this repo or person.
-/// Cycled with `r` / `p`; wrapping past the last value clears it.
+/// Cycled with `r` / `a`; wrapping past the last value clears it.
 #[derive(Clone)]
 enum Facet {
     Repo(String),
@@ -525,7 +525,7 @@ impl App {
     }
 
     /// Distinct repos (`repo=true`) or people across topics, most-covered first —
-    /// the order `r`/`p` cycle through (precomputed; see ViewCache).
+    /// the order `r`/`a` cycle through (precomputed; see ViewCache).
     fn facet_names(&self, repo: bool) -> &[String] {
         if repo { &self.cache.repo_facets } else { &self.cache.acct_facets }
     }
