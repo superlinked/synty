@@ -105,28 +105,35 @@ cargo run --release -- summarize                  # again: reduce each topic fro
 
 ## Fleet mode (optional)
 
-Solo, the "bucket" is a local directory. For a team, every machine shares one
-S3/GCS bucket — no build server, no cron:
+Solo, the "bucket" is a local directory. For a team it's one shared S3/GCS
+bucket — and the bucket is the *only* shared infrastructure: no build server,
+no cron, no coordination service. That works because everything in it is
+append-only (events), write-once (embeddings, summaries), or swapped
+atomically behind a pointer (the index) — machines cooperate without ever
+talking to each other.
+
+Three roles, one binary:
+
+- **Every machine writes.** The tracker runs at login: model-free, near-zero
+  footprint, it tails local agent session files and pushes raw events.
+- **One machine scrapes GitHub.** Whichever machine has a token refreshes the
+  org's PRs/issues during its builds — incrementally, fetching only what
+  changed since the last scrape — and shares the result. Nobody else needs a
+  token.
+- **Viewers build.** Opening `synty tui` (or running `synty build`) pulls the
+  latest published read-model, then freshens in the background: encode and
+  summarize only what no machine has done yet (the first to need something
+  generates it for the fleet; concurrent viewers split the pending list), one
+  soft lease per index build, publish, pointer swap. Idle for a week? Events
+  accumulate; the next viewer pays an incremental catch-up.
 
 ```sh
-SYNTY_BUCKET=s3://my-team ./install.sh   # per machine (or baked into VM images)
+SYNTY_BUCKET=s3://my-team ./install.sh   # per machine, or baked into VM images
 ```
 
-That installs the model-free tracker at login: it tails local agent session
-files and pushes raw events to the bucket. GitHub needs a token on just one
-machine — its incremental scrape shares through the bucket and refreshes
-automatically during builds. The compute comes from viewers —
-whoever opens `synty tui` (or runs `synty build`) pulls the latest published
-read-model, then freshens in the background. Embeddings and summaries are
-write-once shared objects (the first machine to need one generates it for the
-fleet; concurrent viewers split the pending work), a soft lease elects one
-index builder at a time, and published builds swap in atomically — a reader
-never sees a torn build. If nobody opens a viewer for a week, events just
-accumulate until the next one pays an incremental catch-up.
-
-The bucket from `synty setup` (or install time) is the default everywhere;
-`--bucket` overrides per call. Cloud buckets need `--features s3` / `gcs`.
-The TUI footer shows the state: `⟳ encoding 120/470` · `⚠ stale` · `✓ fresh`.
+The configured bucket is the default everywhere; `--bucket` overrides. Cloud
+buckets need `--features s3` / `gcs`. The TUI footer shows where things stand:
+`⟳ encoding 120/470` · `⚠ stale` · `✓ fresh`.
 
 Caveat: every fleet member has raw bucket access and can read everyone's
 sessions. Fine for high-trust teams; the mediated-frontend tier (publication
