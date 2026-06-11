@@ -28,6 +28,10 @@ const CANDIDATES: usize = 64;
 /// a finer resolution yields coherent topics. Calibrated against the anchor
 /// membership eval, NOT silhouette (which prefers coarser clusters → grab-bags).
 const RES_SCALE: f64 = 2.5;
+/// Per-token symmetrized MaxSim at or above this is a near-duplicate — the
+/// same work item re-run, not related work. Live non-dup same-topic pairs top
+/// out ≈0.85, so 0.95 keeps a wide margin against union-find chaining.
+const DUP: f32 = 0.95;
 
 pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let units = units::cluster_units()?;
@@ -66,7 +70,18 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     // One kNN pass feeds both the graph (top-K) and the quality eval (full).
     eprintln!("topics: kNN over {n} summaries");
     crate::progress::phase("clustering", 0, 1);
-    let results = maxsim_knn(&emb, EVAL_K);
+    let mut results = maxsim_knn(&emb, EVAL_K);
+
+    // Collapse near-duplicate units (the same work item re-run) onto one
+    // representative before any graph work — a duplicate clique otherwise
+    // consumes its members' edge budgets, skews every cohesion number, and
+    // pads the topic prompts with the same line over and over.
+    let rep = dup_groups(&emb, &results, &units);
+    collapse_dups(&mut results, &rep);
+    let dup_units = rep.iter().enumerate().filter(|&(i, r)| *r != i).count();
+    if dup_units > 0 {
+        eprintln!("topics: collapsed {dup_units} near-duplicate units");
+    }
 
     let edges = build_edges(&results);
     // Degree in the mutual-kNN graph: a unit with no edge is an outlier we abstain
@@ -107,7 +122,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     if moved > 0 {
         eprintln!("topics: reassigned {moved} outlier units to their nearest cluster");
     }
-    let bridges = snap_to_prs(&mut of, &units);
+    let bridges = snap_to_prs(&mut of, &units, &rep);
     if bridges > 0 {
         eprintln!("topics: snapped {bridges} sessions to their produced PR's topic");
     }
@@ -157,6 +172,16 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
             m.into_iter().collect()
         })
         .unwrap_or_default();
+    // For the Jaccard match a cluster's identity includes its collapsed
+    // duplicates — previous rows list every unit, so comparing reps-only
+    // against them would undercount overlap and shed stable keys (and with
+    // them the cached summaries/names) on the first post-collapse run.
+    let mut dups_of: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, &r) in rep.iter().enumerate() {
+        if r != i {
+            dups_of.entry(r).or_default().push(i);
+        }
+    }
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stable_keys: Vec<String> = Vec::with_capacity(members.len());
     let mut inherited = 0usize;
@@ -165,7 +190,11 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
             stable_keys.push(format!("e{ci}"));
             continue;
         }
-        let cur: std::collections::HashSet<&str> = m.iter().map(|&i| units[i].key.as_str()).collect();
+        let cur: std::collections::HashSet<&str> = m
+            .iter()
+            .flat_map(|&i| std::iter::once(i).chain(dups_of.get(&i).into_iter().flatten().copied()))
+            .map(|i| units[i].key.as_str())
+            .collect();
         let best = prev
             .iter()
             .filter(|(k, _)| !used.contains(k.as_str()))
@@ -194,6 +223,18 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     for (i, o) in of.iter().enumerate() {
         if let Some(ci) = o {
             assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "topic": stable_keys[*ci], "label": labels[*ci], "rank": rank[i]}));
+        }
+    }
+    // Collapsed duplicates follow their representative: same cluster and rank,
+    // plus a `dup` pointer so readers can fold them (and the summarizer can
+    // skip them). A duplicate of an unclustered representative stays rowless,
+    // like any unclustered unit.
+    for (i, &r) in rep.iter().enumerate() {
+        if r == i {
+            continue;
+        }
+        if let Some(ci) = of[r] {
+            assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "topic": stable_keys[ci], "label": labels[ci], "rank": rank[r], "dup": units[r].key}));
         }
     }
     // Clusters are a derived artifact OF a build: write the next rev as a new
@@ -225,6 +266,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         .set("unclustered", n - assign.len())
         .set("clusters", sizes.len())
         .set("bridges", bridges)
+        .set("dup_units", dup_units)
         .set("id_continuity", id_continuity)
         .set("modularity", q)
         .set("cohesion_med", qual.cohesion_med as f64)
@@ -355,16 +397,104 @@ fn diag(units: &[units::UnitClusterInput], results: &[Knn], of: &[Option<usize>]
     }
 }
 
+/// Group near-duplicate units (per-token symmetrized MaxSim ≥ DUP, same repo
+/// and same kind — collapsing never crosses either) under one representative:
+/// rep[i] == i marks a representative. Candidate pairs come from the kNN
+/// lists — duplicates are nearest neighbors by definition — with a cheap
+/// prefilter (one direction ≥ 2·DUP−1 implies the symmetric mean can reach
+/// DUP). The representative is the member that produced a PR (it anchors the
+/// group via snap_to_prs), else the smallest key — stable as reruns accumulate,
+/// where "most recent" would churn the rep, the medoid, and the stable id.
+fn dup_groups(emb: &[Array2<f32>], results: &[Knn], units: &[units::UnitClusterInput]) -> Vec<usize> {
+    let n = results.len();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    for (i, r) in results.iter().enumerate() {
+        let ri = emb[i].nrows().max(1) as f32;
+        for (id, s) in r.ids.iter().zip(r.scores.iter()) {
+            let j = *id;
+            if j == i || s / ri < 2.0 * DUP - 1.0 {
+                continue;
+            }
+            if units[i].repo != units[j].repo
+                || units[i].key.starts_with("gh:") != units[j].key.starts_with("gh:")
+            {
+                continue;
+            }
+            // Reverse direction: reuse j's kNN entry for i when present.
+            let rj = emb[j].nrows().max(1) as f32;
+            let back = results[j]
+                .ids
+                .iter()
+                .position(|&x| x == i)
+                .map(|p| results[j].scores[p])
+                .unwrap_or_else(|| maxsim(&emb[j], &emb[i]));
+            if (s / ri + back / rj) / 2.0 >= DUP {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+    }
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        groups.entry(root).or_default().push(i);
+    }
+    let mut rep: Vec<usize> = (0..n).collect();
+    for (_, g) in groups {
+        if g.len() < 2 {
+            continue;
+        }
+        let r = *g.iter().min_by_key(|&&i| (units[i].linked.is_none(), &units[i].key)).expect("non-empty group");
+        for &i in &g {
+            rep[i] = r;
+        }
+    }
+    rep
+}
+
+/// Remove collapsed duplicates from the kNN geometry: a non-representative
+/// loses its neighbor list (degree 0 keeps it out of the graph, reassignment
+/// and the quality report), and no surviving list points at one. One pass here
+/// gives every consumer the corrected geometry — per-consumer skipping could
+/// not fix build_edges, whose top-K budget and ÷best normalization a duplicate
+/// clique would otherwise consume.
+fn collapse_dups(results: &mut [Knn], rep: &[usize]) {
+    for (i, r) in results.iter_mut().enumerate() {
+        if rep[i] != i {
+            r.ids.clear();
+            r.scores.clear();
+            continue;
+        }
+        let keep: Vec<usize> = (0..r.ids.len()).filter(|&k| rep[r.ids[k]] == r.ids[k]).collect();
+        r.ids = keep.iter().map(|&k| r.ids[k]).collect();
+        r.scores = keep.iter().map(|&k| r.scores[k]).collect();
+    }
+}
+
 /// kNN edges from MaxSim: normalized per-unit (÷ best neighbor), floored, summed
 /// over both directions so mutual neighbors weigh more. Top-K per unit.
 /// Snap each session to the topic of the PR it produced — they're one unit of
 /// work, so the GitHub artifact (clustered by its own content) anchors the
 /// session. A hard override after reassignment, since a soft edge loses to the
-/// kNN-based reassign. Returns the number of sessions moved.
-fn snap_to_prs(of: &mut [Option<usize>], units: &[units::UnitClusterInput]) -> usize {
+/// kNN-based reassign. Collapsed duplicates are skipped (they follow their
+/// representative, which is chosen linked-PR-first for exactly this reason).
+/// Returns the number of sessions moved.
+fn snap_to_prs(of: &mut [Option<usize>], units: &[units::UnitClusterInput], rep: &[usize]) -> usize {
     let idx: HashMap<&str, usize> = units.iter().enumerate().map(|(i, u)| (u.key.as_str(), i)).collect();
     let mut snapped = 0;
     for i in 0..units.len() {
+        if rep[i] != i {
+            continue;
+        }
         if let Some(&j) = units[i].linked.as_deref().and_then(|pr| idx.get(pr)) {
             if of[j].is_some() && of[i] != of[j] {
                 of[i] = of[j];
@@ -696,6 +826,80 @@ mod tests {
         }
     }
 
+    fn dup_unit(key: &str, repo: &str, linked: Option<&str>) -> units::UnitClusterInput {
+        units::UnitClusterInput {
+            key: key.to_string(),
+            summary: String::new(),
+            embed: String::new(),
+            repo: repo.to_string(),
+            linked: linked.map(String::from),
+        }
+    }
+
+    // Re-runs of the same work item (near-identical embeds, same repo and
+    // kind) collapse under one representative; merely-similar units do not.
+    #[test]
+    fn dup_groups_union_only_above_threshold() {
+        let a = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
+        let a2 = a.clone(); // identical → sym 1.0
+        let b = arr2(&[[0.8, 0.6], [0.0, 1.0]]); // sym vs a = 0.9 < DUP
+        let emb = vec![a, a2, b];
+        let results = maxsim_knn(&emb, 2);
+        let units: Vec<_> = ["s0", "s1", "s2"].iter().map(|k| dup_unit(k, "", None)).collect();
+        assert_eq!(dup_groups(&emb, &results, &units), vec![0, 0, 2]);
+    }
+
+    // The guardrail: identical text in different repos, or a session vs a
+    // GitHub doc, never collapses.
+    #[test]
+    fn dup_groups_respect_repo_and_kind() {
+        let a = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
+        let emb = vec![a.clone(), a.clone(), a.clone(), a];
+        let results = maxsim_knn(&emb, 3);
+        let units = vec![
+            dup_unit("s0", "alpha", None),
+            dup_unit("s1", "beta", None), // other repo
+            dup_unit("gh:alpha#1", "alpha", None), // other kind
+            dup_unit("s3", "alpha", None), // genuine dup of s0
+        ];
+        assert_eq!(dup_groups(&emb, &results, &units), vec![0, 1, 2, 0]);
+    }
+
+    // The representative anchors the group: the member that produced a PR
+    // wins (snap_to_prs follows it), else the smallest key — stable as new
+    // reruns accumulate.
+    #[test]
+    fn dup_rep_prefers_linked_pr_then_min_key() {
+        let a = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
+        let emb = vec![a.clone(), a.clone(), a.clone()];
+        let results = maxsim_knn(&emb, 2);
+        let linked: Vec<_> = vec![
+            dup_unit("s0", "", None),
+            dup_unit("s1", "", None),
+            dup_unit("s2", "", Some("gh:r#1")),
+        ];
+        assert_eq!(dup_groups(&emb, &results, &linked), vec![2, 2, 2]);
+        let unlinked: Vec<_> = ["s2", "s1", "s0"].iter().map(|k| dup_unit(k, "", None)).collect();
+        assert_eq!(dup_groups(&emb, &results, &unlinked), vec![2, 2, 2]); // "s0" is at index 2
+    }
+
+    // Collapsing erases duplicates from the geometry: their lists empty, and
+    // no surviving list points at one.
+    #[test]
+    fn collapse_dups_strips_non_reps() {
+        let a = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
+        let b = arr2(&[[0.6, 0.8], [0.8, -0.6]]);
+        let emb = vec![a.clone(), a.clone(), b];
+        let mut results = maxsim_knn(&emb, 2);
+        let rep = vec![0, 0, 2];
+        collapse_dups(&mut results, &rep);
+        assert!(results[1].ids.is_empty() && results[1].scores.is_empty());
+        for r in &results {
+            assert!(!r.ids.contains(&1), "no list may point at a collapsed dup");
+            assert_eq!(r.ids.len(), r.scores.len());
+        }
+    }
+
     // A cluster whose members barely cohere relative to the run's median is
     // flagged as a grab-bag; a tight cluster is not, and an empty run flags
     // nothing.
@@ -705,6 +909,7 @@ mod tests {
             key: k.to_string(),
             summary: String::new(),
             embed: String::new(),
+            repo: String::new(),
             linked: None,
         };
         let units: Vec<units::UnitClusterInput> = (0..10).map(|i| unit(&format!("u{i}"))).collect();

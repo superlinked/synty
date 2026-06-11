@@ -529,6 +529,9 @@ fn topic_jobs() -> Result<Vec<Job>> {
         .iter()
         .map(|t| {
             let mut ordered: Vec<&units::Unit> = t.units.iter().collect();
+            // One rerun's summary is enough: collapsed duplicates would pad the
+            // reduce prompt with the same line and skew the idf and terms.
+            ordered.retain(|u| !u.dup);
             ordered.sort_by_key(|u| u.rank);
             ordered.iter().filter_map(|u| u.summary.clone()).take(40).collect()
         })

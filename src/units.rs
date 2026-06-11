@@ -97,7 +97,8 @@ pub struct Unit {
     pub outcome: String, // PR state, or session file/PR summary
     pub summary: Option<String>, // one-line LLM summary, if cached
     pub topic: Option<i64>,
-    pub rank: i64, // centrality rank within its topic (0 = medoid; MAX unranked)
+    pub rank: i64,  // centrality rank within its topic (0 = medoid; MAX unranked)
+    pub dup: bool,  // a collapsed near-duplicate of another unit in its topic
     pub struggle: f32,
     pub author: String,    // PR/issue author, or the resolved actor for sessions
     pub doc_id: Option<i64>,    // for PR/issue → docs.jsonl
@@ -283,7 +284,7 @@ pub fn sessions() -> Result<Vec<Session>> {
                 tools: a.tools,
                 files: a.files.clone(),
                 linked_pr: a.linked_pr.clone(),
-                topic: topic_of.get(id).map(|(c, _, _, _)| *c),
+                topic: topic_of.get(id).map(|t| t.cluster),
                 struggle: scores[i],
                 summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
                 author: a.actor.clone(),
@@ -311,7 +312,8 @@ pub fn units() -> Result<Vec<Unit>> {
             outcome: session_outcome(&s),
             summary: s.summary.clone(),
             topic: s.topic,
-            rank: topic_of.get(&s.id).map(|(_, _, _, r)| *r).unwrap_or(i64::MAX),
+            rank: topic_of.get(&s.id).map(|t| t.rank).unwrap_or(i64::MAX),
+            dup: topic_of.get(&s.id).is_some_and(|t| t.dup.is_some()),
             struggle: s.struggle,
             author: if s.author.is_empty() { local_actor.clone() } else { s.author.clone() },
             doc_id: None,
@@ -336,8 +338,9 @@ pub fn units() -> Result<Vec<Unit>> {
                 title: format!("{}#{} {}", d.meta.repo, num, first_line(&d.text)),
                 outcome: d.meta.state.clone().unwrap_or_default(),
                 summary: cache.get(&key).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
-                topic: topic_of.get(&key).map(|(c, _, _, _)| *c),
-                rank: topic_of.get(&key).map(|(_, _, _, r)| *r).unwrap_or(i64::MAX),
+                topic: topic_of.get(&key).map(|t| t.cluster),
+                rank: topic_of.get(&key).map(|t| t.rank).unwrap_or(i64::MAX),
+                dup: topic_of.get(&key).is_some_and(|t| t.dup.is_some()),
                 struggle: 0.0,
                 author: d.meta.author.clone(),
                 doc_id: Some(d.id),
@@ -419,21 +422,34 @@ fn struggle_scores(raw: &[[f64; 4]]) -> Vec<f32> {
 
 // ── topic membership (unit-level) ─────────────────────────────────────────
 
-/// unit key → (cluster index, stable cache key, label, centrality rank), from
-/// unit_clusters.json (written by `cluster`). Empty until clustering has run.
-/// The stable key falls back to the index string for pre-I1 files; the rank
-/// (0 = medoid) falls back to i64::MAX for files written before it existed,
-/// so ordering by rank degrades to the callers' existing order.
-fn unit_topics() -> HashMap<String, (i64, String, String, i64)> {
+/// One unit's clustering row, parsed from unit_clusters.json (written by
+/// `cluster`). The stable key falls back to the index string for pre-I1 files;
+/// the rank (0 = medoid) falls back to i64::MAX for files written before it
+/// existed, so ordering by rank degrades to the callers' existing order.
+struct UnitTopic {
+    cluster: i64,
+    stable: String,
+    label: String,
+    rank: i64,
+    dup: Option<String>, // the representative's key, when this unit is a collapsed near-duplicate
+}
+
+/// unit key → its clustering row. Empty until clustering has run.
+fn unit_topics() -> HashMap<String, UnitTopic> {
     let Ok(raw) = std::fs::read_to_string(readmodel::clusters_path()) else { return HashMap::new() };
     let arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
     arr.iter()
         .filter_map(|it| {
             let key = it["key"].as_str()?.to_string();
             let cluster = it["cluster"].as_i64()?;
-            let cache_key = it["topic"].as_str().map(String::from).unwrap_or_else(|| cluster.to_string());
-            let rank = it["rank"].as_i64().unwrap_or(i64::MAX);
-            Some((key, (cluster, cache_key, it["label"].as_str().unwrap_or("").to_string(), rank)))
+            let stable = it["topic"].as_str().map(String::from).unwrap_or_else(|| cluster.to_string());
+            Some((key, UnitTopic {
+                cluster,
+                stable,
+                label: it["label"].as_str().unwrap_or("").to_string(),
+                rank: it["rank"].as_i64().unwrap_or(i64::MAX),
+                dup: it["dup"].as_str().map(String::from),
+            }))
         })
         .collect()
 }
@@ -441,8 +457,8 @@ fn unit_topics() -> HashMap<String, (i64, String, String, i64)> {
 /// cluster index → label.
 fn cluster_labels() -> HashMap<i64, String> {
     let mut m = HashMap::new();
-    for (_, (c, _, l, _)) in unit_topics() {
-        m.entry(c).or_insert(l);
+    for (_, t) in unit_topics() {
+        m.entry(t.cluster).or_insert(t.label);
     }
     m
 }
@@ -450,22 +466,26 @@ fn cluster_labels() -> HashMap<i64, String> {
 /// cluster index → stable cache key (medoid hash).
 fn cluster_cache_keys() -> HashMap<i64, String> {
     let mut m = HashMap::new();
-    for (_, (c, k, _, _)) in unit_topics() {
-        m.entry(c).or_insert(k);
+    for (_, t) in unit_topics() {
+        m.entry(t.cluster).or_insert(t.stable);
     }
     m
 }
 
 /// Stable topic key → its members' embed-text hashes, centrality-ordered
-/// (medoid first). The embed texts are what `cluster` encoded into the shared
-/// store, so the name-faithfulness gate can score names against members
-/// without re-encoding anything but the names themselves.
+/// (medoid first), collapsed duplicates excluded — one rerun's vectors are
+/// enough. The embed texts are what `cluster` encoded into the shared store,
+/// so the name-faithfulness gate can score names against members without
+/// re-encoding anything but the names themselves.
 pub fn topic_member_embed_hashes() -> Result<HashMap<String, Vec<u64>>> {
     let topic_of = unit_topics();
     let mut grouped: HashMap<String, Vec<(i64, u64)>> = HashMap::new();
     for u in cluster_units()? {
-        if let Some((_, stable, _, rank)) = topic_of.get(&u.key) {
-            grouped.entry(stable.clone()).or_default().push((*rank, crate::index::fnv1a(u.embed.as_bytes())));
+        if let Some(t) = topic_of.get(&u.key) {
+            if t.dup.is_some() {
+                continue;
+            }
+            grouped.entry(t.stable.clone()).or_default().push((t.rank, crate::index::fnv1a(u.embed.as_bytes())));
         }
     }
     Ok(grouped
@@ -647,6 +667,7 @@ pub struct UnitClusterInput {
     pub key: String,
     pub summary: String, // for c-TF-IDF labels
     pub embed: String,   // richer text actually embedded for clustering
+    pub repo: String,    // dup collapsing never crosses repos
     pub linked: Option<String>, // for a session: the gh: key of the PR it produced
 }
 
@@ -667,7 +688,7 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
             let files = s.files.iter().take(8).cloned().collect::<Vec<_>>().join(" ");
             let embed = crate::excerpt(&format!("{summary} {} {}", s.repo, files), 500);
             let linked = s.linked_pr.as_deref().and_then(linked_pr_key);
-            out.push(UnitClusterInput { key: s.id, summary, embed, linked });
+            out.push(UnitClusterInput { key: s.id, summary, embed, repo: s.repo, linked });
         }
     }
     let cache = load_summary_cache();
@@ -678,7 +699,7 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
                 // summary + title + body, capped so units stay comparable in length
                 // (MaxSim is length-biased — long bodies would otherwise hub).
                 let embed = crate::excerpt(&format!("{} {}", c.summary, d.text), 500);
-                out.push(UnitClusterInput { key, summary: c.summary.clone(), embed, linked: None });
+                out.push(UnitClusterInput { key, summary: c.summary.clone(), embed, repo: d.meta.repo.clone(), linked: None });
             }
         }
     }
