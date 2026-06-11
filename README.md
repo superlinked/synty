@@ -113,7 +113,9 @@ SYNTY_BUCKET=s3://my-team ./install.sh   # per machine (or baked into VM images)
 ```
 
 That installs the model-free tracker at login: it tails local agent session
-files and pushes raw events to the bucket. The compute comes from viewers —
+files and pushes raw events to the bucket. GitHub needs a token on just one
+machine — its incremental scrape shares through the bucket and refreshes
+automatically during builds. The compute comes from viewers —
 whoever opens `synty tui` (or runs `synty build`) pulls the latest published
 read-model, then freshens in the background. Embeddings and summaries are
 write-once shared objects (the first machine to need one generates it for the

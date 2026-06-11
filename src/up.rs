@@ -14,16 +14,9 @@ pub fn run(bucket: &str, machine: &str, poll_secs: u64, github: bool) -> Result<
         "synty up: track + index every {poll_secs}s (bucket {bucket}). Ctrl-C to stop.",
     );
 
-    // GitHub changes slowly; pull once at startup, best-effort (needs a token).
+    // GitHub changes slowly; refresh once at startup, best-effort.
     if github {
-        match crate::config::load().org {
-            Some(org) => {
-                if let Err(e) = crate::github::run(&org, None, 90, &format!("{CORPUS_DIR}/github")) {
-                    eprintln!("up: github pull skipped ({e})");
-                }
-            }
-            None => eprintln!("up: no GitHub org configured — run `synty setup` to add one"),
-        }
+        refresh_github(bucket);
     }
 
     let mut iteration = 0u64;
@@ -52,6 +45,8 @@ pub fn build(bucket: &str, machine: &str, resolution: f64, no_track: bool) -> Re
         Ok(false) => {}
         Err(e) => eprintln!("build: read-model pull skipped ({e})"),
     }
+
+    refresh_github(bucket);
 
     if !no_track {
         track::run(track::Opts {
@@ -107,6 +102,35 @@ pub fn build(bucket: &str, machine: &str, resolution: f64, no_track: bool) -> Re
     }
     eprintln!("build: done — try `synty topic`, `synty search \"…\"`, or `synty tui`");
     Ok(())
+}
+
+/// Stale GitHub corpus older than this triggers a refresh during a build.
+const GITHUB_STALE_MIN: i64 = 60;
+
+/// The fleet's GitHub corpus: pull the bucket's copy, and when it's stale and
+/// this machine has an org + token, refresh it incrementally and push — one
+/// tokened machine keeps everyone's PRs/issues fresh; the rest just pull. This
+/// is also what stops a token-less builder from publishing a read-model with
+/// the org's GitHub docs missing.
+fn refresh_github(bucket: &str) {
+    let dir = format!("{CORPUS_DIR}/github");
+    match crate::sync::pull_github(bucket, &dir) {
+        Ok(n) if n > 0 => eprintln!("github: pulled {n} corpus files from {bucket}"),
+        Ok(_) => {}
+        Err(e) => eprintln!("github: corpus pull skipped ({e})"),
+    }
+    if !crate::github::stale(&dir, GITHUB_STALE_MIN) {
+        return;
+    }
+    let Some(org) = crate::config::load().org else { return };
+    match crate::github::run(&org, None, 90, &dir) {
+        Ok(()) => match crate::sync::push_github(bucket, &dir) {
+            Ok(n) if n > 0 => eprintln!("github: pushed {n} corpus objects → {bucket}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("github: corpus push skipped ({e})"),
+        },
+        Err(e) => eprintln!("github: refresh skipped ({e})"), // e.g. no token here
+    }
 }
 
 #[cfg(feature = "llm")]

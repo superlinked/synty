@@ -1,7 +1,14 @@
 // Machine-independent GitHub ingestion. Pulls a trailing window of PRs and
 // issues per repo straight from the GitHub GraphQL API with a token, so it runs
 // anywhere (CI, a server) without a developer machine or the `gh` CLI. Output
-// is the per-repo JSON `ingest` reads: corpus/github/{prs,issues}-<repo>.json.
+// is the per-repo JSON `ingest` reads: corpus/github/{prs,issues}-<repo>.json,
+// plus a manifest (hashes + scraped_at) that shares the corpus through the
+// bucket and floors the next scrape.
+//
+// Scrapes are INCREMENTAL: ordered by UPDATED_AT and floored at the last
+// scrape time, so a steady-state run fetches only items that changed since —
+// including state flips (OPEN→MERGED) the old created-window approach only
+// refreshed by re-downloading everything.
 //
 // Token resolution: $GITHUB_TOKEN, else `gh auth token` for local convenience.
 
@@ -12,10 +19,17 @@ use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.github.com/graphql";
 const PAGE: i64 = 50;
+/// Overlap subtracted from the last scrape time when flooring an incremental
+/// fetch — clock skew and in-flight updates must not slip between scrapes.
+const FLOOR_SLACK_MIN: i64 = 60;
 
 pub fn run(owner: &str, repos: Option<String>, since_days: u64, out: &str) -> Result<()> {
     let token = resolve_token()?;
     let cutoff = days_ago_rfc3339(since_days);
+    let floor = scrape_floor(&crate::sync::load_github_manifest(out).scraped_at, &cutoff);
+    if floor != cutoff {
+        eprintln!("github: incremental — fetching items updated since {floor}");
+    }
     // Explicit --repos wins; otherwise pull the org's most-recently-active set.
     let repos: Vec<String> = match repos {
         Some(s) => s.split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect(),
@@ -40,19 +54,87 @@ pub fn run(owner: &str, repos: Option<String>, since_days: u64, out: &str) -> Re
         crate::identity::cache_github_login(&login);
     }
 
+    let scraped_at = days_ago_rfc3339(0);
+    let mut manifest = crate::sync::GithubManifest { scraped_at, ..Default::default() };
     let mut tot_pr = 0;
     let mut tot_is = 0;
     for repo in &repos {
-        let prs = fetch(&agent, &token, owner, repo, Kind::Pr, &cutoff)?;
-        let issues = fetch(&agent, &token, owner, repo, Kind::Issue, &cutoff)?;
-        std::fs::write(Path::new(out).join(format!("prs-{repo}.json")), serde_json::to_string(&prs)?)?;
-        std::fs::write(Path::new(out).join(format!("issues-{repo}.json")), serde_json::to_string(&issues)?)?;
-        tot_pr += prs.len();
-        tot_is += issues.len();
-        eprintln!("{:<22} prs={:<4} issues={}", repo, prs.len(), issues.len());
+        // A repo we've never scraped gets the full window even mid-increment.
+        let mut write = |kind: Kind, fname: String, count: &mut usize| -> Result<()> {
+            let path = Path::new(out).join(&fname);
+            let existing: Vec<Value> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let f = if existing.is_empty() { &cutoff } else { &floor };
+            let fetched = fetch(&agent, &token, owner, repo, kind, f)?;
+            let merged = merge_items(existing, fetched, &cutoff);
+            *count += merged.len();
+            let body = serde_json::to_string(&merged)?;
+            manifest.files.insert(fname, format!("{:016x}", crate::index::fnv1a(body.as_bytes())));
+            std::fs::write(path, body)?;
+            Ok(())
+        };
+        write(Kind::Pr, format!("prs-{repo}.json"), &mut tot_pr)?;
+        write(Kind::Issue, format!("issues-{repo}.json"), &mut tot_is)?;
     }
-    eprintln!("github: {tot_pr} PRs + {tot_is} issues from {} repos (since {cutoff}) → {out}", repos.len());
+    // Drop files for repos no longer in the active set, then publish the
+    // manifest — ingest reads the directory, so orphans would linger forever.
+    for entry in std::fs::read_dir(out)?.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if (name.starts_with("prs-") || name.starts_with("issues-")) && !manifest.files.contains_key(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    crate::write_atomic(
+        &Path::new(out).join(crate::sync::GH_MANIFEST).to_string_lossy(),
+        &serde_json::to_vec(&manifest)?,
+    )?;
+    eprintln!("github: {tot_pr} PRs + {tot_is} issues across {} repos (window since {cutoff}) → {out}", repos.len());
     Ok(())
+}
+
+/// Floor for an incremental fetch: the last scrape time minus slack, never
+/// older than the retention window (a long-idle machine just re-backfills).
+fn scrape_floor(scraped_at: &str, window_cutoff: &str) -> String {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    let Some(t) = DateTime::parse_from_rfc3339(scraped_at).ok() else { return window_cutoff.into() };
+    let floored = (t.with_timezone(&Utc) - chrono::Duration::minutes(FLOOR_SLACK_MIN))
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    if floored.as_str() > window_cutoff { floored } else { window_cutoff.into() }
+}
+
+/// Merge an incremental fetch into a repo's existing items: replace by number,
+/// insert new, drop anything created before the retention window, newest
+/// (by creation) first — the same shape a full scrape produces.
+fn merge_items(existing: Vec<Value>, fetched: Vec<Value>, created_cutoff: &str) -> Vec<Value> {
+    let mut by_number: std::collections::BTreeMap<i64, Value> = existing
+        .into_iter()
+        .filter_map(|v| v["number"].as_i64().map(|n| (n, v)))
+        .collect();
+    for v in fetched {
+        if let Some(n) = v["number"].as_i64() {
+            by_number.insert(n, v);
+        }
+    }
+    let mut out: Vec<Value> = by_number
+        .into_values()
+        .filter(|v| v["createdAt"].as_str().unwrap_or("") >= created_cutoff)
+        .collect();
+    out.sort_by(|a, b| b["createdAt"].as_str().unwrap_or("").cmp(a["createdAt"].as_str().unwrap_or("")));
+    out
+}
+
+/// Whether the local GitHub corpus is older than `minutes` (or was never
+/// scraped) — the build's cue to refresh it if it has a token. RFC3339 UTC
+/// strings compare lexicographically; an empty scraped_at is always stale.
+pub fn stale(dir: &str, minutes: i64) -> bool {
+    crate::sync::load_github_manifest(dir).scraped_at < days_ago_rfc3339_minutes(minutes)
+}
+
+fn days_ago_rfc3339_minutes(minutes: i64) -> String {
+    use chrono::{SecondsFormat, Utc};
+    (Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 #[derive(Clone, Copy)]
@@ -61,11 +143,12 @@ enum Kind {
     Issue,
 }
 
-/// Paginate a repo's PRs or issues (newest first), keeping nodes created at or
-/// after `cutoff` and stopping once they fall older. Each node is reshaped into
-/// the JSON `ingest` expects (number, title, body, author.login, url, labels,
-/// state, createdAt).
-fn fetch(agent: &ureq::Agent, token: &str, owner: &str, repo: &str, kind: Kind, cutoff: &str) -> Result<Vec<Value>> {
+/// Paginate a repo's PRs or issues most-recently-UPDATED first, keeping nodes
+/// updated at or after `floor` and stopping once they fall older — so an
+/// incremental scrape touches only what changed (new items AND state flips on
+/// old ones). Each node is reshaped into the JSON `ingest` expects (number,
+/// title, body, author.login, url, labels, state, createdAt).
+fn fetch(agent: &ureq::Agent, token: &str, owner: &str, repo: &str, kind: Kind, floor: &str) -> Result<Vec<Value>> {
     let conn = match kind {
         Kind::Pr => "pullRequests",
         Kind::Issue => "issues",
@@ -73,9 +156,9 @@ fn fetch(agent: &ureq::Agent, token: &str, owner: &str, repo: &str, kind: Kind, 
     let query = format!(
         r#"query($owner:String!,$name:String!,$cursor:String){{
   repository(owner:$owner,name:$name){{
-    {conn}(first:{PAGE},after:$cursor,orderBy:{{field:CREATED_AT,direction:DESC}}){{
+    {conn}(first:{PAGE},after:$cursor,orderBy:{{field:UPDATED_AT,direction:DESC}}){{
       pageInfo{{hasNextPage endCursor}}
-      nodes{{number title body state url createdAt author{{login}} labels(first:20){{nodes{{name}}}}}}
+      nodes{{number title body state url createdAt updatedAt author{{login}} labels(first:20){{nodes{{name}}}}}}
     }}
   }}
 }}"#
@@ -88,9 +171,9 @@ fn fetch(agent: &ureq::Agent, token: &str, owner: &str, repo: &str, kind: Kind, 
         let data = post(agent, token, &query, vars)?;
         let conn_obj = &data["repository"][conn];
         for n in conn_obj["nodes"].as_array().cloned().unwrap_or_default() {
-            let created = n["createdAt"].as_str().unwrap_or("");
-            if created < cutoff {
-                return Ok(out); // newest-first: everything below is older
+            let updated = n["updatedAt"].as_str().unwrap_or("");
+            if updated < floor {
+                return Ok(out); // newest-updated first: everything below is older
             }
             out.push(reshape(&n));
         }
@@ -202,4 +285,60 @@ fn repos_under(root: &str, affil: &str, owner: &str, k: usize) -> Result<Vec<Str
 fn days_ago_rfc3339(days: u64) -> String {
     use chrono::{SecondsFormat, Utc};
     (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(number: i64, created: &str, state: &str) -> Value {
+        json!({"number": number, "title": format!("t{number}"), "createdAt": created, "state": state})
+    }
+
+    // An incremental fetch merges into the existing corpus: a state flip
+    // replaces the old item, new items insert, items older than the retention
+    // window drop, and the result stays newest-created-first like a full scrape.
+    #[test]
+    fn incremental_merge_updates_inserts_and_expires() {
+        let existing = vec![
+            item(1, "2026-05-01T00:00:00Z", "OPEN"),
+            item(2, "2026-03-01T00:00:00Z", "OPEN"), // now outside the window
+        ];
+        let fetched = vec![
+            item(1, "2026-05-01T00:00:00Z", "MERGED"), // state flip
+            item(3, "2026-06-01T00:00:00Z", "OPEN"),   // new
+        ];
+        let merged = merge_items(existing, fetched, "2026-04-01T00:00:00Z");
+        let numbers: Vec<i64> = merged.iter().map(|v| v["number"].as_i64().unwrap()).collect();
+        assert_eq!(numbers, vec![3, 1], "newest first; #2 expired");
+        assert_eq!(merged[1]["state"], "MERGED", "the fetch's state wins");
+    }
+
+    // The fetch floor: last scrape minus slack, never older than the window —
+    // and a never-scraped corpus backfills the whole window.
+    #[test]
+    fn floor_is_last_scrape_minus_slack_bounded_by_window() {
+        let window = "2026-03-01T00:00:00Z";
+        assert_eq!(scrape_floor("", window), window, "no manifest → full window");
+        assert_eq!(scrape_floor("2026-06-10T12:00:00Z", window), "2026-06-10T11:00:00Z");
+        assert_eq!(scrape_floor("2026-01-01T00:00:00Z", window), window, "stale scrape → window");
+    }
+
+    // Staleness drives the build's refresh decision: never-scraped and old
+    // manifests are stale, a fresh one is not.
+    #[test]
+    fn staleness_reads_the_manifest() {
+        let dir = std::env::temp_dir().join(format!("synty-ghstale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        assert!(stale(d, 60), "no manifest → stale");
+        let m = crate::sync::GithubManifest { scraped_at: days_ago_rfc3339_minutes(0), ..Default::default() };
+        std::fs::write(dir.join(crate::sync::GH_MANIFEST), serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(!stale(d, 60), "just scraped → fresh");
+        let m = crate::sync::GithubManifest { scraped_at: days_ago_rfc3339_minutes(120), ..Default::default() };
+        std::fs::write(dir.join(crate::sync::GH_MANIFEST), serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(stale(d, 60), "two hours old → stale");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

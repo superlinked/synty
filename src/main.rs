@@ -306,6 +306,9 @@ enum Cmd {
         /// Output dir for the per-repo JSON
         #[arg(long, default_value = "corpus/github")]
         out: String,
+        /// Bucket to share the scraped corpus with (default: config, then .synty)
+        #[arg(long)]
+        bucket: Option<String>,
     },
 }
 
@@ -426,11 +429,15 @@ fn main() -> Result<()> {
         Cmd::Up { bucket, machine, poll, no_github } => {
             up::run(&config::resolve_bucket(bucket), &machine, poll, !no_github)?
         }
-        Cmd::Github { owner, repos, since_days, out } => {
+        Cmd::Github { owner, repos, since_days, out, bucket } => {
             let owner = owner
                 .or_else(|| config::load().org)
                 .ok_or_else(|| anyhow::anyhow!("no GitHub org: run `synty setup` or pass --owner"))?;
-            github::run(&owner, repos, since_days, &out)?
+            github::run(&owner, repos, since_days, &out)?;
+            let n = sync::push_github(&config::resolve_bucket(bucket), &out)?;
+            if n > 0 {
+                eprintln!("github: pushed {n} corpus objects to the bucket");
+            }
         }
     }
     Ok(())

@@ -66,7 +66,7 @@ the bucket; `docs.jsonl` + the index are derived.
 | Source | Mechanism | Status |
 |---|---|---|
 | Claude Code / Codex / Cowork | `synty track` tails local session files → canonical envelopes | **Built** (native Rust tailers, one per tool; `--watch` + per-file cursors + launchd/systemd autostart) |
-| GitHub (PRs, issues, comments) | `synty github` GraphQL backfill (token) | **Built** (machine-independent, no `gh`); App install-token + webhooks planned |
+| GitHub (PRs, issues) | `synty github` GraphQL backfill (token) | **Built** — incremental (UPDATED_AT-floored at the last scrape, so steady-state runs fetch only changes incl. state flips); the corpus + manifest share through the bucket, and `build` refreshes when stale and a token is present, so one tokened machine scrapes for the fleet. App install-token + webhooks planned |
 
 `synty track` is the source of truth for sessions: a `Source` per tool detects
 the file format version and builds a parser; a shared driver mints canonical

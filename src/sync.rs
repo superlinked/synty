@@ -75,6 +75,90 @@ pub fn pull_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
     Ok(n)
 }
 
+/// The GitHub corpus manifest: per-file content hashes plus when the last
+/// scrape ran. Written by `synty github`, shared through the bucket so one
+/// tokened machine scrapes for the fleet — and so a builder that never
+/// scraped can't publish a read-model with the org's PRs missing.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct GithubManifest {
+    pub scraped_at: String,
+    pub files: BTreeMap<String, String>, // filename → fnv64 of contents
+}
+
+pub const GH_MANIFEST: &str = ".manifest.json";
+const GITHUB_PREFIX: &str = "github";
+
+pub fn load_github_manifest(dir: &str) -> GithubManifest {
+    std::fs::read_to_string(Path::new(dir).join(GH_MANIFEST))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Push the local GitHub corpus (files whose hash the bucket manifest doesn't
+/// have) and then the manifest. Returns objects uploaded.
+pub fn push_github(bucket_uri: &str, dir: &str) -> Result<usize> {
+    let local = load_github_manifest(dir);
+    if local.files.is_empty() {
+        return Ok(0); // never scraped here
+    }
+    let b = bucket::open(bucket_uri)?;
+    let remote: GithubManifest = b
+        .get(&format!("{GITHUB_PREFIX}/{GH_MANIFEST}"))?
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default();
+    if remote.scraped_at >= local.scraped_at {
+        return Ok(0); // bucket is as fresh or fresher
+    }
+    let mut n = 0;
+    for (name, hash) in &local.files {
+        if remote.files.get(name) != Some(hash) {
+            b.put(&format!("{GITHUB_PREFIX}/{name}"), &std::fs::read(Path::new(dir).join(name))?)?;
+            n += 1;
+        }
+    }
+    b.put(&format!("{GITHUB_PREFIX}/{GH_MANIFEST}"), &serde_json::to_vec(&local)?)?;
+    Ok(n + 1)
+}
+
+/// Pull the fleet's GitHub corpus when the bucket's manifest is fresher:
+/// changed files are fetched, files dropped from the scrape set are removed,
+/// and the local manifest adopts the remote one. Returns files changed.
+pub fn pull_github(bucket_uri: &str, dir: &str) -> Result<usize> {
+    let b = bucket::open(bucket_uri)?;
+    let Some(remote) = b
+        .get(&format!("{GITHUB_PREFIX}/{GH_MANIFEST}"))?
+        .and_then(|raw| serde_json::from_slice::<GithubManifest>(&raw).ok())
+    else {
+        return Ok(0); // nothing published yet
+    };
+    let local = load_github_manifest(dir);
+    if local.scraped_at >= remote.scraped_at {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(dir)?;
+    let mut n = 0;
+    for (name, hash) in &remote.files {
+        if local.files.get(name) == Some(hash) {
+            continue;
+        }
+        let Some(bytes) = b.get(&format!("{GITHUB_PREFIX}/{name}"))? else { continue };
+        crate::write_atomic(&Path::new(dir).join(name).to_string_lossy(), &bytes)?;
+        n += 1;
+    }
+    for name in local.files.keys() {
+        if !remote.files.contains_key(name) {
+            let _ = std::fs::remove_file(Path::new(dir).join(name));
+            n += 1;
+        }
+    }
+    crate::write_atomic(
+        &Path::new(dir).join(GH_MANIFEST).to_string_lossy(),
+        &serde_json::to_vec(&remote)?,
+    )?;
+    Ok(n)
+}
+
 /// Upload the current build: blobs for files the bucket doesn't have yet, the
 /// (build, rev) manifest, then the pointer — strictly last, so readers either
 /// see the previous complete build or this complete build, never a mix.
@@ -166,4 +250,55 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
     readmodel::repoint(&remote.build, remote.rev)?;
     readmodel::gc(&keep);
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The GitHub corpus travels through the bucket by manifest: a scraping
+    // machine pushes changed files; a token-less machine pulls them (and drops
+    // files for repos that left the scrape set) — so any builder publishes
+    // with the org's PRs present.
+    #[test]
+    fn github_corpus_roundtrips_through_the_bucket() {
+        let root = std::env::temp_dir().join(format!("synty-ghsync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b, bucket) = (root.join("a"), root.join("b"), root.join("bucket"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let write_manifest = |dir: &std::path::Path, m: &GithubManifest| {
+            std::fs::write(dir.join(GH_MANIFEST), serde_json::to_vec(m).unwrap()).unwrap();
+        };
+
+        // Machine A scraped two repos.
+        std::fs::write(a.join("prs-web.json"), b"[\"web\"]").unwrap();
+        std::fs::write(a.join("prs-api.json"), b"[\"api\"]").unwrap();
+        let mut m = GithubManifest { scraped_at: "2026-06-11T10:00:00Z".into(), ..Default::default() };
+        for f in ["prs-web.json", "prs-api.json"] {
+            let h = crate::index::fnv1a(&std::fs::read(a.join(f)).unwrap());
+            m.files.insert(f.into(), format!("{h:016x}"));
+        }
+        write_manifest(&a, &m);
+        let bu = bucket.to_str().unwrap();
+        assert!(push_github(bu, a.to_str().unwrap()).unwrap() > 0);
+        assert_eq!(push_github(bu, a.to_str().unwrap()).unwrap(), 0, "re-push is a no-op");
+
+        // Machine B (no token, never scraped) pulls the corpus.
+        assert!(pull_github(bu, b.to_str().unwrap()).unwrap() > 0);
+        assert_eq!(std::fs::read(b.join("prs-web.json")).unwrap(), b"[\"web\"]");
+        assert_eq!(pull_github(bu, b.to_str().unwrap()).unwrap(), 0, "re-pull is a no-op");
+
+        // A re-scrapes later: api dropped from the set, web changed.
+        std::fs::write(a.join("prs-web.json"), b"[\"web2\"]").unwrap();
+        let mut m2 = GithubManifest { scraped_at: "2026-06-11T11:00:00Z".into(), ..Default::default() };
+        let h = crate::index::fnv1a(&std::fs::read(a.join("prs-web.json")).unwrap());
+        m2.files.insert("prs-web.json".into(), format!("{h:016x}"));
+        write_manifest(&a, &m2);
+        push_github(bu, a.to_str().unwrap()).unwrap();
+        pull_github(bu, b.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(b.join("prs-web.json")).unwrap(), b"[\"web2\"]");
+        assert!(!b.join("prs-api.json").exists(), "dropped repo removed on pull");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
