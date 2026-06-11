@@ -186,10 +186,14 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     let live = members.iter().filter(|m| !m.is_empty()).count();
     let id_continuity = if prev.is_empty() || live == 0 { 0.0 } else { 100.0 * inherited as f64 / live as f64 };
 
+    // Centrality rank within each cluster (0 = medoid). Persisted so the
+    // summarizer can lead its prompts with the most central members — the
+    // theme, not whatever happens to be most recent.
+    let rank = centrality_ranks(&members, &results, &of);
     let mut assign: Vec<serde_json::Value> = Vec::new();
     for (i, o) in of.iter().enumerate() {
         if let Some(ci) = o {
-            assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "topic": stable_keys[*ci], "label": labels[*ci]}));
+            assign.push(serde_json::json!({"key": units[i].key, "cluster": ci, "topic": stable_keys[*ci], "label": labels[*ci], "rank": rank[i]}));
         }
     }
     // Clusters are a derived artifact OF a build: write the next rev as a new
@@ -316,7 +320,8 @@ fn maxsim_knn(emb: &[Array2<f32>], k: usize) -> Vec<Knn> {
 }
 
 /// Late-interaction score: each query token's best doc-token dot, summed.
-fn maxsim(q: &Array2<f32>, doc: &Array2<f32>) -> f32 {
+/// Also the substrate of the name-faithfulness gate (qwen).
+pub(crate) fn maxsim(q: &Array2<f32>, doc: &Array2<f32>) -> f32 {
     if q.nrows() == 0 || doc.nrows() == 0 {
         return 0.0;
     }
@@ -462,6 +467,25 @@ fn reassign_once(results: &[Knn], of: &mut [Option<usize>], has_edge: &[bool]) -
         }
     }
     moved
+}
+
+/// Each clustered unit's centrality rank within its cluster: members ordered
+/// by summed same-cluster MaxSim, descending — rank 0 is the medoid. Unclustered
+/// units keep 0; they are never written to unit_clusters.json.
+fn centrality_ranks(members: &[Vec<usize>], results: &[Knn], of: &[Option<usize>]) -> Vec<usize> {
+    let mut rank = vec![0usize; results.len()];
+    for m in members {
+        let mut ord = m.clone();
+        ord.sort_by(|&a, &b| {
+            same_cluster_score(b, results, of)
+                .partial_cmp(&same_cluster_score(a, results, of))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (r, &i) in ord.iter().enumerate() {
+            rank[i] = r;
+        }
+    }
+    rank
 }
 
 /// The cluster's medoid — the member best connected to its co-members (max summed
@@ -629,6 +653,23 @@ mod tests {
             let want: Vec<usize> = brute.iter().take(5).map(|(j, _)| *j).collect();
             assert_eq!(knn[i].ids, want, "unit {i} neighbor ranking diverged");
         }
+    }
+
+    // The hub of a cluster (best-connected member) gets rank 0 — its summary
+    // leads the topic prompts, so the rank must reflect connectivity, not
+    // insertion order.
+    #[test]
+    fn centrality_rank_puts_the_hub_first() {
+        // Unit 1 is everyone's strong neighbor; 0 and 2 connect mainly to 1.
+        let results = vec![
+            Knn { ids: vec![1, 2], scores: vec![0.9, 0.2] },
+            Knn { ids: vec![0, 2], scores: vec![0.9, 0.8] },
+            Knn { ids: vec![1, 0], scores: vec![0.8, 0.2] },
+        ];
+        let of = vec![Some(0), Some(0), Some(0)];
+        let rank = centrality_ranks(&[vec![0, 1, 2]], &results, &of);
+        assert_eq!(rank[1], 0, "the hub is the medoid");
+        assert!(rank[0] < rank[2], "stronger connectivity ranks earlier");
     }
 
     // maxsim: per query token, best doc-token dot, summed.

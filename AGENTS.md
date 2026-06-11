@@ -45,7 +45,8 @@ Operations that produce health or quality numbers emit them the same way, never
 ad hoc: build a `metrics::Run`, record named fields, `emit()` a `[metrics <op>]`
 block to stderr. `cluster` logs modularity, misplaced %, cluster-size
 min/median/max, and the session/doc mix; `summarize` logs unit coverage, topics
-named, duplicate names, keyword-fallback names, and throughput. Redirect stderr
+named, duplicate names, keyword-fallback names, name faithfulness, and
+throughput. Redirect stderr
 (`2>> runs.log`) if you want a history.
 When a change is meant to move quality, read the metric — don't eyeball it or
 recompute in a throwaway script.

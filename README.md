@@ -151,8 +151,10 @@ delay, redaction) is the planned answer where it isn't.
 - **Topics** — units of work (sessions, PRs, issues) clustered by the embedding
   of their one-line summary (Louvain over a MaxSim kNN graph), each named by the
   local model with a short title that must share one of the cluster's
-  *distinctive* terms (c-TF-IDF against the other clusters) and may not be a
-  bare repo name — otherwise an extractive keyword title takes its place; a
+  *distinctive* terms (c-TF-IDF against the other clusters), may not be a
+  bare repo name, and must embed close to its members (MaxSim against the
+  cluster's own embeddings) — otherwise an extractive keyword title takes
+  its place; a
   `--resolution` knob trades more, smaller topics for fewer, larger ones. A
   topic is a coherent set of units, not a bag of messages.
 - **Source of truth** — sessions and GitHub items become append-only event

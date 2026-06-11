@@ -7,6 +7,7 @@
 use crate::units::{self, CachedSummary, DocInput, SessionInput};
 use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
+use ndarray::Array2;
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::{Config, ModelForCausalLM};
 use sha2::{Digest, Sha256};
@@ -473,13 +474,16 @@ struct Job {
 }
 
 /// Salt for the topic reduce / name prompts; bump to regenerate them only.
-/// t7: combinatorial opener stripping (drops "the cluster focuses …" et al.).
+/// t8: reduce inputs ordered by centrality, medoid first (the 0.6B attends to
+/// early tokens, so the theme should lead, not the most recent member).
 /// s4: distinctive (c-TF-IDF) terms in the prompt and gate, keyword fallback,
 /// repo-slug ban — and the name's hash now covers only the summary it titles,
 /// so a version bump is the one lever that forces a fleet-wide name refresh
 /// after term-algorithm changes.
-const TOPIC_PROMPT_VERSION: &str = "t7";
-const TOPIC_NAME_VERSION: &str = "s4";
+/// s5: centrality-ordered examples + the embedding-faithfulness gate; isolates
+/// these names from machines still generating ungated s4 ones.
+const TOPIC_PROMPT_VERSION: &str = "t8";
+const TOPIC_NAME_VERSION: &str = "s5";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -495,18 +499,15 @@ fn unit_jobs() -> Result<Vec<Job>> {
     Ok(jobs)
 }
 
-/// Representative member lines for the name prompt: the shortest summaries are
-/// the most title-like, but the very shortest are degenerate slug echoes
-/// ("sie-internal: #955") that prime the small model to answer in slugs — so
-/// require a minimum of substance first, falling back to the raw list when a
-/// tiny cluster has nothing better.
+/// Representative member lines for the name prompt: the most central members
+/// (the input arrives medoid-first) that are real sentences — the degenerate
+/// slug echoes ("sie-internal: #955") prime the small model to answer in
+/// slugs, so anything under 5 words is skipped, falling back to the raw list
+/// when a tiny cluster has nothing better.
 fn pick_examples(members: &[String]) -> Vec<String> {
-    let mut wf: Vec<&String> = members.iter().filter(|s| s.split_whitespace().count() >= 5).collect();
-    if wf.len() < 3 {
-        wf = members.iter().collect();
-    }
-    wf.sort_by_key(|s| s.len());
-    wf.iter().take(3).map(|s| crate::excerpt(s, 90)).collect()
+    let wf: Vec<&String> = members.iter().filter(|s| s.split_whitespace().count() >= 5).collect();
+    let pick: Vec<&String> = if wf.len() < 3 { members.iter().collect() } else { wf };
+    pick.iter().take(3).map(|s| crate::excerpt(s, 90)).collect()
 }
 
 /// Topic jobs: a one-line summary reduced from the member-unit summaries, plus a
@@ -518,11 +519,19 @@ fn pick_examples(members: &[String]) -> Vec<String> {
 /// a TOPIC_NAME_VERSION bump forces the rest.
 fn topic_jobs() -> Result<Vec<Job>> {
     // First pass: every cluster's member summaries (capped exactly as the jobs
-    // consume them), so terms can be weighted by cross-cluster rarity.
+    // consume them), so terms can be weighted by cross-cluster rarity. Members
+    // are ordered by centrality (medoid first, from `cluster`'s rank; stable
+    // sort keeps recency among unranked) — the 0.6B attends to early tokens,
+    // so the reduce prompt and the examples lead with the theme, not with
+    // whatever happens to be most recent.
     let topics = units::topic_units(12)?;
     let memberships: Vec<Vec<String>> = topics
         .iter()
-        .map(|t| t.units.iter().filter_map(|u| u.summary.clone()).take(40).collect())
+        .map(|t| {
+            let mut ordered: Vec<&units::Unit> = t.units.iter().collect();
+            ordered.sort_by_key(|u| u.rank);
+            ordered.iter().filter_map(|u| u.summary.clone()).take(40).collect()
+        })
         .collect();
     let populated: Vec<Vec<String>> = memberships.iter().filter(|m| !m.is_empty()).cloned().collect();
     let idf = idf_map(&populated);
@@ -634,6 +643,126 @@ fn keyword_label(terms: &[String], ban: &[String]) -> String {
         .map(|t| title_case(t))
         .collect();
     crate::excerpt(&kw.join(" · "), 48)
+}
+
+/// Most-central members scored per topic by the embedding gate — the head of
+/// the centrality-ordered list represents the theme; a hub's periphery adds
+/// nothing but noise.
+const GATE_MEMBERS: usize = 20;
+/// Run-relative faithfulness floor: an LLM name scoring below this fraction of
+/// the run's median is rejected (mirrors the clustering FLOOR). Run-relative
+/// because MaxSim is non-metric — absolute thresholds don't transfer across
+/// corpora or models (see quality-roadmap, cross-cutting tradeoffs).
+const EMBED_FLOOR: f32 = 0.6;
+/// Below this many scored names the median is noise — apply no rejections.
+const EMBED_MIN_SCORED: usize = 8;
+
+/// Length-normalized MaxSim of a name against its topic's members: mean over
+/// members of (per-name-token best dot, summed) ÷ name tokens. A hallucinated
+/// token finds no good match in any member and drags the mean down, while the
+/// length norm keeps 2-word and 5-word names comparable.
+fn name_score(name: &Array2<f32>, members: &[Array2<f32>]) -> f32 {
+    if name.nrows() == 0 || members.is_empty() {
+        return 0.0;
+    }
+    let s: f32 = members.iter().map(|m| crate::topics::maxsim(name, m)).sum();
+    s / members.len() as f32 / name.nrows() as f32
+}
+
+/// Which of the (index, score) pairs fail the run-relative floor.
+fn embed_rejects(scores: &[(usize, f32)]) -> Vec<usize> {
+    if scores.len() < EMBED_MIN_SCORED {
+        return Vec::new();
+    }
+    let mut v: Vec<f32> = scores.iter().map(|(_, s)| *s).collect();
+    v.sort_by(f32::total_cmp);
+    let med = v[v.len() / 2];
+    scores.iter().filter(|(_, s)| *s < EMBED_FLOOR * med).map(|(i, _)| *i).collect()
+}
+
+/// I2's embedding-faithfulness gate, over every valid LLM topic name — the
+/// unigram gate cannot see a hallucinated half ("Stablebridge Dashboard" on a
+/// dashboard cluster). Each name is embedded with the retrieval encoder
+/// (content-addressed, so usually a store hit) and MaxSim-scored against the
+/// member embeddings `cluster` already produced; run-relative outliers are
+/// replaced with the keyword label in the LOCAL cache only. The write-once
+/// fleet store keeps the raw generation — every machine applies the same
+/// deterministic verdict, so corrections converge without coordination.
+/// Returns (scored, rejected).
+fn embed_gate_names(tjobs: &[Job], cache: &mut units::SummaryCache, bucket: &str) -> Result<(usize, usize)> {
+    let model = crate::model_id();
+    let store = crate::store::EmbStore::open(bucket, &model)?;
+    let member_hashes = units::topic_member_embed_hashes()?;
+
+    // Candidates: cached LLM-authored names. Keyword fallbacks are extractive
+    // — grounded by construction — and skipped.
+    let mut cand: Vec<(&Job, String)> = Vec::new();
+    for j in tjobs.iter().filter(|j| j.short) {
+        let Some(c) = cache.get(&j.key) else { continue };
+        if c.summary.is_empty() || c.summary == keyword_label(j.gate.as_deref().unwrap_or_default(), &j.ban) {
+            continue;
+        }
+        cand.push((j, c.summary.clone()));
+    }
+    if cand.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut embs: Vec<Option<Array2<f32>>> = Vec::with_capacity(cand.len());
+    for (_, name) in &cand {
+        embs.push(store.get(crate::index::fnv1a(name.as_bytes()))?);
+    }
+    let miss: Vec<usize> = (0..cand.len()).filter(|&i| embs[i].is_none()).collect();
+    if !miss.is_empty() {
+        let mut enc = crate::encode::Encoder::load(&model)?;
+        let texts: Vec<String> = miss.iter().map(|&i| cand[i].1.clone()).collect();
+        for (&i, e) in miss.iter().zip(enc.encode_docs(&texts)?) {
+            store.put(crate::index::fnv1a(cand[i].1.as_bytes()), &e)?;
+            embs[i] = Some(e);
+        }
+    }
+
+    let mut scores: Vec<(usize, f32)> = Vec::new();
+    for (i, (j, _)) in cand.iter().enumerate() {
+        let stable = j.key.strip_prefix("topicname:").unwrap_or(&j.key);
+        let Some(hashes) = member_hashes.get(stable) else { continue };
+        let mut mem = Vec::new();
+        for h in hashes.iter().take(GATE_MEMBERS) {
+            if let Some(e) = store.get(*h)? {
+                mem.push(e);
+            }
+        }
+        if mem.is_empty() {
+            continue; // summaries drifted since `cluster` encoded them — abstain
+        }
+        if let Some(e) = &embs[i] {
+            scores.push((i, name_score(e, &mem)));
+        }
+    }
+
+    // Debug visibility, like the cluster quality report: where the floor sits
+    // and which names are nearest it — the data for tuning EMBED_FLOOR.
+    if !scores.is_empty() {
+        let mut by_score = scores.clone();
+        by_score.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let med = by_score[by_score.len() / 2].1;
+        eprintln!("  name gate: {} scored, median {med:.2}, floor {:.2} — lowest:", scores.len(), EMBED_FLOOR * med);
+        for (i, s) in by_score.iter().take(5) {
+            eprintln!("    [{s:.2}] {}", cand[*i].1);
+        }
+    }
+
+    let rejects = embed_rejects(&scores);
+    for &i in &rejects {
+        let (j, name) = &cand[i];
+        let fallback = keyword_label(j.gate.as_deref().unwrap_or_default(), &j.ban);
+        let score = scores.iter().find(|(x, _)| *x == i).map(|(_, s)| *s).unwrap_or(0.0);
+        eprintln!("  name gate: “{name}” unfaithful to its members ({score:.2}) → “{fallback}”");
+        if let Some(c) = cache.get_mut(&j.key) {
+            c.summary = fallback;
+        }
+    }
+    Ok((scores.len(), rejects.len()))
 }
 
 /// Clean a raw generation per the job type and apply the faithfulness gates: a
@@ -891,6 +1020,35 @@ mod tests {
         assert_eq!(pick_examples(&tiny).len(), 2); // fallback: better than nothing
     }
 
+    // A name with a hallucinated token scores visibly below a fully-grounded
+    // one — the length norm makes the bad half count, instead of letting the
+    // good half's matches paper over it.
+    #[test]
+    fn name_score_penalizes_hallucinated_tokens() {
+        use ndarray::arr2;
+        let members = vec![arr2(&[[1.0f32, 0.0]]), arr2(&[[0.9f32, 0.1]])];
+        let grounded = arr2(&[[1.0f32, 0.0]]);
+        let half_hallucinated = arr2(&[[1.0f32, 0.0], [0.0, 1.0]]); // 2nd token matches nothing
+        let g = name_score(&grounded, &members);
+        let h = name_score(&half_hallucinated, &members);
+        assert!(g > 0.9, "grounded name scores high: {g}");
+        assert!(h < 0.6 * g, "hallucinated half drags it below the floor: {h} vs {g}");
+        assert_eq!(name_score(&grounded, &[]), 0.0);
+    }
+
+    // The run-relative floor rejects only clear outliers, and abstains
+    // entirely when too few names are scored for the median to mean anything.
+    #[test]
+    fn embed_rejects_only_clear_outliers() {
+        let mut scores: Vec<(usize, f32)> = (0..7).map(|i| (i, 1.0)).collect();
+        scores.push((7, 0.2));
+        assert_eq!(embed_rejects(&scores), vec![7]); // 8 scored: the outlier goes
+        scores[7] = (7, 0.7);
+        assert!(embed_rejects(&scores).is_empty()); // above 0.6×median: kept
+        let few: Vec<(usize, f32)> = vec![(0, 1.0), (1, 0.1)];
+        assert!(embed_rejects(&few).is_empty()); // too few to judge
+    }
+
     // Hyphen/slash compounds are cased per component (the acronym list can
     // never match inside "SIE-INTERNAL" as one token), whole-token codes like
     // GPT-5.5 stay intact, and brands get their canonical mixed case.
@@ -1023,6 +1181,20 @@ pub fn summarize_all(bucket: &str) -> Result<()> {
         let (i, o) = run_jobs(&ttodo, &mut cache, &mut llm, &store, "topic")?;
         (in_tok, out_tok) = (in_tok + i, out_tok + o);
     }
+
+    // Pass 3: the embedding-faithfulness gate over every LLM name — including
+    // ones pulled from the fleet or cached by earlier runs, so a bad name is
+    // corrected on every machine no matter where it was generated.
+    let (scored, rejected) = match embed_gate_names(&tjobs, &mut cache, bucket) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("summarize: name gate skipped ({e})");
+            (0, 0)
+        }
+    };
+    if rejected > 0 {
+        eprintln!("summarize: name gate replaced {rejected}/{scored} unfaithful name(s)");
+    }
     // Prune orphaned topic entries — stable keys from superseded clusterings,
     // left behind when re-clustering changes a cluster's medoid/membership.
     // Session and doc summaries (keyed by id / gh:repo#n) are untouched.
@@ -1066,6 +1238,8 @@ pub fn summarize_all(bucket: &str) -> Result<()> {
         .set("topics_named", named)
         .set("name_dupes", name_dupes)
         .set("names_kw_fallback", kw_fallback)
+        .set("names_scored", scored)
+        .set("name_faithful_pct", if scored > 0 { 100.0 * (scored - rejected) as f64 / scored as f64 } else { 100.0 })
         .set("regenerated", n)
         .set("prompt_tok", in_tok)
         .set("output_tok", out_tok)

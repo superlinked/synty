@@ -97,6 +97,7 @@ pub struct Unit {
     pub outcome: String, // PR state, or session file/PR summary
     pub summary: Option<String>, // one-line LLM summary, if cached
     pub topic: Option<i64>,
+    pub rank: i64, // centrality rank within its topic (0 = medoid; MAX unranked)
     pub struggle: f32,
     pub author: String,    // PR/issue author, or the resolved actor for sessions
     pub doc_id: Option<i64>,    // for PR/issue → docs.jsonl
@@ -282,7 +283,7 @@ pub fn sessions() -> Result<Vec<Session>> {
                 tools: a.tools,
                 files: a.files.clone(),
                 linked_pr: a.linked_pr.clone(),
-                topic: topic_of.get(id).map(|(c, _, _)| *c),
+                topic: topic_of.get(id).map(|(c, _, _, _)| *c),
                 struggle: scores[i],
                 summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
                 author: a.actor.clone(),
@@ -299,6 +300,7 @@ pub fn units() -> Result<Vec<Unit>> {
     // fleet build credits each author); pre-stamp sessions fall back to this
     // machine's actor, matching what `ingest` stamps on session docs.
     let local_actor = crate::identity::actor();
+    let topic_of = unit_topics();
     let mut out: Vec<Unit> = sessions()?
         .into_iter()
         .map(|s| Unit {
@@ -309,6 +311,7 @@ pub fn units() -> Result<Vec<Unit>> {
             outcome: session_outcome(&s),
             summary: s.summary.clone(),
             topic: s.topic,
+            rank: topic_of.get(&s.id).map(|(_, _, _, r)| *r).unwrap_or(i64::MAX),
             struggle: s.struggle,
             author: if s.author.is_empty() { local_actor.clone() } else { s.author.clone() },
             doc_id: None,
@@ -317,7 +320,6 @@ pub fn units() -> Result<Vec<Unit>> {
         .collect();
 
     if let Ok(docs) = load_docs(readmodel::docs_path()) {
-        let topic_of = unit_topics();
         let cache = load_summary_cache();
         for d in &docs {
             let kind = match d.meta.kind.as_str() {
@@ -334,7 +336,8 @@ pub fn units() -> Result<Vec<Unit>> {
                 title: format!("{}#{} {}", d.meta.repo, num, first_line(&d.text)),
                 outcome: d.meta.state.clone().unwrap_or_default(),
                 summary: cache.get(&key).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
-                topic: topic_of.get(&key).map(|(c, _, _)| *c),
+                topic: topic_of.get(&key).map(|(c, _, _, _)| *c),
+                rank: topic_of.get(&key).map(|(_, _, _, r)| *r).unwrap_or(i64::MAX),
                 struggle: 0.0,
                 author: d.meta.author.clone(),
                 doc_id: Some(d.id),
@@ -416,10 +419,12 @@ fn struggle_scores(raw: &[[f64; 4]]) -> Vec<f32> {
 
 // ── topic membership (unit-level) ─────────────────────────────────────────
 
-/// unit key → (cluster index, stable cache key, label), from unit_clusters.json
-/// (written by `cluster`). Empty until clustering has run. The stable key falls
-/// back to the index string for pre-I1 files.
-fn unit_topics() -> HashMap<String, (i64, String, String)> {
+/// unit key → (cluster index, stable cache key, label, centrality rank), from
+/// unit_clusters.json (written by `cluster`). Empty until clustering has run.
+/// The stable key falls back to the index string for pre-I1 files; the rank
+/// (0 = medoid) falls back to i64::MAX for files written before it existed,
+/// so ordering by rank degrades to the callers' existing order.
+fn unit_topics() -> HashMap<String, (i64, String, String, i64)> {
     let Ok(raw) = std::fs::read_to_string(readmodel::clusters_path()) else { return HashMap::new() };
     let arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
     arr.iter()
@@ -427,7 +432,8 @@ fn unit_topics() -> HashMap<String, (i64, String, String)> {
             let key = it["key"].as_str()?.to_string();
             let cluster = it["cluster"].as_i64()?;
             let cache_key = it["topic"].as_str().map(String::from).unwrap_or_else(|| cluster.to_string());
-            Some((key, (cluster, cache_key, it["label"].as_str().unwrap_or("").to_string())))
+            let rank = it["rank"].as_i64().unwrap_or(i64::MAX);
+            Some((key, (cluster, cache_key, it["label"].as_str().unwrap_or("").to_string(), rank)))
         })
         .collect()
 }
@@ -435,7 +441,7 @@ fn unit_topics() -> HashMap<String, (i64, String, String)> {
 /// cluster index → label.
 fn cluster_labels() -> HashMap<i64, String> {
     let mut m = HashMap::new();
-    for (_, (c, _, l)) in unit_topics() {
+    for (_, (c, _, l, _)) in unit_topics() {
         m.entry(c).or_insert(l);
     }
     m
@@ -444,10 +450,31 @@ fn cluster_labels() -> HashMap<i64, String> {
 /// cluster index → stable cache key (medoid hash).
 fn cluster_cache_keys() -> HashMap<i64, String> {
     let mut m = HashMap::new();
-    for (_, (c, k, _)) in unit_topics() {
+    for (_, (c, k, _, _)) in unit_topics() {
         m.entry(c).or_insert(k);
     }
     m
+}
+
+/// Stable topic key → its members' embed-text hashes, centrality-ordered
+/// (medoid first). The embed texts are what `cluster` encoded into the shared
+/// store, so the name-faithfulness gate can score names against members
+/// without re-encoding anything but the names themselves.
+pub fn topic_member_embed_hashes() -> Result<HashMap<String, Vec<u64>>> {
+    let topic_of = unit_topics();
+    let mut grouped: HashMap<String, Vec<(i64, u64)>> = HashMap::new();
+    for u in cluster_units()? {
+        if let Some((_, stable, _, rank)) = topic_of.get(&u.key) {
+            grouped.entry(stable.clone()).or_default().push((*rank, crate::index::fnv1a(u.embed.as_bytes())));
+        }
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|(k, mut v)| {
+            v.sort_by_key(|(r, _)| *r);
+            (k, v.into_iter().map(|(_, h)| h).collect())
+        })
+        .collect())
 }
 
 /// First and last day across day-or-timestamp strings (lexicographic works

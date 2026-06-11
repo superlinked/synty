@@ -86,8 +86,9 @@ runs on CI or a server without a developer machine.
   construction — no doc-vs-unit reconciliation. A `--resolution` knob trades
   topic count vs size; modularity is reported. Each cluster's provisional label
   is its most concise member summary, replaced once `summarize` titles the topic
-  — the title is gated on the cluster's distinctive (c-TF-IDF) terms and banned
-  from being a bare repo slug, with an extractive keyword title as the fallback;
+  — the title is gated on the cluster's distinctive (c-TF-IDF) terms, banned
+  from being a bare repo slug, and embedding-checked against the members
+  themselves, with an extractive keyword title as the fallback;
   summary embeddings are content-addressed in the shared store (encode-once).
   Clustering the denoised summaries also beats clustering the chat firehose.
   *Built (unit-summary Louvain + resolution + gated topic names).*
