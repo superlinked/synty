@@ -30,6 +30,12 @@ members → giant hubs.
    otherwise iterate or revert. Commit each kept intervention separately with the
    measured effect in the message.
 
+For probes that need more than the metrics block, `SYNTY_QDUMP=<path> synty
+cluster` writes one JSON row per scored unit (key, embed hash, token count,
+own/other cluster, same/other best MaxSim, top-1, kNN-vote) — margin
+distributions, length-bias checks, and per-cluster splitability analyses run
+offline from that plus the embedding store, with no code changes.
+
 ## Shared metrics (the eval surface)
 
 Today — `[metrics cluster]`: `misplaced(+pct) modularity cohesion_med
@@ -137,9 +143,15 @@ Addresses root causes #5 (session misplacement) and #6 (representation).
   (`"{summary} {repo} {files}"`, units.rs) — a type-prefixed structure with
   the summary appended-not-leading remains untried, and per-token length-norm
   inside the cap is still a candidate if misplacement resurfaces.
-- **Eval for the open half:** `misplaced_pct` down; spot-check that sessions
-  leave hub topics. A re-encode pass is expected (the embed string changes →
-  new content hash).
+- **Validated (SYNTY_QDUMP probe, live corpus):** sessions place markedly worse
+  than PRs/issues — misplaced 9.2% vs 3.0%, kNN-vote disagreement 50.6% vs
+  27.8% — so the representation gap the open half targets is real, and this is
+  the highest-leverage open clustering change. The length bias itself is
+  mostly contained by the 500-char cap (best-neighbor MaxSim is flat across
+  the upper three embed-length quartiles, depressed only in the shortest).
+- **Eval for the open half:** the session-vs-doc misplacement gap closes;
+  `misplaced_pct` down. A re-encode pass is expected (the embed string
+  changes → new content hash).
 
 ### I5 — Abstain on borderline outliers · low · shipped
 Addresses root cause #5 — precision over forced coverage, which the get-up-to-speed
@@ -166,14 +178,43 @@ low-ρ_C clusters the run report still flags.
 - **Eval:** the flagged clusters' ρ_C rises and their summaries/names sharpen
   (today they read as grab-bag lists); cluster count rise stays bounded.
 - **Guardrail:** don't over-fragment; I1 keeps the surviving ids stable.
+- **Probe before building (SYNTY_QDUMP + pairwise member MaxSim offline):** the
+  flagship flagged cluster measured *diffuse*, not bimodal — best 2-way split
+  separation (within − between) only +0.03 on per-token-normalized MaxSim, so
+  a local re-split would cut arbitrarily. Run the same probe on any newly
+  flagged cluster; build I6 only when one shows real separation, and note the
+  other flagged clusters were mono-theme with weak names (a naming residual)
+  or near-duplicate piles (I10), not under-splits.
+
+### I10 — Collapse near-duplicate units · low · pending (new, probe-driven)
+The lowest-cohesion cluster turned out to be ~a dozen near-identical kickoff
+sessions: every member pair above 0.8 per-token MaxSim, 39 of 66 pairs above
+0.9 — the same canonical summary re-generated session after session. No
+planned intervention touches this; it pollutes cohesion metrics, inflates
+topic unit counts, and pads the topic view with repetition.
+- **Approach:** collapse units whose pairwise per-token MaxSim exceeds ~0.95
+  into one logical unit for clustering and topic facets (keep the count as a
+  badge, like "×9"), or flag-and-fold in the views; embeddings are already in
+  the store, so detection is a cheap pass over each cluster's members.
+- **Eval:** the blurb cluster folds to a handful of logical units and its ρ_C
+  normalizes; topic unit counts stop double-counting reruns.
+- **Guardrail:** never collapse across repos or kinds; keep keys reachable
+  (drill-in still lists the collapsed sessions).
 
 ### Deferred (revisit if the cause persists)
 - **I7** self-consistency name verification (research #8) — needs temperature
-  sampling added to the greedy decoder.
+  sampling added to the greedy decoder. Its target failure is currently
+  absent (`name_faithful_pct` 100, `name_dupes` 0) and the embedding gate
+  covers regressions; revisit only if those metrics slip.
 - **I8** IDF-weighted MaxSim (research #9) — corpus IDF table over token ids;
-  clustering benefit inferred, validate first.
+  clustering benefit inferred, validate first. Designed probe: re-encode one
+  flagged cluster's embed texts with the repo-token suffix stripped and
+  compare within/between separation — implement only if separation jumps.
 - **I9** HDBSCAN/GLOSH outlier pre-filter (research #10) — adds a dependency; I5
-  gets most of the benefit dependency-free.
+  gets most of the benefit dependency-free. Probe evidence against: 82.5% of
+  clustered units sit within 10% relative margin of another cluster (MaxSim
+  margins are inherently tight here), so a margin-keyed outlier filter would
+  over-fire; placement uncertainty is better read from `vote_disagree`.
 
 ## Cross-cutting tradeoffs
 

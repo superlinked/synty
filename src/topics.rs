@@ -530,7 +530,7 @@ const COHERENCE_MIN: usize = 8;
 fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], units: &[units::UnitClusterInput]) -> Quality {
     let label = |ci: usize| labels.get(ci).cloned().unwrap_or_default();
     let mut by_a: HashMap<usize, Vec<f32>> = HashMap::new(); // ci -> each member's best same-cluster MaxSim
-    let mut margins: Vec<(usize, usize, usize, f32)> = Vec::new(); // (unit, own ci, nearest other ci, a−b)
+    let mut margins: Vec<(usize, usize, usize, f32, f32)> = Vec::new(); // (unit, own ci, nearest other ci, a, b)
     let (mut top1_sum, mut top1_n, mut misplaced) = (0.0f32, 0usize, 0usize);
     for (i, r) in results.iter().enumerate() {
         let Some(ci) = of[i] else { continue };
@@ -559,7 +559,7 @@ fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], unit
         if b > a {
             misplaced += 1;
         }
-        margins.push((i, ci, other, a - b));
+        margins.push((i, ci, other, a, b));
     }
     let scored = margins.len();
     if scored == 0 {
@@ -579,6 +579,7 @@ fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], unit
     // Rescale-invariant placement: a unit whose kNN-majority cluster differs from
     // its assignment is likely misplaced regardless of the score scale.
     let mut vote_disagree = 0;
+    let mut vote_mode: HashMap<usize, usize> = HashMap::new();
     for (i, r) in results.iter().enumerate() {
         let Some(ci) = of[i] else { continue };
         let mut votes: HashMap<usize, usize> = HashMap::new();
@@ -591,16 +592,46 @@ fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], unit
             }
         }
         if let Some((&mode, _)) = votes.iter().max_by_key(|(_, c)| **c) {
+            vote_mode.insert(i, mode);
             if mode != ci {
                 vote_disagree += 1;
             }
         }
     }
 
-    margins.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+    // Optional per-unit quality dump (`SYNTY_QDUMP=<path>`): one JSON row per
+    // scored unit — key, embed hash (to fetch its vectors from the store),
+    // embed token count, own/nearest-other cluster, same/other-cluster best
+    // MaxSim, top-1 score, kNN-majority cluster. The raw material for offline
+    // eval of candidate interventions (margin distributions by unit kind,
+    // length bias, splitability) without bloating the metrics block.
+    if let Ok(path) = std::env::var("SYNTY_QDUMP") {
+        let rows: Vec<serde_json::Value> = margins
+            .iter()
+            .map(|(i, ci, other, a, b)| {
+                serde_json::json!({
+                    "key": units[*i].key,
+                    "hash": format!("{:016x}", crate::index::fnv1a(units[*i].embed.as_bytes())),
+                    "tokens": units[*i].embed.split_whitespace().count(),
+                    "ci": ci,
+                    "other": other,
+                    "a": a,
+                    "b": b,
+                    "top1": results[*i].scores.first().copied().unwrap_or(0.0),
+                    "vote": vote_mode.get(i),
+                })
+            })
+            .collect();
+        match serde_json::to_string(&rows).map_err(anyhow::Error::from).and_then(|s| crate::write_atomic(&path, s.as_bytes())) {
+            Ok(()) => eprintln!("  qdump: wrote {} rows to {path}", rows.len()),
+            Err(e) => eprintln!("  qdump failed: {e}"),
+        }
+    }
+
+    margins.sort_by(|x, y| (x.3 - x.4).partial_cmp(&(y.3 - y.4)).unwrap_or(std::cmp::Ordering::Equal));
     eprintln!("  worst-placed units (in → would prefer):");
-    for (i, ci, other, m) in margins.iter().take(6) {
-        eprintln!("    [{m:+.2}] {} — in “{}” → “{}”", crate::short(&units[*i].key), label(*ci), label(*other));
+    for (i, ci, other, a, b) in margins.iter().take(6) {
+        eprintln!("    [{:+.2}] {} — in “{}” → “{}”", a - b, crate::short(&units[*i].key), label(*ci), label(*other));
     }
     rho.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
     eprintln!("  lowest-cohesion clusters (ρ_C · size · label):");
