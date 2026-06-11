@@ -32,53 +32,56 @@ members → giant hubs.
 
 ## Shared metrics (the eval surface)
 
-Today — `[metrics cluster]`: `silhouette misplaced(+pct) modularity
-size_{min,med,max} sessions docs clusters unclustered`; `[metrics summarize]`:
-`unit_coverage_pct topics_named name_dupes names_kw_fallback names_scored
-name_faithful_pct` (the name fields added with I2/I3 — topics sharing an
-identical name, names that are the keyword fallback rather than an accepted
-LLM title, and the share of LLM names clearing the embedding gate).
+Today — `[metrics cluster]`: `misplaced(+pct) modularity cohesion_med
+vote_disagree bridges id_continuity size_{min,med,max} tiny sessions docs
+clusters unclustered` (no silhouette: it structurally prefers coarser clusters
+— the grab-bag failure — so coherence is judged by the anchor eval instead);
+`[metrics summarize]`: `unit_coverage_pct topics_named name_dupes
+names_kw_fallback names_scored name_faithful_pct` (the name fields added with
+I2/I3 — topics sharing an identical name, names that are the keyword fallback
+rather than an accepted LLM title, and the share of LLM names clearing the
+embedding gate).
 
-Added by **I0**, justified by the research:
+How the I0 research played out:
 
-- `silhouette_macro` — per-cluster mean-of-means; becomes the headline (micro
-  silhouette is inflated up to 41% by the single largest cluster — 2401.05831,
-  and our sizes already span 2..76).
-- `cohesion_min` / `cohesion_med` + `grabbags` — per-cluster cohesion ratio
-  ρ_C = within-cluster mean MaxSim ÷ global mean MaxSim; `grabbags` counts
-  clusters below a run-relative floor (2511.19350), robust under size imbalance.
-- `name_faithful_pct` — share of topic names that clear the embedding-faithfulness
-  gate against their members (2502.18469); added with **I2**.
-- `unclustered` is already emitted — read it next to `misplaced`, since several
+- `silhouette_macro` was planned as the headline (micro silhouette is inflated
+  up to 41% by the single largest cluster — 2401.05831) but silhouette was
+  dropped wholesale once calibration showed it rewards exactly the grab-bag
+  failure; the anchor membership eval is the headline instead.
+- `cohesion_med` shipped — per-cluster cohesion ratio ρ_C = within-cluster mean
+  MaxSim ÷ global mean MaxSim (2511.19350), robust under size imbalance — with
+  the lowest-ρ_C clusters printed per run; a `grabbags` count is still open.
+- `name_faithful_pct` shipped with **I2** — share of topic names that clear the
+  embedding-faithfulness gate against their members (2502.18469).
+- `unclustered` is emitted — read it next to `misplaced`, since several
   interventions trade coverage for precision on purpose.
 
 ## Interventions (priority order)
 
-### I0 — Expand the metric framework · effort low · status pending
+### I0 — Expand the metric framework · effort low · status mostly shipped (silhouette dropped by design)
 Measurement first, so every later change is judged on the same surface and we can
-see the grab-bags/hubs the global silhouette hides.
-- **Approach:** add `silhouette_macro`, per-cluster `cohesion_*` + `grabbags` to
-  `[metrics cluster]`; `report_quality` (topics.rs) already computes per-unit
-  silhouette into `sils` — group by cluster. Emit a per-cluster debug line
-  (id · size · S_C · ρ_C · label).
-- **Eval:** the new fields emit and are sane — `silhouette_macro` < the current
-  micro silhouette given the size imbalance, and the known grab-bag (topic 2)
-  shows a low ρ_C. No behavior change.
-- **Guardrail:** existing metric fields unchanged.
+see the grab-bags/hubs a global score hides.
+- **Shipped (topics.rs):** per-cluster cohesion ratio ρ_C with `cohesion_med`
+  in `[metrics cluster]`, the lowest-cohesion-clusters debug lines
+  (id · ρ_C · size · label), `misplaced(+pct)`, and rescale-invariant
+  `vote_disagree`. Silhouette (micro and macro) was deliberately dropped, not
+  deferred: it structurally prefers coarser clusters — exactly the grab-bag
+  failure — so coherence is judged by the anchor membership eval.
+- **Open:** a `grabbags` count (clusters below a run-relative ρ_C floor) is not
+  emitted; the debug lines carry that signal today.
 
-### I1 — Stable content-addressed cluster ids · low · pending
+### I1 — Stable content-addressed cluster ids · low · shipped
 Addresses root cause #2. Prerequisite — every name/summary fix is pointless if
-ids renumber under it (topic 27's "Colpali" name is a stale-id symptom).
-- **Approach:** after Louvain + reassign, Jaccard-match each new cluster to the
-  previous `unit_clusters.json` on member keys; overlap ≥ 0.5 inherits the old
-  stable id (and thus its cached name/summary). New clusters get an id hashed
-  (FNV1a) from their **medoid** unit key (member with max mean MaxSim to
-  co-members, from the EVAL_K results already fetched). Write the stable id, not
-  the positional `ci`; re-key `topic_key`/`topic_name_key`.
-- **Eval:** new `id_continuity_pct` (clusters that inherited an id). Run `cluster`
-  twice on unchanged data → continuity 100% and no `topic:<id>` cache mismatch.
-- **Guardrail:** `silhouette_macro`, `misplaced` unchanged — this is a post-hoc
-  label-transfer layer, not a clustering change.
+ids renumber under it (topic 27's "Colpali" name was a stale-id symptom).
+- **Shipped (topics.rs):** after Louvain + reassign, each new cluster
+  Jaccard-matches the previous `unit_clusters.json` on member keys; overlap
+  ≥ 0.5 inherits the old stable key (and thus its cached name/summary), new
+  clusters get a key hashed (FNV1a) from their medoid unit key.
+  `topic_key`/`topic_name_key` are keyed by it, and `id_continuity` is emitted
+  — it has held 100% across consecutive re-clusters on live data, including
+  re-clusters that crossed a build replacement.
+- **Guardrail held:** a post-hoc label-transfer layer; the partition itself is
+  untouched.
 
 ### I2 — Name faithfulness gate + keyword fallback · low · shipped
 Addresses root cause #1 — catches "Colpali Visual Document Retrieval" on
@@ -123,39 +126,46 @@ Addresses root cause #1 at the source, complementing I2's after-the-fact gate.
 - **Guardrail:** names stay natural/readable; `topics_named` coverage unchanged
   (82/82 after the change).
 
-### I4 — MaxSim length-norm + decouple summary + PR-bridge edges · low · pending
+### I4 — MaxSim length-norm + decouple summary + PR-bridge edges · low · partially shipped
 Addresses root causes #5 (session misplacement) and #6 (representation).
-- **Approach:** divide each raw MaxSim by the probe unit's token count before the
-  ÷best/FLOOR step in `build_edges` (the units.rs comment already names this bias);
-  embed a type-prefixed structure (`Session: … / PR: …`) with the summary
-  appended-not-leading (so a bad summary no longer corrupts placement); inject a
-  strong session↔`linked_pr` bridge edge.
-- **Eval:** `misplaced_pct` down; spot-check that synty/slide/RAG sessions leave
-  the OCR hub (topic 0).
-- **Guardrail:** `silhouette_macro` not worse. A re-encode pass is expected (the
-  embed string changes → new content hash).
+- **Shipped (alternate forms):** the session↔`linked_pr` bridge ships as
+  `snap_to_prs` — a hard post-reassignment snap to the produced PR's topic
+  (a soft edge loses to kNN reassign), with `bridges` emitted; the length bias
+  is contained by capping every embed text at 500 chars so units stay
+  comparable, rather than per-token normalization in `build_edges`.
+- **Open:** the embed text still leads with the summary
+  (`"{summary} {repo} {files}"`, units.rs) — a type-prefixed structure with
+  the summary appended-not-leading remains untried, and per-token length-norm
+  inside the cap is still a candidate if misplacement resurfaces.
+- **Eval for the open half:** `misplaced_pct` down; spot-check that sessions
+  leave hub topics. A re-encode pass is expected (the embed string changes →
+  new content hash).
 
-### I5 — Abstain on borderline outliers · low · pending
+### I5 — Abstain on borderline outliers · low · shipped
 Addresses root cause #5 — precision over forced coverage, which the get-up-to-speed
 use case values.
-- **Approach:** mark degree-0 nodes (no mutual-kNN neighbor) unclustered before
-  Louvain; in `reassign_once`, move a unit only when `sil < -0.10 && b/a > 1.1`
-  and **abstain** (leave `None`) when `|sil| < 0.05` instead of force-assigning.
-- **Eval:** `misplaced_pct` down; `unclustered` rises (intended — the trade).
-  Track both.
-- **Guardrail:** don't strand coherent units — `silhouette_macro` up or flat.
+- **Shipped (topics.rs):** a unit with no mutual-kNN edge (degree 0) is a
+  genuine outlier the reassignment refuses to adopt — it stays unclustered
+  rather than being forced into a topic it doesn't belong to, and `unclustered`
+  is emitted next to `misplaced` so the precision/coverage trade stays visible.
+  The silhouette-threshold variants died with silhouette itself (see I0);
+  placement quality is watched through `misplaced_pct` and `vote_disagree`.
 
 ### I6 — Targeted re-split of flagged hubs · medium · pending
-Addresses root cause #3 (under-splitting) without a global resolution change.
-- **Approach:** for each cluster flagged grab-bag by I0 (low ρ_C/S_C **and** size
-  > ~8), extract the induced sub-graph from the existing `edges` and re-run
-  `louvain()` on it at resolution × 1.5–2.0; replace with the sub-clusters. A
-  local re-run sidesteps the Louvain resolution limit (Fortunato–Barthélemy 2007).
-  Optional merge pass for cluster pairs with c-TF-IDF cosine > 0.8.
-- **Eval:** `grabbags` down, `silhouette_macro` up; topic 2 splits into coherent
-  sub-topics (spot-check).
-- **Guardrail:** don't over-fragment — bound the cluster-count rise; I1 keeps the
-  surviving ids stable.
+Addresses root cause #3 (under-splitting). The global counterpart already
+shipped: Louvain runs at resolution × RES_SCALE (2.5), calibrated against the
+anchor eval, which broke the original resolution-limit grab-bags; agglomerative
+re-merging was tried and dropped (coherent and grab-bag sub-themes merge at the
+same threshold). What remains is the *local* version, for the few residual
+low-ρ_C clusters the run report still flags.
+- **Approach:** for each cluster flagged by the lowest-cohesion debug (low ρ_C
+  **and** size > ~8), extract the induced sub-graph from the existing `edges`
+  and re-run `louvain()` on it at resolution × 1.5–2.0; replace with the
+  sub-clusters. A local re-run sidesteps the Louvain resolution limit
+  (Fortunato–Barthélemy 2007).
+- **Eval:** the flagged clusters' ρ_C rises and their summaries/names sharpen
+  (today they read as grab-bag lists); cluster count rise stays bounded.
+- **Guardrail:** don't over-fragment; I1 keeps the surviving ids stable.
 
 ### Deferred (revisit if the cause persists)
 - **I7** self-consistency name verification (research #8) — needs temperature
