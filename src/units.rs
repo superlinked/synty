@@ -671,6 +671,18 @@ pub struct UnitClusterInput {
     pub linked: Option<String>, // for a session: the gh: key of the PR it produced
 }
 
+/// A session's embed text for clustering: a type prefix and the
+/// project-identifying tokens (repo, touched files) lead, the summary follows
+/// — sessions placed markedly worse than PRs with the summary leading (qdump
+/// probe: ~3x the misplacement rate), and the leading tokens set the
+/// contextual frame the encoder embeds the rest in. The head is capped
+/// separately so a session with long file paths can never truncate its
+/// summary, the highest-signal content.
+fn session_embed(summary: &str, repo: &str, files: &str) -> String {
+    let head = crate::excerpt(&format!("Session: {repo} {files}"), 320);
+    crate::excerpt(&format!("{head} — {summary}"), 500)
+}
+
 /// All units that have a cached summary, for clustering. We embed more than the
 /// one-line summary so the vectors separate (a lone 20-token summary is too thin
 /// to cluster well). For sessions we add *project-identifying* tokens — the repo
@@ -686,7 +698,7 @@ pub fn cluster_units() -> Result<Vec<UnitClusterInput>> {
             // 500-capped PR/issue embeds (MaxSim is length-biased — an embed that's
             // all file paths would otherwise dominate and over-group by repo).
             let files = s.files.iter().take(8).cloned().collect::<Vec<_>>().join(" ");
-            let embed = crate::excerpt(&format!("{summary} {} {}", s.repo, files), 500);
+            let embed = session_embed(&summary, &s.repo, &files);
             let linked = s.linked_pr.as_deref().and_then(linked_pr_key);
             out.push(UnitClusterInput { key: s.id, summary, embed, repo: s.repo, linked });
         }
@@ -793,6 +805,20 @@ fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The session embed leads with the project (type prefix, repo, files) and
+    // appends the summary — which must survive the cap intact even when file
+    // paths are long, since it carries the semantic signal.
+    #[test]
+    fn session_embed_keeps_summary_under_cap() {
+        let files = (0..8).map(|i| format!("very/long/path/to/some/deeply/nested/module_{i}.rs")).collect::<Vec<_>>().join(" ");
+        let summary = "S".repeat(170); // a typical one-liner's length
+        let e = session_embed(&summary, "sie-internal", &files);
+        assert!(e.starts_with("Session: sie-internal"));
+        assert!(e.contains(" — "));
+        assert!(e.ends_with(&summary), "the summary survives the cap intact");
+        assert!(e.chars().count() <= 500);
+    }
 
     // File tokens are repo-qualified path tails; harness/temp artifacts are dropped.
     // A cwd segment that is (or folds to) a known repo wins, anywhere in the
