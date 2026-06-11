@@ -140,11 +140,12 @@ Items:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
 }
 
-/// Name a topic with a short Title-Case heading, GROUNDED in the cluster's salient
-/// terms and a few representative items (not just the reduced summary). Concrete
-/// evidence makes the small model build the name from terms the cluster actually
-/// uses, so it passes the faithfulness gate instead of free-associating. (No
-/// example *name* is given — the 0.6B parrots those; terms and items are data.)
+/// Name a topic with a short Title-Case heading, GROUNDED in the cluster's
+/// distinctive terms and a few representative items (not just the reduced
+/// summary). Concrete evidence makes the small model build the name from terms
+/// the cluster actually uses, so it passes the faithfulness gate instead of
+/// free-associating. (No example *name* is given — the 0.6B parrots those;
+/// terms and items are data.)
 fn prompt_for_topic_name(summary: &str, terms: &[String], examples: &[String]) -> String {
     let kw = terms.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
     let mut items = String::new();
@@ -154,30 +155,71 @@ fn prompt_for_topic_name(summary: &str, terms: &[String], examples: &[String]) -
         items.push('\n');
     }
     format!(
-        "<|im_start|>user\nName this cluster of engineering work with a short Title Case heading of 2 to 4 words, like a chapter title. Build it from the key terms and items below — prefer the most specific, recurring nouns. Output only the title: no quotes, no period, no commas.\n\n\
+        "<|im_start|>user\nName this cluster of engineering work with a short Title Case heading of 2 to 4 words, like a chapter title. Build it from the key terms and items below — prefer the most distinctive, specific nouns. Never use a repository or product name alone. Output only the title: no quotes, no period, no commas.\n\n\
 Key terms: {kw}\nItems:\n{items}Description: {summary}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     )
 }
 
-/// Frequent content words across a cluster's member summaries (document frequency,
-/// ≥3 chars, minus stopwords) — the cluster's salient terms for the name gate.
-fn cluster_terms(members: &[String], k: usize) -> Vec<String> {
-    let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for m in members {
+/// Lowercased content words of one summary: ≥3 chars, not generic developer
+/// vocabulary, and containing at least one letter (a bare issue number like
+/// "955" is cluster-unique by accident, not a topic term). Shared by the term
+/// scorer and the idf map so the two tokenizations cannot drift.
+fn content_words(s: &str) -> std::collections::HashSet<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w) && w.chars().any(|c| c.is_alphabetic()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Smoothed inverse cluster frequency over every cluster's member summaries:
+/// ln((1+N)/(1+cf)) + 1, where cf counts the clusters that mention the term at
+/// all. Corpus-background words ("sie" shows up in 60 of 82 live clusters) keep
+/// a small positive weight instead of zeroing out, and with a single cluster
+/// the weights are uniform — ranking degrades to plain frequency.
+fn idf_map(clusters: &[Vec<String>]) -> std::collections::HashMap<String, f64> {
+    let mut cf: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for members in clusters {
         let mut seen = std::collections::HashSet::new();
-        for w in m.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3 && !STOPWORDS.contains(w)) {
-            if seen.insert(w.to_string()) {
-                *freq.entry(w.to_string()).or_default() += 1;
-            }
+        for m in members {
+            seen.extend(content_words(m));
+        }
+        for w in seen {
+            *cf.entry(w).or_default() += 1;
         }
     }
-    let mut v: Vec<(String, usize)> = freq.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let n = clusters.len() as f64;
+    cf.into_iter().map(|(w, c)| (w, ((1.0 + n) / (1.0 + c as f64)).ln() + 1.0)).collect()
+}
+
+/// A cluster's most *distinctive* terms (roadmap I2/I3's c-TF-IDF): per-term
+/// document frequency over the member summaries, weighted by the smoothed
+/// inverse cluster frequency. Plain frequency made the corpus-wide background
+/// vocabulary head almost every cluster's list — and a name gate that accepts
+/// "SIE" everywhere stops nothing — so the terms must separate THIS cluster
+/// from the others, not describe the whole corpus.
+fn cluster_terms(members: &[String], k: usize, idf: &std::collections::HashMap<String, f64>) -> Vec<String> {
+    let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for m in members {
+        for w in content_words(m) {
+            *freq.entry(w).or_default() += 1;
+        }
+    }
+    let n = members.len().max(1) as f64;
+    let mut v: Vec<(String, f64)> = freq
+        .into_iter()
+        .map(|(w, c)| {
+            let weight = idf.get(&w).copied().unwrap_or(1.0);
+            (w, c as f64 / n * weight)
+        })
+        .collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     v.into_iter().take(k).map(|(w, _)| w).collect()
 }
 
-/// True if the generated name shares at least one salient term with the cluster —
-/// otherwise it is about something the members are not, and is rejected.
+/// True if the generated name shares at least one distinctive term with the
+/// cluster — otherwise it is about something the members are not, and is
+/// rejected.
 fn name_grounded(name: &str, terms: &[String]) -> bool {
     if name.is_empty() {
         return false;
@@ -187,7 +229,7 @@ fn name_grounded(name: &str, terms: &[String]) -> bool {
     terms.iter().any(|t| words.contains(t.as_str()))
 }
 
-/// Generic developer vocabulary that must not count as a cluster's salient term —
+/// Generic developer vocabulary that must not count as a cluster's term at all —
 /// a name should match on a concrete subject, not "update"/"fix"/"feature".
 const STOPWORDS: &[&str] = &[
     "the", "and", "for", "was", "were", "with", "that", "this", "from", "into", "are", "has", "have",
@@ -197,6 +239,7 @@ const STOPWORDS: &[&str] = &[
     "includes", "including", "improve", "improved", "improving", "enhance", "enhanced", "enhancing",
     "project", "work", "feature", "features", "changes", "change", "code", "file", "files", "repo",
     "repository", "dependencies", "dependency", "data", "based", "various", "tools", "system",
+    "feat", "chore", "subject", // commit-convention ceremony leaking from PR-title summaries
 ];
 
 /// Meta-opener clauses the 0.6B stacks in front of summaries, generated as every
@@ -266,21 +309,23 @@ fn clean(s: &str) -> String {
 /// Clean a short topic name. The 0.6B titles its summary well but SHOUTS in
 /// all-caps and sometimes snake_cases, so *normalize* (underscores→spaces,
 /// Title Case keeping acronyms) rather than reject. Only genuine non-titles —
-/// comma-lists, whole sentences (>6 words), field echoes, the bare generic
-/// word — fall back to the representative-member label.
+/// comma-lists, whole sentences (>6 words), anything too long to be a heading
+/// (a truncated title is not a title), hyphen-mush compounds, field echoes,
+/// the bare generic word — are rejected, falling back to the keyword label.
 fn clean_name(s: &str) -> String {
     let s = s.rsplit("</think>").next().unwrap_or(s).trim().trim_matches('"').trim();
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s).replace('_', " ");
-    let line = crate::excerpt(&line, 48);
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let line = line.trim_end_matches(['.', ':', ',']).trim();
     let low = line.to_lowercase();
     let echo = ["keyphrase", "items", "title", "repo", "update:", "description"].iter().any(|p| low.starts_with(p));
     let words = line.split_whitespace().count();
-    if line.is_empty() || echo || line.contains(',') || !(1..=6).contains(&words) {
+    let mush = line.split_whitespace().any(|w| w.matches('-').count() >= 3);
+    if line.is_empty() || echo || line.contains(',') || !(1..=6).contains(&words) || line.chars().count() > 48 || mush {
         return String::new();
     }
     let t = title_case(line);
-    let t = t.trim_end_matches(" Cluster").trim();
+    let t = t.trim_end_matches(" Cluster").trim_end_matches("-Cluster").trim();
     if t.is_empty() || matches!(t.to_lowercase().as_str(), "cluster" | "chores" | "update" | "fix") {
         String::new()
     } else {
@@ -288,36 +333,96 @@ fn clean_name(s: &str) -> String {
     }
 }
 
-/// Title-case a phrase: keep known domain acronyms (GPU, SIE, NATS…) and codes
-/// (S3, M4, GPT-5.5) uppercase, lowercase function words mid-title, capitalize
-/// the rest. The model SHOUTS, so we can't infer acronyms from case — hence the
-/// small curated allowlist.
+/// Domain acronyms kept uppercase in titles. The model SHOUTS, so acronyms
+/// can't be inferred from case — hence the small curated allowlist.
+const ACRO: &[&str] = &[
+    "GPU", "CPU", "AWS", "GCP", "TEI", "API", "SIE", "NATS", "OCR", "CLI", "UI", "UX", "JSON",
+    "LLM", "TLS", "VDB", "CTA", "SDK", "HTTP", "AI", "ML", "RAG", "SQL", "K8S", "GHCR", "TUI",
+    "MTP", "PR", "CI", "CD", "BYO", "VM", "VMS", "CUDA", "JIT", "EKS", "GKE", "AKS", "GCS",
+    "MTEB", "NPM", "VPC", "TTL", "DNS", "GPT", "MCP", "GTM", "GPC",
+];
+/// Canonical mixed-case brands — neither the acronym list (all-caps) nor the
+/// code rule can produce "ColBERT", and the SHOUTed input carries no case to
+/// preserve, so a curated map is the only source.
+const BRAND: &[(&str, &str)] = &[
+    ("colbert", "ColBERT"),
+    ("deepseek", "DeepSeek"),
+    ("github", "GitHub"),
+    ("lora", "LoRA"),
+    ("pypi", "PyPI"),
+    ("qwen3", "Qwen3"),
+    ("sglang", "SGLang"),
+    ("vectorhub", "VectorHub"),
+];
+const STOP: &[&str] = &["and", "or", "for", "to", "the", "a", "an", "of", "in", "on", "at", "with", "by", "vs", "from", "into"];
+
+/// Title-case a phrase: restore brand casing (ColBERT), keep known domain
+/// acronyms (GPU, SIE, NATS…) and codes (S3, M4, GPT-5.5) uppercase, lowercase
+/// function words mid-title, capitalize the rest. Hyphen/slash compounds are
+/// cased per component ("sie-internal" → "SIE-Internal") — but only after the
+/// whole-token checks, so a dotted code like GPT-5.5 still matches as one unit.
 fn title_case(s: &str) -> String {
-    const ACRO: &[&str] = &[
-        "GPU", "CPU", "AWS", "GCP", "TEI", "API", "SIE", "NATS", "OCR", "CLI", "UI", "UX", "JSON",
-        "LLM", "TLS", "VDB", "CTA", "SDK", "HTTP", "AI", "ML", "RAG", "SQL", "K8S", "GHCR", "TUI",
-        "MTP", "PR", "CI", "CD", "TLS", "BYO", "VM", "VMS",
-    ];
-    const STOP: &[&str] = &["and", "or", "for", "to", "the", "a", "an", "of", "in", "on", "at", "with", "by", "vs", "from", "into"];
     s.split_whitespace()
         .enumerate()
-        .map(|(i, w)| {
-            let core: String = w.to_uppercase().chars().filter(|c| c.is_alphanumeric()).collect();
-            let code = core.len() <= 6 && core.chars().any(|c| c.is_numeric()) && core.chars().all(|c| c.is_uppercase() || c.is_numeric());
-            if ACRO.contains(&core.as_str()) || code {
-                w.to_uppercase()
-            } else if i > 0 && STOP.contains(&w.to_lowercase().as_str()) {
-                w.to_lowercase()
-            } else {
-                let mut ch = w.chars();
-                match ch.next() {
-                    Some(f) => f.to_uppercase().collect::<String>() + &ch.as_str().to_lowercase(),
-                    None => String::new(),
-                }
-            }
-        })
+        .map(|(i, w)| case_word(w, i == 0))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// One whitespace token: whole-token brand/acronym/code first, then per
+/// '-'/'/' component, then the stopword/capitalize default. `first` marks the
+/// leading token, whose leading component never stop-lowercases.
+fn case_word(w: &str, first: bool) -> String {
+    if let Some(t) = case_core(w) {
+        return t;
+    }
+    if !w.contains(['-', '/']) {
+        return cap(w, first);
+    }
+    let mut out = String::new();
+    let mut comp = String::new();
+    for c in w.chars() {
+        if c == '-' || c == '/' {
+            let f = first && out.is_empty();
+            out.push_str(&case_core(&comp).unwrap_or_else(|| cap(&comp, f)));
+            out.push(c);
+            comp.clear();
+        } else {
+            comp.push(c);
+        }
+    }
+    let f = first && out.is_empty();
+    out.push_str(&case_core(&comp).unwrap_or_else(|| cap(&comp, f)));
+    out
+}
+
+/// Brand, acronym, or short numeric code (S3, M4, GPT-5.5) — the casings that
+/// override the title rules. Brands run first: the code rule would otherwise
+/// catch "qwen3" and SHOUT it.
+fn case_core(w: &str) -> Option<String> {
+    if w.is_empty() {
+        return None;
+    }
+    if let Some((_, canon)) = BRAND.iter().find(|(b, _)| *b == w.to_lowercase()) {
+        return Some((*canon).to_string());
+    }
+    let core: String = w.to_uppercase().chars().filter(|c| c.is_alphanumeric()).collect();
+    let code = core.len() <= 6 && core.chars().any(|c| c.is_numeric()) && core.chars().all(|c| c.is_uppercase() || c.is_numeric());
+    if ACRO.contains(&core.as_str()) || code {
+        return Some(w.to_uppercase());
+    }
+    None
+}
+
+fn cap(w: &str, first: bool) -> String {
+    if !first && STOP.contains(&w.to_lowercase().as_str()) {
+        return w.to_lowercase();
+    }
+    let mut ch = w.chars();
+    match ch.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + &ch.as_str().to_lowercase(),
+        None => String::new(),
+    }
 }
 
 /// 8-byte content hash of arbitrary parts, salted by the prompt version (a
@@ -349,10 +454,14 @@ fn doc_hash(d: &DocInput) -> String {
 }
 
 /// One unit of summarization work: a cache key, its input hash, and the prompt.
-/// `short` jobs are topic names (cleaned as a title, not a sentence). `gate`, when
-/// set, holds the cluster's salient terms: a name sharing none of them is rejected
-/// (→ empty, so `title()` falls through to the grounded summary) — this is what
-/// stops "Colpali" on error-handling PRs or "Update Dependencies" on synty work.
+/// `short` jobs are topic names (cleaned as a title, not a sentence). `gate`,
+/// when set, holds the cluster's distinctive terms: a name sharing none of them
+/// is rejected — this is what stops "Colpali" on error-handling PRs or "Update
+/// Dependencies" on synty work. `ban` holds the topic's normalized repo slugs
+/// and their components: the repo is already a facet on every surface, so a
+/// "name" that is just a repo fragment carries nothing. Either rejection falls
+/// back to the extractive keyword label, so a topic never ends up titled by a
+/// whole sentence.
 struct Job {
     key: String,
     hash: String,
@@ -360,12 +469,17 @@ struct Job {
     label: String,
     short: bool,
     gate: Option<Vec<String>>,
+    ban: Vec<String>,
 }
 
 /// Salt for the topic reduce / name prompts; bump to regenerate them only.
 /// t7: combinatorial opener stripping (drops "the cluster focuses …" et al.).
+/// s4: distinctive (c-TF-IDF) terms in the prompt and gate, keyword fallback,
+/// repo-slug ban — and the name's hash now covers only the summary it titles,
+/// so a version bump is the one lever that forces a fleet-wide name refresh
+/// after term-algorithm changes.
 const TOPIC_PROMPT_VERSION: &str = "t7";
-const TOPIC_NAME_VERSION: &str = "s3";
+const TOPIC_NAME_VERSION: &str = "s4";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -373,22 +487,48 @@ fn unit_jobs() -> Result<Vec<Job>> {
     let docs = units::doc_inputs()?;
     let mut jobs = Vec::with_capacity(sessions.len() + docs.len());
     for s in &sessions {
-        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id), short: false, gate: None });
+        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id), short: false, gate: None, ban: Vec::new() });
     }
     for d in &docs {
-        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone(), short: false, gate: None });
+        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone(), short: false, gate: None, ban: Vec::new() });
     }
     Ok(jobs)
+}
+
+/// Representative member lines for the name prompt: the shortest summaries are
+/// the most title-like, but the very shortest are degenerate slug echoes
+/// ("sie-internal: #955") that prime the small model to answer in slugs — so
+/// require a minimum of substance first, falling back to the raw list when a
+/// tiny cluster has nothing better.
+fn pick_examples(members: &[String]) -> Vec<String> {
+    let mut wf: Vec<&String> = members.iter().filter(|s| s.split_whitespace().count() >= 5).collect();
+    if wf.len() < 3 {
+        wf = members.iter().collect();
+    }
+    wf.sort_by_key(|s| s.len());
+    wf.iter().take(3).map(|s| crate::excerpt(s, 90)).collect()
 }
 
 /// Topic jobs: a one-line summary reduced from the member-unit summaries, plus a
 /// short name that *titles that summary* (a small model shortens a sentence far
 /// better than it abstracts a name from a list of items). The summary's hash is
-/// over its members; the name's is over the summary text it titles.
+/// over its members; the name's is over the summary text it titles — NOT the
+/// terms or examples, which shift whenever any other cluster does (idf is
+/// global): a name regenerates exactly when the summary it titles changes, and
+/// a TOPIC_NAME_VERSION bump forces the rest.
 fn topic_jobs() -> Result<Vec<Job>> {
+    // First pass: every cluster's member summaries (capped exactly as the jobs
+    // consume them), so terms can be weighted by cross-cluster rarity.
+    let topics = units::topic_units(12)?;
+    let memberships: Vec<Vec<String>> = topics
+        .iter()
+        .map(|t| t.units.iter().filter_map(|u| u.summary.clone()).take(40).collect())
+        .collect();
+    let populated: Vec<Vec<String>> = memberships.iter().filter(|m| !m.is_empty()).cloned().collect();
+    let idf = idf_map(&populated);
+
     let mut jobs = Vec::new();
-    for t in units::topic_units(12)? {
-        let members: Vec<String> = t.units.iter().filter_map(|u| u.summary.clone()).take(40).collect();
+    for (t, members) in topics.iter().zip(&memberships) {
         if members.is_empty() {
             continue;
         }
@@ -399,27 +539,28 @@ fn topic_jobs() -> Result<Vec<Job>> {
         jobs.push(Job {
             key: units::topic_key(&t.cache_key),
             hash: hash_parts(&sum_parts),
-            prompt: prompt_for_topic(&members),
+            prompt: prompt_for_topic(members),
             label: format!("topic:{}", t.id),
             short: false,
             gate: None,
+            ban: Vec::new(),
         });
         // The name titles the topic summary, so it depends on it. The summary job
         // above runs first in the same pass; for a topic whose summary isn't
         // cached yet the name regenerates next run, once the summary exists. The
-        // gate carries the cluster's salient terms so an off-theme name is rejected.
+        // gate carries the cluster's distinctive terms and `ban` its repo slugs,
+        // so an off-theme or repo-echo name falls back to the keyword label.
         if let Some(sum) = &t.summary {
-            let terms = cluster_terms(&members, 12);
-            let mut examples: Vec<&String> = members.iter().collect();
-            examples.sort_by_key(|s| s.len()); // shortest = most title-like
-            let examples: Vec<String> = examples.iter().take(3).map(|s| crate::excerpt(s, 90)).collect();
+            let terms = cluster_terms(members, 12, &idf);
+            let examples = pick_examples(members);
             jobs.push(Job {
                 key: units::topic_name_key(&t.cache_key),
-                hash: hash_parts(&[TOPIC_NAME_VERSION, sum.as_str(), &terms.join(",")]),
+                hash: hash_parts(&[TOPIC_NAME_VERSION, sum.as_str()]),
                 prompt: prompt_for_topic_name(sum, &terms, &examples),
                 label: format!("name:{}", t.id),
                 short: true,
                 gate: Some(terms),
+                ban: repo_ban(&t.repos),
             });
         }
     }
@@ -459,14 +600,58 @@ fn shuffle<T>(v: &mut [T], seed: u64) {
     }
 }
 
-/// Clean a raw generation per the job type and apply the faithfulness gate: a
-/// topic name sharing no salient term with its cluster is rejected (→ empty →
-/// `title()` falls through to the grounded summary).
+/// Lowercase alphanumeric skeleton of a title or repo slug, so "SIE-Internal",
+/// "sie_internal", and "sie-internal" all compare equal.
+fn normalize_slug(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// The banned names for a topic: each repo slug plus its components ("sie-web"
+/// bans "sieweb", "sie", and "web"). A name that IS a repo fragment carries
+/// nothing the repos facet doesn't already show — and the components double as
+/// the skip-list that keeps repo fragments out of the keyword fallback.
+fn repo_ban(repos: &[String]) -> Vec<String> {
+    let mut ban = Vec::new();
+    for r in repos {
+        ban.push(normalize_slug(r));
+        ban.extend(r.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|c| c.len() >= 3).map(str::to_string));
+    }
+    ban.sort_unstable();
+    ban.dedup();
+    ban
+}
+
+/// Extractive fallback title: the cluster's top distinctive terms, title-cased
+/// and joined (roadmap I2's keyword-join label) — grounded by construction, so
+/// a topic whose LLM name is rejected still gets a name-shaped title instead
+/// of surfacing a whole sentence. Banned (repo-slug) terms are skipped lest
+/// the fallback reproduce the very name the ban rejected.
+fn keyword_label(terms: &[String], ban: &[String]) -> String {
+    let kw: Vec<String> = terms
+        .iter()
+        .filter(|t| !ban.contains(&normalize_slug(t)))
+        .take(3)
+        .map(|t| title_case(t))
+        .collect();
+    crate::excerpt(&kw.join(" · "), 48)
+}
+
+/// Clean a raw generation per the job type and apply the faithfulness gates: a
+/// topic name must be well-formed, share a distinctive term with its cluster,
+/// and not be a bare repo slug — otherwise it falls back to the extractive
+/// keyword label (empty only when the cluster has no terms at all).
 fn finish(j: &Job, raw: &str) -> String {
-    let summary = if j.short { clean_name(raw) } else { clean(raw) };
-    match &j.gate {
-        Some(terms) if !name_grounded(&summary, terms) => String::new(),
-        _ => summary,
+    if !j.short {
+        return clean(raw);
+    }
+    let name = clean_name(raw);
+    let ok = !name.is_empty()
+        && j.gate.as_ref().map(|terms| name_grounded(&name, terms)).unwrap_or(true)
+        && !j.ban.contains(&normalize_slug(&name));
+    if ok {
+        name
+    } else {
+        keyword_label(j.gate.as_deref().unwrap_or_default(), &j.ban)
     }
 }
 
@@ -490,21 +675,24 @@ fn llm_workers(jobs: usize) -> usize {
 
 /// Resolve one job: the fleet store first (another viewer may have generated
 /// it — a GET beats a generation), the model only on a store miss, sharing the
-/// result back. Returns (summary, prompt_tok, out_tok, from_store).
-fn resolve(j: &Job, llm: &mut Summarizer, store: &crate::store::SummaryStore) -> (String, usize, usize, bool) {
+/// result back. Returns (summary, prompt_tok, out_tok, from_store) — or None
+/// when generation failed, in which case nothing is cached or shared: a
+/// transient model failure must not fleet-persist a fallback as if the model
+/// had really been consulted. The next run retries.
+fn resolve(j: &Job, llm: &mut Summarizer, store: &crate::store::SummaryStore) -> Option<(String, usize, usize, bool)> {
     if let Ok(Some(s)) = store.get(&j.key, &j.hash) {
-        return (s, 0, 0, true);
+        return Some((s, 0, 0, true));
     }
     let (raw, pt, ot) = match llm.generate(&j.prompt) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("  {} failed: {e}", j.label);
-            (String::new(), 0, 0)
+            return None;
         }
     };
     let summary = finish(j, &raw);
     let _ = store.put(&j.key, &j.hash, &summary);
-    (summary, pt, ot, false)
+    Some((summary, pt, ot, false))
 }
 
 /// Generate `todo`, updating and periodically persisting the cache. One worker
@@ -525,16 +713,17 @@ fn run_jobs(
         let llm = llm.as_mut().expect("summarizer loaded");
         let (mut in_tok, mut out_tok) = (0usize, 0usize);
         for (n, j) in todo.iter().enumerate() {
-            let (summary, pt, ot, fetched) = resolve(j, llm, store);
-            in_tok += pt;
-            out_tok += ot;
-            let tag = if fetched { " (fleet)" } else { "" };
-            eprintln!("  [{kind} {}/{}] {}{tag} — {}", n + 1, todo.len(), j.label, summary);
-            crate::progress::phase(&format!("summarizing {kind}s"), n + 1, todo.len());
-            cache.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
-            if (n + 1) % 10 == 0 {
-                units::save_summary_cache(cache)?;
+            if let Some((summary, pt, ot, fetched)) = resolve(j, llm, store) {
+                in_tok += pt;
+                out_tok += ot;
+                let tag = if fetched { " (fleet)" } else { "" };
+                eprintln!("  [{kind} {}/{}] {}{tag} — {}", n + 1, todo.len(), j.label, summary);
+                cache.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
+                if (n + 1) % 10 == 0 {
+                    units::save_summary_cache(cache)?;
+                }
             }
+            crate::progress::phase(&format!("summarizing {kind}s"), n + 1, todo.len());
         }
         return Ok((in_tok, out_tok));
     }
@@ -554,13 +743,13 @@ fn run_jobs(
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(j) = todo.get(i) else { break };
-                        let (summary, pt, ot, fetched) = resolve(j, &mut llm, store);
+                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        crate::progress::phase(&format!("summarizing {kind}s"), n, todo.len());
+                        let Some((summary, pt, ot, fetched)) = resolve(j, &mut llm, store) else { continue };
                         in_tok += pt;
                         out_tok += ot;
-                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                         let tag = if fetched { " (fleet)" } else { "" };
                         eprintln!("  [{kind} {n}/{}] {}{tag} — {}", todo.len(), j.label, summary);
-                        crate::progress::phase(&format!("summarizing {kind}s"), n, todo.len());
                         let mut c = shared.lock().expect("cache lock");
                         c.insert(j.key.clone(), CachedSummary { hash: j.hash.clone(), summary });
                         if n % 10 == 0 {
@@ -609,18 +798,115 @@ mod tests {
         assert_eq!(strip_opener("This binary indexes documents with ColBERT."), "This binary indexes documents with ColBERT.");
     }
 
-    // The faithfulness gate rejects a name that shares no salient term with its
-    // cluster, but keeps one that does.
+    // The faithfulness gate rejects a name that shares no distinctive term with
+    // its cluster, but keeps one that does. With a single cluster the idf is
+    // uniform, so ranking degrades to plain frequency — the smoothing guard.
     #[test]
     fn name_gate_rejects_off_theme() {
         let members = vec![
             "Added InputTooLongError and an overflow policy to the extract SDK".to_string(),
             "gliclass returns all label scores and bounds input length".to_string(),
         ];
-        let terms = cluster_terms(&members, 12);
+        let idf = idf_map(std::slice::from_ref(&members));
+        let terms = cluster_terms(&members, 12, &idf);
         assert!(name_grounded("Overflow Policy Handling", &terms)); // shares "overflow"/"policy"
         assert!(!name_grounded("Colpali Visual Retrieval", &terms)); // shares nothing
         assert!(!name_grounded("Update Dependencies", &terms)); // generic words, not cluster terms
+    }
+
+    // A term every cluster shares ("sie") must not outrank a cluster's own
+    // vocabulary, even when it tops the raw frequency count — four live topics
+    // were all named after the corpus-wide product because of this.
+    #[test]
+    fn cluster_terms_demote_background_words() {
+        let mk = |lines: &[&str]| lines.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let a = mk(&["sie voyage reranker benchmark", "sie voyage cohere reranker", "sie cohere benchmark"]);
+        let b = mk(&["sie terraform helm provisioning", "sie helm chart", "sie terraform destroy"]);
+        let c = mk(&["sie nats queue routing", "sie nats telemetry", "sie queue router"]);
+        let idf = idf_map(&[a.clone(), b.clone(), c.clone()]);
+        let top = cluster_terms(&a, 3, &idf);
+        assert!(!top.contains(&"sie".to_string()), "background word must be demoted: {top:?}");
+        assert!(top.contains(&"voyage".to_string()) || top.contains(&"reranker".to_string()), "cluster vocabulary must lead: {top:?}");
+        // Pure numbers are not topic terms, however cluster-unique.
+        let nums = mk(&["closes #955 in the worker", "follow-up to #955 cleanup", "tracked under #955 still"]);
+        let idf2 = idf_map(std::slice::from_ref(&nums));
+        assert!(!cluster_terms(&nums, 12, &idf2).contains(&"955".to_string()));
+    }
+
+    // A name that fails the gate or cleans to nothing yields the extractive
+    // keyword title — never an empty name (which would surface a sentence).
+    #[test]
+    fn finish_falls_back_to_keywords() {
+        let j = Job {
+            key: "topicname:x".into(),
+            hash: String::new(),
+            prompt: String::new(),
+            label: String::new(),
+            short: true,
+            gate: Some(vec!["voyage".into(), "reranker".into(), "cohere".into(), "benchmark".into()]),
+            ban: vec!["sieinternal".into()],
+        };
+        assert_eq!(finish(&j, "Colpali Visual Retrieval"), "Voyage · Reranker · Cohere"); // off-theme
+        assert_eq!(finish(&j, "Sharing models, cutting costs."), "Voyage · Reranker · Cohere"); // not a title
+        assert_eq!(finish(&j, "Voyage Reranker Benchmarks"), "Voyage Reranker Benchmarks"); // grounded → kept
+    }
+
+    // The repo is already a facet on every surface — a "name" that is just the
+    // repo slug OR one of its fragments carries nothing and falls back to the
+    // keyword title, with banned terms skipped so the fallback can't reproduce
+    // the rejected name (or lead with repo fragments like "internal").
+    #[test]
+    fn finish_bans_repo_slug_names() {
+        let j = Job {
+            key: "topicname:x".into(),
+            hash: String::new(),
+            prompt: String::new(),
+            label: String::new(),
+            short: true,
+            gate: Some(vec!["sie".into(), "pool".into(), "warmup".into()]),
+            ban: repo_ban(&["sie-internal".into()]),
+        };
+        // Grounded (shares "sie") but still just the repo / a repo fragment.
+        assert_eq!(finish(&j, "Sie-Internal"), "Pool · Warmup");
+        assert_eq!(finish(&j, "SIE"), "Pool · Warmup");
+        assert_eq!(repo_ban(&["sie-web".into()]), vec!["sie", "sieweb", "web"]);
+    }
+
+    // The exemplars shown to the model must be real sentences, not the slug
+    // echoes that happen to be shortest ("sie-internal: #955" primes the 0.6B
+    // to answer in slugs). A tiny cluster with nothing better still gets some.
+    #[test]
+    fn pick_examples_skips_degenerate_slugs() {
+        let members: Vec<String> = vec![
+            "sie-internal: #955".into(),
+            "sie-router-rust".into(),
+            "Added a retry path to the gateway transport for 503 responses".into(),
+            "Tuned warm pool startup probes to cut cold-start latency in half".into(),
+            "Moved sidecar config into the worker chart and documented the flags".into(),
+        ];
+        let ex = pick_examples(&members);
+        assert_eq!(ex.len(), 3);
+        assert!(ex.iter().all(|e| !e.contains("#955") && !e.contains("sie-router-rust")), "{ex:?}");
+        let tiny: Vec<String> = vec!["sie-internal: #955".into(), "fix".into()];
+        assert_eq!(pick_examples(&tiny).len(), 2); // fallback: better than nothing
+    }
+
+    // Hyphen/slash compounds are cased per component (the acronym list can
+    // never match inside "SIE-INTERNAL" as one token), whole-token codes like
+    // GPT-5.5 stay intact, and brands get their canonical mixed case.
+    #[test]
+    fn title_case_components_and_brands() {
+        assert_eq!(clean_name("SIE-INTERNAL CLEANUP"), "SIE-Internal Cleanup");
+        assert_eq!(clean_name("GPT-5.5 ROLLOUT"), "GPT-5.5 Rollout");
+        assert_eq!(clean_name("COLBERT INDEXING"), "ColBERT Indexing");
+        assert_eq!(clean_name("QWEN3 NAMING"), "Qwen3 Naming"); // brand beats the code rule
+        assert_eq!(clean_name("CTA/GITHUB BUTTON FIXES"), "CTA/GitHub Button Fixes");
+        assert_eq!(clean_name("CUDA JIT COMPILATION"), "CUDA JIT Compilation");
+        assert_eq!(clean_name("RUST-ORCHESTRATION-CLUSTER"), "Rust-Orchestration"); // generic suffix, hyphenated too
+        // Not titles: hyphen-mush compounds and anything too long to display
+        // untruncated (an ellipsis in a heading is worse than the fallback).
+        assert_eq!(clean_name("Mcp-Claud-Eq-Reduction-Generation"), "");
+        assert_eq!(clean_name("Web Deployment Notes Synchronization Prerequisites"), "");
     }
 
     // Two machines shuffle the same pending list differently (so concurrent
@@ -681,8 +967,9 @@ pub fn sample(n: usize) -> Result<()> {
     let mut llm = Summarizer::load()?;
     for j in &sel {
         let (raw, _, _) = llm.generate(&j.prompt)?;
-        let out = if j.short { clean_name(&raw) } else { clean(&raw) };
-        println!("{} — {out}", j.label);
+        // The full finishing pipeline (clean + gate + fallback), so the dry run
+        // shows exactly what a real pass would cache.
+        println!("{} — {}", j.label, finish(j, &raw));
     }
     Ok(())
 }
@@ -754,11 +1041,31 @@ pub fn summarize_all(bucket: &str) -> Result<()> {
     let covered = ujobs.iter().filter(|j| cache.get(&j.key).map(|c| !c.summary.is_empty()).unwrap_or(false)).count();
     let named = cache.iter().filter(|(k, v)| k.starts_with("topicname:") && !v.summary.is_empty()).count();
     let topics = cache.keys().filter(|k| k.starts_with("topic:")).count();
+    // Name quality: topics sharing an identical name (a name's one job is to
+    // tell topics apart), and names equal to their keyword fallback — i.e. how
+    // often the LLM's title was rejected (exact right after a regen pass).
+    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut kw_fallback = 0usize;
+    for j in tjobs.iter().filter(|j| j.short) {
+        let Some(c) = cache.get(&j.key) else { continue };
+        if c.summary.is_empty() {
+            continue;
+        }
+        *name_counts.entry(c.summary.as_str()).or_default() += 1;
+        if let Some(terms) = &j.gate {
+            if c.summary == keyword_label(terms, &j.ban) {
+                kw_fallback += 1;
+            }
+        }
+    }
+    let name_dupes: usize = name_counts.values().filter(|&&c| c > 1).sum();
     crate::metrics::Run::new("summarize")
         .set("units", ujobs.len())
         .set("unit_coverage_pct", 100.0 * covered as f64 / ujobs.len().max(1) as f64)
         .set("topics", topics)
         .set("topics_named", named)
+        .set("name_dupes", name_dupes)
+        .set("names_kw_fallback", kw_fallback)
         .set("regenerated", n)
         .set("prompt_tok", in_tok)
         .set("output_tok", out_tok)

@@ -17,6 +17,7 @@ clusters.md
 summary.md
 eval_runs.md
 cluster.err
+runs.log
 
 .synty/
 tmp/

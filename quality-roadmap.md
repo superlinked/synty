@@ -34,7 +34,9 @@ members → giant hubs.
 
 Today — `[metrics cluster]`: `silhouette misplaced(+pct) modularity
 size_{min,med,max} sessions docs clusters unclustered`; `[metrics summarize]`:
-`unit_coverage_pct topics_named`.
+`unit_coverage_pct topics_named name_dupes names_kw_fallback` (the last two
+added with I2/I3 — topics sharing an identical name, and names that are the
+keyword fallback rather than an accepted LLM title).
 
 Added by **I0**, justified by the research:
 
@@ -77,27 +79,39 @@ ids renumber under it (topic 27's "Colpali" name is a stale-id symptom).
 - **Guardrail:** `silhouette_macro`, `misplaced` unchanged — this is a post-hoc
   label-transfer layer, not a clustering change.
 
-### I2 — Name faithfulness gate + keyword fallback · low · pending
+### I2 — Name faithfulness gate + keyword fallback · low · shipped except the embedding gate
 Addresses root cause #1 — catches "Colpali Visual Document Retrieval" on
 error-handling PRs and "Update Dependencies" on synty sessions, after generation.
 - **Approach:** embed the generated name with the same ColBERT encoder; mean
   MaxSim to members; below a run-relative τ, reject and fall back to a c-TF-IDF
   keyword-join label (100%-grounded — it cannot say a token absent from members).
   Cheap LLM-free pre-check: reject if the name shares zero unigrams with the
-  cluster's top-10 c-TF-IDF terms. Show the LLM name only when it passes.
-- **Eval:** define `name_faithful_pct`; the known-bad names (27, 28) stop showing.
+  cluster's top-12 c-TF-IDF terms. Show the LLM name only when it passes.
+- **Shipped (qwen.rs):** the unigram pre-check now gates on genuinely
+  *contrastive* terms (per-cluster df × smoothed inverse cluster frequency —
+  plain frequency had let "SIE" pass as grounded in most clusters), plus a ban
+  on names equal to a repo slug or fragment; any rejection falls back to the
+  keyword-join label, so no topic is ever titled by its summary sentence.
+  Measured on the live corpus: duplicate names 14→0 topics, empty names 5→0,
+  bare repo-slug names 27→0, keyword-fallback share 20/82. The embedding-MaxSim
+  gate (and its `name_faithful_pct`) remains pending.
 - **Guardrail:** the keyword-fallback share stays bounded (not over-rejecting good
-  names) — track it.
+  names) — `names_kw_fallback` tracks it.
 
-### I3 — Ground the naming prompt · medium · pending
+### I3 — Ground the naming prompt · medium · shipped except centrality ordering
 Addresses root cause #1 at the source, complementing I2's after-the-fact gate.
-- **Approach:** prompt with the medoid summary as the first line + top-5 c-TF-IDF
+- **Approach:** prompt with the medoid summary as the first line + top c-TF-IDF
   keywords + the titles/first-lines of the 3–5 most-central members, preferring PR
   titles over abstract session summaries; reorder the reduce inputs by centrality
   (the 0.6B attends to early tokens). Bump TOPIC_PROMPT_VERSION/TOPIC_NAME_VERSION.
-- **Eval:** `name_faithful_pct` rises and I2's keyword-fallback share drops (more
-  names pass the gate).
-- **Guardrail:** names stay natural/readable; `topics_named` coverage unchanged.
+- **Shipped (qwen.rs, name prompt v s4):** the prompt's key terms are the
+  contrastive c-TF-IDF list (top 8), and the example items are filtered to
+  well-formed member summaries (≥5 words) before picking the shortest — the
+  raw shortest were degenerate slug echoes ("sie-internal: #955") that primed
+  the 0.6B to answer in slugs. Centrality-ordered examples and medoid-first
+  reduce inputs remain pending.
+- **Guardrail:** names stay natural/readable; `topics_named` coverage unchanged
+  (82/82 after the change).
 
 ### I4 — MaxSim length-norm + decouple summary + PR-bridge edges · low · pending
 Addresses root causes #5 (session misplacement) and #6 (representation).

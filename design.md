@@ -84,18 +84,21 @@ runs on CI or a server without a developer machine.
   summed over both directions). A topic is therefore a coherent *set of units*,
   so its members, facets (repos/authors), label, and summary are consistent by
   construction — no doc-vs-unit reconciliation. A `--resolution` knob trades
-  topic count vs size; modularity is reported. Labels are extractive c-TF-IDF
-  keyphrases over the member summaries; summary embeddings are content-addressed
-  in the shared store (encode-once). Clustering the denoised summaries also beats
-  clustering the chat firehose. *Built (unit-summary Louvain + resolution +
-  keyphrase labels).*
+  topic count vs size; modularity is reported. Each cluster's provisional label
+  is its most concise member summary, replaced once `summarize` titles the topic
+  — the title is gated on the cluster's distinctive (c-TF-IDF) terms and banned
+  from being a bare repo slug, with an extractive keyword title as the fallback;
+  summary embeddings are content-addressed in the shared store (encode-once).
+  Clustering the denoised summaries also beats clustering the chat firehose.
+  *Built (unit-summary Louvain + resolution + gated topic names).*
 - **Summaries.** Per session: opening ask, c-TF-IDF keyphrases, files touched,
   effort, linked PR, and a one-line abstractive summary from a local Qwen3-0.6B
   (greedy decode, cached by input hash in `.synty/` — and shared fleet-wide as
   write-once bucket objects — so the reader never runs
   the model at view time; falls back to an extractive representative line without
-  the `llm` feature). Per topic: counts, repos, notable titles — extractive.
-  *Built (extractive + local LLM session summaries).*
+  the `llm` feature). Per topic: a one-line summary reduced from the member
+  summaries plus the short gated name, same model and cache; counts and repos
+  stay extractive. *Built (extractive + local LLM session summaries).*
 
 ## Surfaces
 
