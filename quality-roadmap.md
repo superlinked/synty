@@ -64,17 +64,16 @@ How the I0 research played out:
 
 ## Interventions (priority order)
 
-### I0 — Expand the metric framework · effort low · status mostly shipped (silhouette dropped by design)
+### I0 — Expand the metric framework · effort low · status shipped (silhouette dropped by design)
 Measurement first, so every later change is judged on the same surface and we can
 see the grab-bags/hubs a global score hides.
 - **Shipped (topics.rs):** per-cluster cohesion ratio ρ_C with `cohesion_med`
   in `[metrics cluster]`, the lowest-cohesion-clusters debug lines
-  (id · ρ_C · size · label), `misplaced(+pct)`, and rescale-invariant
-  `vote_disagree`. Silhouette (micro and macro) was deliberately dropped, not
-  deferred: it structurally prefers coarser clusters — exactly the grab-bag
-  failure — so coherence is judged by the anchor membership eval.
-- **Open:** a `grabbags` count (clusters below a run-relative ρ_C floor) is not
-  emitted; the debug lines carry that signal today.
+  (id · ρ_C · size · label), `misplaced(+pct)`, rescale-invariant
+  `vote_disagree`, and `grabbags` — gated clusters below 0.8× the run-median
+  ρ_C. Silhouette (micro and macro) was deliberately dropped, not deferred:
+  it structurally prefers coarser clusters — exactly the grab-bag failure —
+  so coherence is judged by the anchor membership eval.
 
 ### I1 — Stable content-addressed cluster ids · low · shipped
 Addresses root cause #2. Prerequisite — every name/summary fix is pointless if
@@ -132,26 +131,24 @@ Addresses root cause #1 at the source, complementing I2's after-the-fact gate.
 - **Guardrail:** names stay natural/readable; `topics_named` coverage unchanged
   (82/82 after the change).
 
-### I4 — MaxSim length-norm + decouple summary + PR-bridge edges · low · partially shipped
+### I4 — MaxSim length-norm + decouple summary + PR-bridge edges · low · shipped
 Addresses root causes #5 (session misplacement) and #6 (representation).
 - **Shipped (alternate forms):** the session↔`linked_pr` bridge ships as
   `snap_to_prs` — a hard post-reassignment snap to the produced PR's topic
   (a soft edge loses to kNN reassign), with `bridges` emitted; the length bias
   is contained by capping every embed text at 500 chars so units stay
-  comparable, rather than per-token normalization in `build_edges`.
-- **Open:** the embed text still leads with the summary
-  (`"{summary} {repo} {files}"`, units.rs) — a type-prefixed structure with
-  the summary appended-not-leading remains untried, and per-token length-norm
-  inside the cap is still a candidate if misplacement resurfaces.
-- **Validated (SYNTY_QDUMP probe, live corpus):** sessions place markedly worse
-  than PRs/issues — misplaced 9.2% vs 3.0%, kNN-vote disagreement 50.6% vs
-  27.8% — so the representation gap the open half targets is real, and this is
-  the highest-leverage open clustering change. The length bias itself is
-  mostly contained by the 500-char cap (best-neighbor MaxSim is flat across
-  the upper three embed-length quartiles, depressed only in the shortest).
-- **Eval for the open half:** the session-vs-doc misplacement gap closes;
-  `misplaced_pct` down. A re-encode pass is expected (the embed string
-  changes → new content hash).
+  comparable, rather than per-token normalization in `build_edges` (probe:
+  best-neighbor MaxSim is flat across the upper three embed-length quartiles,
+  so the per-token norm stays unbuilt).
+- **Shipped (units.rs `session_embed`):** session embeds restructured per the
+  probe that found sessions placing ~3× worse than PRs (misplaced 9.2% vs
+  3.0%, vote disagreement 50.6% vs 27.8%): "Session: {repo} {files} —
+  {summary}", with the head capped separately so long file paths can never
+  truncate the summary. Measured against the post-I10 baseline: session
+  misplaced 7.6%→6.2%, session vote-disagreement 57.0%→43.3%, PR stats and
+  `bridges` flat — and 18 previously-abstained sessions joined clusters,
+  forming session-only topics that had no home (those are loose and lift
+  `grabbags`; that's new coverage being flagged, not a regression).
 
 ### I5 — Abstain on borderline outliers · low · shipped
 Addresses root cause #5 — precision over forced coverage, which the get-up-to-speed
@@ -185,21 +182,31 @@ low-ρ_C clusters the run report still flags.
   flagged cluster; build I6 only when one shows real separation, and note the
   other flagged clusters were mono-theme with weak names (a naming residual)
   or near-duplicate piles (I10), not under-splits.
+- **Re-probed after I10+I4:** the young session-only clusters the new coverage
+  created flag as grab-bags and three sit just above the separation line
+  (+0.04–0.05) — but their split sides are 2–4 units, at or below
+  MIN_CLUSTER, so a local re-split would orphan rather than sharpen. Still
+  no-go; re-probe once those topics accrete members.
 
-### I10 — Collapse near-duplicate units · low · pending (new, probe-driven)
-The lowest-cohesion cluster turned out to be ~a dozen near-identical kickoff
-sessions: every member pair above 0.8 per-token MaxSim, 39 of 66 pairs above
-0.9 — the same canonical summary re-generated session after session. No
-planned intervention touches this; it pollutes cohesion metrics, inflates
-topic unit counts, and pads the topic view with repetition.
-- **Approach:** collapse units whose pairwise per-token MaxSim exceeds ~0.95
-  into one logical unit for clustering and topic facets (keep the count as a
-  badge, like "×9"), or flag-and-fold in the views; embeddings are already in
-  the store, so detection is a cheap pass over each cluster's members.
-- **Eval:** the blurb cluster folds to a handful of logical units and its ρ_C
-  normalizes; topic unit counts stop double-counting reruns.
-- **Guardrail:** never collapse across repos or kinds; keep keys reachable
-  (drill-in still lists the collapsed sessions).
+### I10 — Collapse near-duplicate units · low · shipped (new, probe-driven)
+The lowest-cohesion cluster turned out to be near-identical kickoff sessions —
+the same canonical summary re-generated run after run — and a duplicate clique
+consumes its members' kNN edge budgets, skews every cohesion number, and pads
+the topic prompts with the same line repeated.
+- **Shipped (topics.rs `dup_groups`/`collapse_dups`):** units at ≥0.95
+  per-token symmetrized MaxSim (same repo, same session-vs-GitHub kind,
+  candidates from the kNN lists) collapse onto one representative — the
+  linked-PR member first, else smallest key, so reruns don't churn it. Only
+  reps participate in the graph, reassignment, quality, ranks, and stable-key
+  seeding; dups inherit the rep's cluster/rank, carry a `dup` pointer in
+  unit_clusters.json, stay visible in views, and are skipped by the
+  summarizer prompts and the name gate. The stable-key Jaccard counts a
+  cluster's dups as members, so collapsing sheds no cached names. Measured:
+  `dup_units`=44 in 20 groups (the ×15 blurb clique, recurring release
+  chores, template-summary sessions); the blurb cluster kept 6 reps and left
+  the lowest-cohesion list; `grabbags` 4→3 at the time.
+- **Open:** a "×N" fold badge in the views; tighten the kind guard to
+  meta.kind if issue↔PR collapses (one work item, both gh:) ever misbehave.
 
 ### Deferred (revisit if the cause persists)
 - **I7** self-consistency name verification (research #8) — needs temperature

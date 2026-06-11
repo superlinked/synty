@@ -79,9 +79,12 @@ runs on CI or a server without a developer machine.
 - **Search** — filtered late-interaction retrieval. *Built.*
 - **Clusters (topics)** — emergent, no taxonomy. Clustering is over **units of
   work** (sessions, PRs, issues), not the raw message firehose: each unit's
-  one-line summary is embedded (multi-vector ColBERT) and **Louvain** runs over a
-  MaxSim kNN graph of those summary embeddings (normalized per-unit, floored,
-  summed over both directions). A topic is therefore a coherent *set of units*,
+  one-line summary is embedded (multi-vector ColBERT; sessions lead with their
+  repo and touched files, summary appended) and **Louvain** runs over a
+  MaxSim kNN graph of those embeddings (normalized per-unit, floored,
+  summed over both directions), with near-duplicate units — the same work item
+  re-run — collapsed onto one representative before any graph work. A topic is
+  therefore a coherent *set of units*,
   so its members, facets (repos/authors), label, and summary are consistent by
   construction — no doc-vs-unit reconciliation. A `--resolution` knob trades
   topic count vs size; modularity is reported. Each cluster's provisional label

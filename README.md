@@ -149,8 +149,9 @@ delay, redaction) is the planned answer where it isn't.
   queries with MaxSim, backed by SQLite for exact metadata filters
   (`--filter repo=...`, `kind=pull_request`, …).
 - **Topics** — units of work (sessions, PRs, issues) clustered by the embedding
-  of their one-line summary (Louvain over a MaxSim kNN graph), each named by the
-  local model with a short title that must share one of the cluster's
+  of their one-line summary plus project context (Louvain over a MaxSim kNN
+  graph, near-duplicate reruns collapsed onto one representative), each named
+  by the local model with a short title that must share one of the cluster's
   *distinctive* terms (c-TF-IDF against the other clusters), may not be a
   bare repo name, and must embed close to its members (MaxSim against the
   cluster's own embeddings) — otherwise an extractive keyword title takes

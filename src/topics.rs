@@ -1,12 +1,14 @@
 // Unit-level topics. Instead of clustering the 4k-doc message firehose, cluster
 // the *units of work* (sessions, PRs, issues) by a multi-vector ColBERT
-// embedding of a compact per-unit text (its summary plus the session's repo and
-// touched files, or the PR/issue body — a lone one-liner is too thin to
-// separate) — MaxSim kNN
-// + Louvain, the same late-interaction substrate as retrieval, one level up. A
-// topic is then a coherent set of units, so its members/facets/label/summary are
-// consistent by construction. Writes the clusters as a new rev in the current
-// build (see readmodel); reports anchor-validated coherence.
+// embedding of a compact per-unit text (for a session, repo and touched files
+// leading and the summary appended; for a PR/issue, summary plus body — a lone
+// one-liner is too thin to separate) — MaxSim kNN + Louvain, the same
+// late-interaction substrate as retrieval, one level up. Near-duplicate units
+// (the same work item re-run) collapse onto one representative before any
+// graph work. A topic is then a coherent set of units, so its
+// members/facets/label/summary are consistent by construction. Writes the
+// clusters as a new rev in the current build (see readmodel); reports
+// anchor-validated coherence.
 
 use crate::community::{louvain, modularity, Graph};
 use crate::store::EmbStore;
