@@ -231,6 +231,7 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
         .set("misplaced", qual.misplaced)
         .set("misplaced_pct", if qual.scored > 0 { 100.0 * qual.misplaced as f64 / qual.scored as f64 } else { 0.0 })
         .set("vote_disagree", qual.vote_disagree)
+        .set("grabbags", qual.grabbags)
         .set("size_min", sizes.first().copied().unwrap_or(0))
         .set("size_med", sizes.get(sizes.len() / 2).copied().unwrap_or(0))
         .set("size_max", sizes.last().copied().unwrap_or(0))
@@ -519,6 +520,7 @@ struct Quality {
     scored: usize,
     cohesion_med: f32,
     vote_disagree: usize,
+    grabbags: usize,
 }
 
 /// Min cluster size for the cohesion median to count a cluster — tiny clusters
@@ -526,6 +528,10 @@ struct Quality {
 const QGATE: usize = 5;
 /// Min size for a cluster to appear in the lowest-cohesion debug.
 const COHERENCE_MIN: usize = 8;
+/// A gated cluster whose cohesion falls below this fraction of the run median
+/// counts as a grab-bag — run-relative, like every placement metric here,
+/// because MaxSim's scale doesn't transfer across corpora or models.
+const GRABBAG_FRAC: f32 = 0.8;
 
 fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], units: &[units::UnitClusterInput]) -> Quality {
     let label = |ci: usize| labels.get(ci).cloned().unwrap_or_default();
@@ -563,7 +569,7 @@ fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], unit
     }
     let scored = margins.len();
     if scored == 0 {
-        return Quality { misplaced: 0, scored: 0, cohesion_med: 0.0, vote_disagree: 0 };
+        return Quality { misplaced: 0, scored: 0, cohesion_med: 0.0, vote_disagree: 0, grabbags: 0 };
     }
 
     // Cohesion ratio ρ_C = mean within-cluster best-neighbor MaxSim ÷ global mean.
@@ -575,6 +581,10 @@ fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], unit
     let mut rho_gate: Vec<f32> = rho.iter().filter(|(_, n, _)| *n >= QGATE).map(|(_, _, r)| *r).collect();
     rho_gate.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let cohesion_med = rho_gate.get(rho_gate.len() / 2).copied().unwrap_or(0.0);
+    // Grab-bags: gated clusters well below the run median. (With a single
+    // gated cluster the floor is a fraction of its own ρ, so it can never
+    // self-flag — irrelevant at real corpus sizes.)
+    let grabbags = rho_gate.iter().filter(|r| **r < GRABBAG_FRAC * cohesion_med).count();
 
     // Rescale-invariant placement: a unit whose kNN-majority cluster differs from
     // its assignment is likely misplaced regardless of the score scale.
@@ -638,7 +648,7 @@ fn report_quality(results: &[Knn], of: &[Option<usize>], labels: &[String], unit
     for (ci, sz, r) in rho.iter().filter(|(_, n, _)| *n >= COHERENCE_MIN).take(6) {
         eprintln!("    c{ci} [ρ {r:.2}] n={sz} — {}", label(*ci));
     }
-    Quality { misplaced, scored, cohesion_med, vote_disagree }
+    Quality { misplaced, scored, cohesion_med, vote_disagree, grabbags }
 }
 
 #[cfg(test)]
@@ -684,6 +694,33 @@ mod tests {
             let want: Vec<usize> = brute.iter().take(5).map(|(j, _)| *j).collect();
             assert_eq!(knn[i].ids, want, "unit {i} neighbor ranking diverged");
         }
+    }
+
+    // A cluster whose members barely cohere relative to the run's median is
+    // flagged as a grab-bag; a tight cluster is not, and an empty run flags
+    // nothing.
+    #[test]
+    fn grabbags_counts_low_cohesion_clusters() {
+        let unit = |k: &str| units::UnitClusterInput {
+            key: k.to_string(),
+            summary: String::new(),
+            embed: String::new(),
+            linked: None,
+        };
+        let units: Vec<units::UnitClusterInput> = (0..10).map(|i| unit(&format!("u{i}"))).collect();
+        // Cluster 0 (units 0-4) is tight: each member's neighbor scores 1.0.
+        // Cluster 1 (units 5-9) is loose: each member's neighbor scores 0.1.
+        let results: Vec<Knn> = (0..10)
+            .map(|i| {
+                let twin = if i < 5 { (i + 1) % 5 } else { 5 + (i - 4) % 5 };
+                Knn { ids: vec![twin], scores: vec![if i < 5 { 1.0 } else { 0.1 }] }
+            })
+            .collect();
+        let of: Vec<Option<usize>> = (0..10).map(|i| Some(if i < 5 { 0 } else { 1 })).collect();
+        let q = report_quality(&results, &of, &[String::new(), String::new()], &units);
+        assert_eq!(q.scored, 10);
+        assert_eq!(q.grabbags, 1, "only the loose cluster is a grab-bag");
+        assert_eq!(report_quality(&[], &[], &[], &[]).grabbags, 0);
     }
 
     // The hub of a cluster (best-connected member) gets rank 0 — its summary
