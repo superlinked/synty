@@ -14,7 +14,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::symbols::Marker;
-use ratatui::widgets::{Axis, Block, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, TableState, Tabs, Wrap};
+use ratatui::widgets::{Axis, Block, Cell, Chart, Clear, Dataset, GraphType, LegendPosition, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -254,12 +254,11 @@ struct ViewCache {
     acct_counts: HashMap<String, usize>,
     /// Per topic, the day_num of each unit (parallel to `topics`).
     topic_days: Vec<Vec<i32>>,
-    /// The Status stats panel's raw day_num → value series. `chart_rows` are
-    /// the line-chart series (tokens, sessions, prs, loc±); `stats_rows` the
-    /// height-bar count rows below. The visible window is cut at draw time to
-    /// however many Mon-aligned weeks fit the panel's width.
-    chart_rows: Vec<(&'static str, HashMap<i32, u64>)>,
-    stats_rows: Vec<(&'static str, HashMap<i32, u64>)>,
+    /// The Status charts' raw day_num → value series: the agent side
+    /// (tokens, sessions, tools, cache) and the output side (prs, issues,
+    /// loc±). The visible window is cut at draw time to the panel's width.
+    chart_agent: Vec<(&'static str, HashMap<i32, u64>)>,
+    chart_output: Vec<(&'static str, HashMap<i32, u64>)>,
     stats_gmax: i32,
 }
 
@@ -324,21 +323,18 @@ impl ViewCache {
             }
             days
         };
-        // The line-chart series: spend and what it produced, one timeline.
-        let chart_rows: Vec<(&'static str, HashMap<i32, u64>)> = vec![
+        // Two timelines: what the agents consumed, and what the work produced.
+        let chart_agent: Vec<(&'static str, HashMap<i32, u64>)> = vec![
             ("tokens", fold_stat(|s| s.tok_in + s.tok_out)),
+            ("cache", fold_stat(|s| s.cache_read + s.cache_create)),
+            ("tools", fold_stat(|s| s.tools)),
             ("sessions", fold_stat(|s| s.sessions)),
+        ];
+        let chart_output: Vec<(&'static str, HashMap<i32, u64>)> = vec![
             ("prs", fold_kind(Kind::Pr)),
+            ("issues", fold_kind(Kind::Issue)),
             ("loc+", fold_loc(false)),
             ("loc-", fold_loc(true)),
-        ];
-        // The bar rows below: the counts and the cache classes the chart
-        // no longer carries.
-        let stats_rows: Vec<(&'static str, HashMap<i32, u64>)> = vec![
-            ("tools", fold_stat(|s| s.tools)),
-            ("issues", fold_kind(Kind::Issue)),
-            ("cache r", fold_stat(|s| s.cache_read)),
-            ("cache w", fold_stat(|s| s.cache_create)),
         ];
 
         Self {
@@ -350,8 +346,8 @@ impl ViewCache {
                 .iter()
                 .map(|t| t.units.iter().filter_map(|u| day_num(&u.when)).collect())
                 .collect(),
-            chart_rows,
-            stats_rows,
+            chart_agent,
+            chart_output,
             stats_gmax,
         }
     }
@@ -1263,15 +1259,17 @@ impl App {
                 .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" synty ")),
             head,
         );
-        let weeks = Self::stats_weeks(stats.width.saturating_sub(2));
+        let weeks = Self::stats_weeks(stats.width.saturating_sub(2) / 2);
         let block = Block::bordered()
             .border_style(Style::new().fg(theme::BORDER))
-            .title(format!(" tokens & tools · {weeks} weeks "));
+            .title(format!(" agents · output · {weeks} weeks "));
         let inner = block.inner(stats);
         f.render_widget(block, stats);
-        let [plot, counts] = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).areas(inner);
-        self.draw_token_chart(f, plot, weeks);
-        f.render_widget(Paragraph::new(self.stats_panel(weeks)), counts);
+        let [agents, output] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
+        const AGENT_HUES: [Color; 4] = [theme::ACCENT, theme::GITHUB, theme::SAGE, theme::MERGED];
+        const OUTPUT_HUES: [Color; 4] = [theme::GITHUB, theme::MERGED, theme::SAGE, theme::CLOSED];
+        self.draw_series_chart(f, agents, weeks, &self.cache.chart_agent, &AGENT_HUES);
+        self.draw_series_chart(f, output, weeks, &self.cache.chart_output, &OUTPUT_HUES);
         let [upper, lower] = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(cols);
         let [rcol, ucol] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(upper);
         f.render_widget(facet_table("Repos", &self.status.by_repo), rcol);
@@ -1364,48 +1362,43 @@ impl App {
         f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
     }
 
-    /// The work timeline as Braille lines on a log10 y-axis — tokens in the
-    /// millions, LOC in the thousands, sessions in the tens; the log axis
-    /// makes spend and what it produced comparable on one plot. Zero days
-    /// plot at the floor. The legend carries each series' window total.
-    fn draw_token_chart(&self, f: &mut Frame, area: Rect, weeks: usize) {
+    /// One timeline as Braille lines on a log10 y-axis — the series sit
+    /// orders of magnitude apart, and the log axis makes them comparable on
+    /// one plot. Zero days plot at the floor; the legend (top-left, over the
+    /// sparser old data, names only) identifies the lines.
+    fn draw_series_chart(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        weeks: usize,
+        rows: &[(&'static str, HashMap<i32, u64>)],
+        hues: &[Color],
+    ) {
         let c = &self.cache;
         if c.stats_gmax == 0 || area.height < 3 {
             return;
         }
         let start = week_start_for(c.stats_gmax, weeks);
         let n_days = (weeks * 7) as i32;
-        // Maximally-separated brand hues — line identity is carried by color
-        // alone, and the muted table palette blended on a dark plot.
-        const CLASSES: [(&str, Color); 5] = [
-            ("tokens", theme::ACCENT),   // coral — the spend (in + out)
-            ("sessions", theme::MERGED), // violet
-            ("prs", theme::GITHUB),      // sky
-            ("loc+", theme::SAGE),       // green — code landed
-            ("loc-", theme::CLOSED),     // muted red — code removed
-        ];
-        // (series points, legend name) per class; data must outlive the chart.
+        // (series points, name); data must outlive the chart.
         let mut series: Vec<(Vec<(f64, f64)>, String)> = Vec::new();
         let mut top = 0u64;
-        for (i, (name, _)) in CLASSES.iter().enumerate() {
-            let map = &c.chart_rows[i].1;
+        for (name, map) in rows {
             let mut pts = Vec::with_capacity(n_days as usize);
-            let mut total = 0u64;
             for d in 0..n_days {
                 let v = map.get(&(start + d)).copied().unwrap_or(0);
-                total += v;
                 top = top.max(v);
                 pts.push((d as f64, if v == 0 { 0.0 } else { (v as f64).log10() }));
             }
-            series.push((pts, format!("{name} {}", crate::view::fmt_tokens(total))));
+            series.push((pts, name.to_string()));
         }
         // Bounds snapped to a multiple of 3 so the evenly-spaced labels land
         // exactly on 1 / 1k / 1M / 1B.
         let y_max = (((top.max(10) as f64).log10()).ceil() / 3.0).ceil() * 3.0;
         let datasets: Vec<Dataset> = series
             .iter()
-            .zip(CLASSES.iter())
-            .map(|((pts, name), (_, color))| {
+            .zip(hues.iter())
+            .map(|((pts, name), color)| {
                 Dataset::default()
                     .name(name.clone())
                     .marker(Marker::Braille)
@@ -1428,53 +1421,20 @@ impl App {
             })
             .collect();
         let chart = Chart::new(datasets)
-            // the legend carries the totals — never hide it (the default
-            // hides legends taller than a quarter of the plot).
+            .legend_position(Some(LegendPosition::TopLeft))
+            // never hide the legend (the default hides legends taller than a
+            // quarter of the plot).
             .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 1)))
             .x_axis(Axis::default().bounds([0.0, (n_days - 1) as f64]).labels(x_labels))
             .y_axis(Axis::default().bounds([0.0, y_max]).labels(y_labels));
         f.render_widget(chart, area);
     }
 
-    /// How many whole Mon-aligned weeks of chart fit a panel of `width`:
-    /// 9 chars of label + the bars (8 per week incl. divider, minus the last
-    /// divider) + ~10 for the window total.
+    /// How many whole Mon-aligned weeks fit one chart of `width`: braille
+    /// packs two days per column, minus the y-axis gutter.
     fn stats_weeks(width: u16) -> usize {
-        let avail = (width as usize).saturating_sub(9 + 10);
-        ((avail + 1) / 8).clamp(4, 26)
-    }
-
-    /// The count rows under the token chart: day bars scaled by height (▁..█)
-    /// against each row's own peak, over the same window — tools, sessions,
-    /// and the GitHub artifacts, with window totals on the right.
-    fn stats_panel(&self, weeks: usize) -> Text<'static> {
-        let c = &self.cache;
-        if c.stats_gmax == 0 {
-            return Text::from(Line::from(Span::styled("no usage data yet", Style::new().fg(theme::DIM))));
-        }
-        let dim = Style::new().fg(theme::DIM);
-        let start = week_start_for(c.stats_gmax, weeks);
-        let n_days = weeks * 7;
-        let mut lines = vec![Line::from(Span::styled(format!("{:9}{}", "", week_labels(start, weeks)), dim))];
-        for (label, map) in c.stats_rows.iter() {
-            let mut days = vec![0u64; n_days];
-            for (d, v) in map {
-                let off = d - start;
-                if (0..n_days as i32).contains(&off) {
-                    days[off as usize] += v;
-                }
-            }
-            let cap = days.iter().copied().max().unwrap_or(0);
-            let total: u64 = days.iter().sum();
-            let mut spans = vec![Span::styled(format!("{label:<9}"), dim)];
-            spans.extend(bar_spans(&days, cap));
-            spans.push(Span::styled(
-                format!("  {}", crate::view::fmt_tokens(total)),
-                Style::new().fg(theme::FG).add_modifier(Modifier::BOLD),
-            ));
-            lines.push(Line::from(spans));
-        }
-        Text::from(lines)
+        let avail = (width as usize).saturating_sub(12);
+        (avail * 2 / 7).clamp(4, 26)
     }
 
     /// The Status header: totals, freshness, the autostart toggle state, and the
@@ -1748,26 +1708,6 @@ fn week_labels(start: i32, weeks: usize) -> String {
         None => String::new(),
     };
     (0..weeks as i32).map(|w| format!("{:<8}", label(w))).collect::<String>().trim_end().to_string()
-}
-
-/// Day bars by height (▁..█) against `cap` — an actual chart, where the heat
-/// strip's color shades read poorly for magnitudes. Zero days are a dim dot,
-/// weeks separated like the strips.
-fn bar_spans(days: &[u64], cap: u64) -> Vec<Span<'static>> {
-    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let mut spans: Vec<Span> = Vec::with_capacity(days.len() + days.len() / 7);
-    for (d, &n) in days.iter().enumerate() {
-        if d > 0 && d % 7 == 0 {
-            spans.push(Span::styled("│", Style::new().fg(theme::BORDER)));
-        }
-        spans.push(if n == 0 {
-            Span::styled("·", Style::new().fg(theme::HILITE))
-        } else {
-            let lvl = ((n * 8).div_ceil(cap.max(1))).clamp(1, 8) as usize;
-            Span::styled(BARS[lvl - 1].to_string(), Style::new().fg(theme::FG))
-        });
-    }
-    spans
 }
 
 /// Header for the Topics activity column: the four Monday labels.
@@ -2280,11 +2220,9 @@ mod tests {
         // the tokens & tools panel: a log-scale braille line chart for the
         // token classes (legend carries the window totals) over height-bar
         // rows for the counts, windowed to whatever the width fits.
-        assert!(text.contains("tokens & tools · 12 weeks"), "panel should size to the width: {text}");
-        assert!(text.contains("tokens 25.1k") && text.contains("loc+ 120") && text.contains("loc- 40") && text.contains("prs 1"), "chart legend totals missing: {text}");
-        assert!(text.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)), "braille plot missing: {text}");
-        assert!(text.contains("tools") && text.contains("issues") && text.contains("cache r"), "bar rows missing");
-        assert!(text.contains("█"), "count bars missing");
+        assert!(text.contains("agents · output"), "panel title missing: {text}");
+        assert!(text.contains("tokens") && text.contains("cache") && text.contains("loc+") && text.contains("loc-"), "chart legends missing: {text}");
+        assert!(text.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)), "braille plots missing: {text}");
         // segmentation: repo rows carry token/tool spend, the fleet-wide tool
         // mix names tools with their agent, and models get their own table.
         assert!(text.contains("TOK") && text.contains("TOOLS"), "facet spend columns missing: {text}");
