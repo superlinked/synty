@@ -312,6 +312,114 @@ fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut s
     }
 }
 
+/// One day's usage across every session — the substrate for the Status stats
+/// panel's time series. Token fields follow the same accounting as the
+/// per-session aggregation (msg_id dedup, codex last-snapshot normalization);
+/// `sessions` counts the distinct sessions active that day.
+#[derive(Default, Clone, Copy)]
+pub struct DayStat {
+    pub tok_in: u64,
+    pub tok_out: u64,
+    pub cache_read: u64,
+    pub cache_create: u64,
+    pub tools: u64,
+    pub sessions: u64,
+}
+
+/// The day-series fold. Claude usage lands on the day of its (msg_id-deduped)
+/// event — exact, even for sessions spanning days. A codex session's
+/// cumulative last snapshot lands on that snapshot's own day — coarse, but
+/// codex reports no per-turn usage.
+#[derive(Default)]
+struct DayFold {
+    days: HashMap<String, DayStat>,
+    seen: std::collections::HashSet<u64>,
+    seen_msgs: std::collections::HashSet<String>,
+    active: HashMap<String, std::collections::HashSet<String>>,
+    codex: HashMap<String, ((u64, u64, u64), String)>, // sid -> (last snapshot, its day)
+}
+
+impl DayFold {
+    fn fold(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(line) else { return };
+        if !crate::event::first_sighting(&mut self.seen, ev["event_id"].as_str().unwrap_or("")) {
+            return;
+        }
+        let sid = ev["session_id"].as_str().unwrap_or("");
+        let day = ev["ts"].as_str().unwrap_or("").split('T').next().unwrap_or("");
+        if sid.is_empty() || day.len() != 10 {
+            return;
+        }
+        self.active.entry(day.to_string()).or_default().insert(sid.to_string());
+        match ev["kind"].as_str().unwrap_or("") {
+            "tool_call" => self.days.entry(day.to_string()).or_default().tools += 1,
+            "agent_meta" => {
+                let p = &ev["payload"];
+                match p["subtype"].as_str().unwrap_or("") {
+                    "usage" => {
+                        let dedup = p["msg_id"].as_str().filter(|m| !m.is_empty()).map(String::from);
+                        if dedup.map(|m| self.seen_msgs.insert(m)).unwrap_or(true) {
+                            let n = |k: &str| p["usage"][k].as_u64().unwrap_or(0);
+                            let d = self.days.entry(day.to_string()).or_default();
+                            d.tok_in += n("in");
+                            d.tok_out += n("out");
+                            d.cache_read += n("cache_read");
+                            d.cache_create += n("cache_create");
+                        }
+                    }
+                    "event_msg" if p["event_kind"] == "token_count" => {
+                        let u = &p["payload"]["info"]["total_token_usage"];
+                        if u.is_object() {
+                            self.codex.insert(
+                                sid.to_string(),
+                                (
+                                    (
+                                        u["input_tokens"].as_u64().unwrap_or(0),
+                                        u["cached_input_tokens"].as_u64().unwrap_or(0),
+                                        u["output_tokens"].as_u64().unwrap_or(0),
+                                    ),
+                                    day.to_string(),
+                                ),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(mut self) -> HashMap<String, DayStat> {
+        for ((input, cached, output), day) in self.codex.into_values() {
+            let d = self.days.entry(day).or_default();
+            d.tok_in += input.saturating_sub(cached);
+            d.cache_read += cached;
+            d.tok_out += output;
+        }
+        for (day, sids) in self.active {
+            self.days.entry(day).or_default().sessions = sids.len() as u64;
+        }
+        self.days
+    }
+}
+
+/// Per-day usage/tool tallies from the raw envelopes, for the time-series view.
+pub fn day_stats() -> HashMap<String, DayStat> {
+    let mut f = DayFold::default();
+    for path in jsonl_files(Path::new(LOCAL_DIR)) {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            for line in data.lines() {
+                f.fold(line);
+            }
+        }
+    }
+    f.finish()
+}
+
 /// Aggregate the raw envelopes under corpus/local into per-session tallies.
 fn aggregate() -> HashMap<String, Agg> {
     // The org's repos (from the last back-fill) — fold worktree dirs onto them.
@@ -904,6 +1012,38 @@ mod tests {
             fold_line(line, &known, &mut seen, &mut aggs);
         }
         aggs
+    }
+
+    fn day_stats_of(text: &str) -> HashMap<String, DayStat> {
+        let mut f = DayFold::default();
+        for line in text.lines() {
+            f.fold(line);
+        }
+        f.finish()
+    }
+
+    // The day series attributes usage to the day of its event (exact even for
+    // sessions spanning days), dedups streamed msg_ids across days, lands a
+    // codex session's cumulative snapshot on the snapshot's day, and counts
+    // distinct active sessions per day.
+    #[test]
+    fn day_stats_attribute_by_event_day() {
+        let lines = [
+            r#"{"event_id":"e1","session_id":"S","ts":"2026-06-11T23:00:00Z","kind":"agent_meta","payload":{"subtype":"usage","msg_id":"m1","usage":{"in":10,"out":5,"cache_read":100,"cache_create":0}}}"#,
+            r#"{"event_id":"e2","session_id":"S","ts":"2026-06-12T01:00:00Z","kind":"agent_meta","payload":{"subtype":"usage","msg_id":"m1","usage":{"in":10,"out":5,"cache_read":100,"cache_create":0}}}"#,
+            r#"{"event_id":"e3","session_id":"S","ts":"2026-06-12T01:05:00Z","kind":"agent_meta","payload":{"subtype":"usage","msg_id":"m2","usage":{"in":1,"out":2,"cache_read":3,"cache_create":4}}}"#,
+            r#"{"event_id":"e4","session_id":"S","ts":"2026-06-12T01:06:00Z","kind":"tool_call","payload":{"name":"Bash"}}"#,
+            r#"{"event_id":"e5","session_id":"T","ts":"2026-06-12T02:00:00Z","kind":"user_prompt","payload":{"text":"another session active today"}}"#,
+            r#"{"event_id":"e6","session_id":"C","ts":"2026-06-10T09:00:00Z","kind":"agent_meta","payload":{"subtype":"event_msg","event_kind":"token_count","payload":{"info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50}}}}}"#,
+        ]
+        .join("\n");
+        let d = day_stats_of(&lines);
+        assert_eq!(d["2026-06-11"].tok_out, 5, "m1 lands on its first-seen day");
+        assert_eq!(d["2026-06-12"].tok_out, 2, "the cross-day repeat of m1 does not double-count");
+        assert_eq!(d["2026-06-12"].tools, 1);
+        assert_eq!(d["2026-06-12"].sessions, 2, "S and T both active");
+        assert_eq!(d["2026-06-10"].tok_in, 80, "codex snapshot normalized on its own day");
+        assert_eq!(d["2026-06-10"].cache_read, 20);
     }
 
     // A streamed turn repeats the identical usage object on every raw line of

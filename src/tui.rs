@@ -152,6 +152,7 @@ struct Bundle {
     work: Vec<Unit>,
     topics: Vec<TopicUnits>,
     status: crate::view::Status,
+    day_stats: HashMap<String, units::DayStat>,
 }
 
 impl Bundle {
@@ -173,7 +174,7 @@ impl Bundle {
             autostart: false,
             stale: false,
         });
-        Self { docs, sessions, work, topics, status }
+        Self { docs, sessions, work, topics, status, day_stats: units::day_stats() }
     }
 }
 
@@ -241,10 +242,15 @@ struct ViewCache {
     acct_counts: HashMap<String, usize>,
     /// Per topic, the day_num of each unit (parallel to `topics`).
     topic_days: Vec<Vec<i32>>,
+    /// The Status stats panel: per metric, (label, per-day values over the
+    /// 4-week window, window total) — plus the window anchors for the header.
+    stats_rows: Vec<(&'static str, [u64; TL_DAYS], u64)>,
+    stats_start: i32,
+    stats_gmax: i32,
 }
 
 impl ViewCache {
-    fn build(topics: &[TopicUnits], work: &[Unit]) -> Self {
+    fn build(topics: &[TopicUnits], work: &[Unit], day_stats: &HashMap<String, units::DayStat>) -> Self {
         let facet = |repo: bool| {
             let mut ct: HashMap<&str, usize> = HashMap::new();
             for t in topics {
@@ -263,6 +269,35 @@ impl ViewCache {
             }
             ct
         };
+        // The stats time series, anchored to the most recent day with data so
+        // the strips stay deterministic (no wall clock).
+        let by_num: Vec<(i32, units::DayStat)> =
+            day_stats.iter().filter_map(|(d, s)| Some((day_num(d)?, *s))).collect();
+        let stats_gmax = by_num.iter().map(|(d, _)| *d).max().unwrap_or(0);
+        let stats_start = week_start(stats_gmax);
+        let metric: Vec<(&'static str, fn(&units::DayStat) -> u64)> = vec![
+            ("tok out", |s| s.tok_out),
+            ("tok in", |s| s.tok_in),
+            ("cache r", |s| s.cache_read),
+            ("cache w", |s| s.cache_create),
+            ("tools", |s| s.tools),
+            ("sessions", |s| s.sessions),
+        ];
+        let stats_rows = metric
+            .into_iter()
+            .map(|(label, get)| {
+                let mut days = [0u64; TL_DAYS];
+                for (d, s) in &by_num {
+                    let off = d - stats_start;
+                    if (0..TL_DAYS as i32).contains(&off) {
+                        days[off as usize] += get(s);
+                    }
+                }
+                let total: u64 = days.iter().sum();
+                (label, days, total)
+            })
+            .collect();
+
         Self {
             repo_facets: facet(true),
             acct_facets: facet(false),
@@ -272,6 +307,9 @@ impl ViewCache {
                 .iter()
                 .map(|t| t.units.iter().filter_map(|u| day_num(&u.when)).collect())
                 .collect(),
+            stats_rows,
+            stats_start,
+            stats_gmax,
         }
     }
 }
@@ -344,7 +382,7 @@ impl App {
         let doc_by_id = b.docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
         let sess_by_id = b.sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
         let (qtx, rrx) = spawn_search(model_id);
-        let cache = ViewCache::build(&b.topics, &b.work);
+        let cache = ViewCache::build(&b.topics, &b.work, &b.day_stats);
         let (btx, brx) = channel::<Bundle>();
         Self {
             cache,
@@ -448,7 +486,7 @@ impl App {
             .and_then(|vi| self.drilled(vi))
             .map(|t| t.cache_key.clone());
 
-        self.cache = ViewCache::build(&b.topics, &b.work);
+        self.cache = ViewCache::build(&b.topics, &b.work, &b.day_stats);
         self.doc_by_id = b.docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
         self.sess_by_id = b.sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
         self.docs = b.docs;
@@ -1159,19 +1197,53 @@ impl App {
         o
     }
 
-    /// Status view: a totals/freshness/autostart header over two breakdown
-    /// tables — docs · GitHub objects · sessions per repo and per account.
+    /// Status view: a totals/freshness/autostart header, the tokens & tools
+    /// time-series panel, then two breakdown tables — docs · GitHub objects ·
+    /// sessions per repo and per account.
     fn draw_status(&self, f: &mut Frame, area: Rect) {
-        let [head, cols] = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
+        let [head, stats, cols] =
+            Layout::vertical([Constraint::Length(6), Constraint::Length(9), Constraint::Min(0)]).areas(area);
         f.render_widget(
             Paragraph::new(self.status_head())
                 .wrap(Wrap { trim: false })
                 .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" synty ")),
             head,
         );
+        f.render_widget(
+            Paragraph::new(self.stats_panel())
+                .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" tokens & tools · 4 weeks ")),
+            stats,
+        );
         let [rcol, ucol] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(cols);
         f.render_widget(facet_table("Repos", &self.status.by_repo), rcol);
         f.render_widget(facet_table("Accounts", &self.status.by_user), ucol);
+    }
+
+    /// The stats panel: one day-strip row per metric over the last four
+    /// Mon-aligned weeks (the same window and shading as the Topics activity
+    /// column), with the window total on the right. Each row shades against
+    /// its own peak day — the scales differ by orders of magnitude.
+    fn stats_panel(&self) -> Text<'static> {
+        let c = &self.cache;
+        if c.stats_gmax == 0 {
+            return Text::from(Line::from(Span::styled("no usage data yet", Style::new().fg(theme::DIM))));
+        }
+        let dim = Style::new().fg(theme::DIM);
+        let mut lines = vec![Line::from(Span::styled(
+            format!("{:9}{}", "", week_header(c.stats_start, c.stats_gmax)),
+            dim,
+        ))];
+        for (label, days, total) in &c.stats_rows {
+            let mut spans = vec![Span::styled(format!("{label:<9}"), dim)];
+            let cap = days.iter().copied().max().unwrap_or(0);
+            spans.extend(strip_spans(days, cap));
+            spans.push(Span::styled(
+                format!("  {}", crate::view::fmt_tokens(*total)),
+                Style::new().fg(theme::FG).add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::from(spans));
+        }
+        Text::from(lines)
     }
 
     /// The Status header: totals, freshness, the autostart toggle state, and the
@@ -1396,6 +1468,13 @@ fn daily(days: &[i32], start: i32) -> [u64; TL_DAYS] {
 /// tall (the same strip on both lines) so each day is a taller, easier-to-compare
 /// column that lines up with the two-line title/repos cells.
 fn day_strip(days: &[u64; TL_DAYS], cap: u64) -> Cell<'static> {
+    let spans = strip_spans(days, cap);
+    Cell::from(Text::from(vec![Line::from(spans.clone()), Line::from(spans)]))
+}
+
+/// The day-strip spans themselves — shared between the two-line table cell
+/// above and the Status stats panel's single-line rows.
+fn strip_spans(days: &[u64; TL_DAYS], cap: u64) -> Vec<Span<'static>> {
     let mut spans: Vec<Span> = Vec::with_capacity(TL_DAYS + TL_DAYS / 7);
     for (d, &n) in days.iter().enumerate() {
         if d > 0 && d % 7 == 0 {
@@ -1407,7 +1486,7 @@ fn day_strip(days: &[u64; TL_DAYS], cap: u64) -> Cell<'static> {
             Span::styled("█", Style::new().fg(shade(n, cap)))
         });
     }
-    Cell::from(Text::from(vec![Line::from(spans.clone()), Line::from(spans)]))
+    spans
 }
 
 fn type_cell(k: Kind) -> Cell<'static> {
@@ -1568,7 +1647,7 @@ mod tests {
         ];
         let topics = vec![TopicUnits { id: 0, cache_key: "t0".into(), label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()), name: Some("OCR & Document Extraction".into()), span: Some(("2026-05-29".into(), "2026-05-31".into())) }];
         App {
-            cache: ViewCache::build(&topics, &work),
+            cache: ViewCache::build(&topics, &work, &test_day_stats()),
             docs,
             doc_by_id,
             sess_by_id: [("S1".to_string(), 0)].into_iter().collect(),
@@ -1598,6 +1677,13 @@ mod tests {
         }
     }
 
+    fn test_day_stats() -> HashMap<String, units::DayStat> {
+        let mut m = HashMap::new();
+        m.insert("2026-05-31".to_string(), units::DayStat { tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, tools: 8, sessions: 1 });
+        m.insert("2026-05-30".to_string(), units::DayStat { tok_out: 2_000, tools: 3, sessions: 1, ..Default::default() });
+        m
+    }
+
     fn clone_unit(u: &Unit) -> Unit {
         Unit { kind: u.kind, when: u.when.clone(), repo: u.repo.clone(), title: u.title.clone(), outcome: u.outcome.clone(), summary: u.summary.clone(), topic: u.topic, rank: u.rank, dup: u.dup, struggle: u.struggle, author: u.author.clone(), doc_id: u.doc_id, session_id: u.session_id.clone() }
     }
@@ -1622,7 +1708,7 @@ mod tests {
             name: Some("Infra & Terraform".into()),
             span: Some(("2026-05-28".into(), "2026-05-30".into())),
         });
-        a.cache = ViewCache::build(&a.topics, &a.work);
+        a.cache = ViewCache::build(&a.topics, &a.work, &test_day_stats());
         a
     }
 
@@ -1669,6 +1755,7 @@ mod tests {
             work: donor.work,
             topics: donor.topics,
             status: donor.status,
+            day_stats: test_day_stats(),
         };
         a.apply(b);
         let vi = a.drill_topic.expect("drill survives the reload");
@@ -1843,7 +1930,7 @@ mod tests {
     // autostart state. (The toggle itself has side effects, so it isn't pressed.)
     #[test]
     fn status_view_shows_breakdowns_and_autostart() {
-        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
         let mut a = app();
         a.view = View::Status;
         term.draw(|f| a.draw(f)).unwrap();
@@ -1853,6 +1940,11 @@ mod tests {
         assert!(text.contains("SESS") && text.contains("GH") && text.contains("DOCS"), "table headers missing");
         assert!(text.contains("sie") && text.contains("alice"), "facet rows missing");
         assert!(text.contains("autostart") && text.contains("OFF"), "autostart state missing");
+        // the tokens & tools time-series panel sits above the breakdowns, one
+        // strip row per metric with the 4-week total (18.9k + 2k out).
+        assert!(text.contains("tokens & tools"), "stats panel missing: {text}");
+        assert!(text.contains("tok out") && text.contains("cache r") && text.contains("sessions"), "metric rows missing");
+        assert!(text.contains("20.9k"), "window total missing: {text}");
     }
 
     // The facet bar has a Repos row over an Accounts row, and inverts the active.

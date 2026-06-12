@@ -107,7 +107,11 @@ search is instant.
   feed, reframed to units. Drill → unit detail.
 - **Search** (job A) — query → results as units → drill to detail → messages.
 - **Status** (job E) — tracker/index health: docs by source/kind/repo, newest
-  item, last indexed, last tracked, per-source freshness.
+  item, last indexed, last tracked, per-source freshness; a tokens & tools
+  panel tracks the four token classes, tool calls, and active sessions per day
+  over the last four Mon-aligned weeks (same strips as the Topics activity
+  column, each row shaded against its own peak), above the repo/account
+  breakdowns.
 
 ### Unit detail (the drill target)
 

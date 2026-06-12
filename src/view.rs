@@ -146,6 +146,33 @@ pub fn status_md(s: &Status) -> String {
         s.last_tracked.as_deref().unwrap_or("never"),
     ));
     o.push_str(&s.by_kind.iter().take(8).map(|(k, n)| format!("{k}({n})")).collect::<Vec<_>>().join(", "));
+    // 4-week usage totals — the CLI's one-line parity with the TUI stats panel
+    // (anchored to the most recent day with data, not the wall clock).
+    let days = crate::units::day_stats();
+    if let Some(gmax) = days.keys().max().cloned() {
+        if let Ok(end) = chrono::NaiveDate::parse_from_str(&gmax, "%Y-%m-%d") {
+            let mut t = crate::units::DayStat::default();
+            for (d, v) in &days {
+                if let Ok(d) = chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d") {
+                    if (end - d).num_days() < 28 {
+                        t.tok_in += v.tok_in;
+                        t.tok_out += v.tok_out;
+                        t.cache_read += v.cache_read;
+                        t.cache_create += v.cache_create;
+                        t.tools += v.tools;
+                    }
+                }
+            }
+            o.push_str(&format!(
+                "\ntokens 4w: {} in · {} out · {} cache-read · {} cache-write · {} tool calls",
+                fmt_tokens(t.tok_in),
+                fmt_tokens(t.tok_out),
+                fmt_tokens(t.cache_read),
+                fmt_tokens(t.cache_create),
+                fmt_tokens(t.tools),
+            ));
+        }
+    }
     let block = |o: &mut String, label: &str, rows: &[Tally]| {
         o.push_str(&format!("\n\n{label} (sessions · github · docs):\n"));
         for f in rows.iter().take(12) {
@@ -227,7 +254,7 @@ pub fn meter(score: f32) -> String {
     format!("[{}{}]", "●".repeat(filled), "○".repeat(5 - filled))
 }
 
-/// Humanize a token count: 999, 46.1k, 1.2M. One decimal, ".0" trimmed.
+/// Humanize a token count: 999, 46.1k, 1.2M, 2.5B. One decimal, ".0" trimmed.
 pub fn fmt_tokens(n: u64) -> String {
     let scaled = |v: f64, suffix: &str| {
         let s = format!("{v:.1}");
@@ -236,7 +263,8 @@ pub fn fmt_tokens(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
         1_000..=999_999 => scaled(n as f64 / 1_000.0, "k"),
-        _ => scaled(n as f64 / 1_000_000.0, "M"),
+        1_000_000..=999_999_999 => scaled(n as f64 / 1_000_000.0, "M"),
+        _ => scaled(n as f64 / 1_000_000_000.0, "B"),
     }
 }
 
@@ -373,6 +401,7 @@ mod tests {
         assert_eq!(fmt_tokens(46_100), "46.1k");
         assert_eq!(fmt_tokens(2_000), "2k");
         assert_eq!(fmt_tokens(1_200_000), "1.2M");
+        assert_eq!(fmt_tokens(2_543_100_000), "2.5B"); // a month of cache reads
     }
 
     // No usage recorded → no line at all; a fake "0 tokens" would read as a
