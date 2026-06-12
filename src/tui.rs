@@ -155,6 +155,7 @@ struct Bundle {
     topics: Vec<TopicUnits>,
     status: crate::view::Status,
     day_stats: HashMap<String, units::DayStat>,
+    loc_days: HashMap<String, (u64, u64)>,
 }
 
 impl Bundle {
@@ -178,7 +179,7 @@ impl Bundle {
             autostart: false,
             stale: false,
         });
-        Self { docs, sessions, work, topics, status, day_stats: units::day_stats() }
+        Self { docs, sessions, work, topics, status, day_stats: units::day_stats(), loc_days: units::gh_loc_by_day() }
     }
 }
 
@@ -253,15 +254,22 @@ struct ViewCache {
     acct_counts: HashMap<String, usize>,
     /// Per topic, the day_num of each unit (parallel to `topics`).
     topic_days: Vec<Vec<i32>>,
-    /// The Status stats chart: per metric, the raw day_num → value series.
-    /// The visible window is cut at draw time to however many Mon-aligned
-    /// weeks fit the panel's width.
+    /// The Status stats panel's raw day_num → value series. `chart_rows` are
+    /// the line-chart series (tokens, sessions, prs, loc±); `stats_rows` the
+    /// height-bar count rows below. The visible window is cut at draw time to
+    /// however many Mon-aligned weeks fit the panel's width.
+    chart_rows: Vec<(&'static str, HashMap<i32, u64>)>,
     stats_rows: Vec<(&'static str, HashMap<i32, u64>)>,
     stats_gmax: i32,
 }
 
 impl ViewCache {
-    fn build(topics: &[TopicUnits], work: &[Unit], day_stats: &HashMap<String, units::DayStat>) -> Self {
+    fn build(
+        topics: &[TopicUnits],
+        work: &[Unit],
+        day_stats: &HashMap<String, units::DayStat>,
+        loc_days: &HashMap<String, (u64, u64)>,
+    ) -> Self {
         let facet = |repo: bool| {
             let mut ct: HashMap<&str, usize> = HashMap::new();
             for t in topics {
@@ -284,41 +292,54 @@ impl ViewCache {
         // rendering stays deterministic (no wall clock).
         let by_num: Vec<(i32, units::DayStat)> =
             day_stats.iter().filter_map(|(d, s)| Some((day_num(d)?, *s))).collect();
+        let loc_num: Vec<(i32, (u64, u64))> =
+            loc_days.iter().filter_map(|(d, v)| Some((day_num(d)?, *v))).collect();
         let stats_gmax = by_num
             .iter()
             .map(|(d, _)| *d)
             .chain(work.iter().filter_map(|u| day_num(&u.when)))
+            .chain(loc_num.iter().map(|(d, _)| *d))
             .max()
             .unwrap_or(0);
-        let metric: Vec<(&'static str, fn(&units::DayStat) -> u64)> = vec![
-            ("tok out", |s| s.tok_out),
-            ("tok in", |s| s.tok_in),
-            ("cache r", |s| s.cache_read),
-            ("cache w", |s| s.cache_create),
-            ("tools", |s| s.tools),
-            ("sessions", |s| s.sessions),
-        ];
-        let mut stats_rows: Vec<(&'static str, HashMap<i32, u64>)> = metric
-            .into_iter()
-            .map(|(label, get)| {
-                let mut days: HashMap<i32, u64> = HashMap::new();
-                for (d, s) in &by_num {
-                    *days.entry(*d).or_default() += get(s);
-                }
-                (label, days)
-            })
-            .collect();
-        // The GitHub artifacts ride the same chart — the work units already
-        // carry their kind and day.
-        for (label, kind) in [("prs", Kind::Pr), ("issues", Kind::Issue)] {
+        let fold_stat = |get: fn(&units::DayStat) -> u64| {
+            let mut days: HashMap<i32, u64> = HashMap::new();
+            for (d, s) in &by_num {
+                *days.entry(*d).or_default() += get(s);
+            }
+            days
+        };
+        let fold_kind = |kind: Kind| {
             let mut days: HashMap<i32, u64> = HashMap::new();
             for u in work.iter().filter(|u| u.kind == kind) {
                 if let Some(d) = day_num(&u.when) {
                     *days.entry(d).or_default() += 1;
                 }
             }
-            stats_rows.push((label, days));
-        }
+            days
+        };
+        let fold_loc = |del: bool| {
+            let mut days: HashMap<i32, u64> = HashMap::new();
+            for (d, (add, rm)) in &loc_num {
+                *days.entry(*d).or_default() += if del { *rm } else { *add };
+            }
+            days
+        };
+        // The line-chart series: spend and what it produced, one timeline.
+        let chart_rows: Vec<(&'static str, HashMap<i32, u64>)> = vec![
+            ("tokens", fold_stat(|s| s.tok_in + s.tok_out)),
+            ("sessions", fold_stat(|s| s.sessions)),
+            ("prs", fold_kind(Kind::Pr)),
+            ("loc+", fold_loc(false)),
+            ("loc-", fold_loc(true)),
+        ];
+        // The bar rows below: the counts and the cache classes the chart
+        // no longer carries.
+        let stats_rows: Vec<(&'static str, HashMap<i32, u64>)> = vec![
+            ("tools", fold_stat(|s| s.tools)),
+            ("issues", fold_kind(Kind::Issue)),
+            ("cache r", fold_stat(|s| s.cache_read)),
+            ("cache w", fold_stat(|s| s.cache_create)),
+        ];
 
         Self {
             repo_facets: facet(true),
@@ -329,6 +350,7 @@ impl ViewCache {
                 .iter()
                 .map(|t| t.units.iter().filter_map(|u| day_num(&u.when)).collect())
                 .collect(),
+            chart_rows,
             stats_rows,
             stats_gmax,
         }
@@ -403,7 +425,7 @@ impl App {
         let doc_by_id = b.docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
         let sess_by_id = b.sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
         let (qtx, rrx) = spawn_search(model_id);
-        let cache = ViewCache::build(&b.topics, &b.work, &b.day_stats);
+        let cache = ViewCache::build(&b.topics, &b.work, &b.day_stats, &b.loc_days);
         let (btx, brx) = channel::<Bundle>();
         Self {
             cache,
@@ -508,7 +530,7 @@ impl App {
             .and_then(|vi| self.drilled(vi))
             .map(|t| t.cache_key.clone());
 
-        self.cache = ViewCache::build(&b.topics, &b.work, &b.day_stats);
+        self.cache = ViewCache::build(&b.topics, &b.work, &b.day_stats, &b.loc_days);
         self.doc_by_id = b.docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
         self.sess_by_id = b.sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
         self.docs = b.docs;
@@ -1234,7 +1256,7 @@ impl App {
     /// sessions per repo and per account.
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let [head, stats, cols] =
-            Layout::vertical([Constraint::Length(6), Constraint::Length(15), Constraint::Min(0)]).areas(area);
+            Layout::vertical([Constraint::Length(6), Constraint::Length(17), Constraint::Min(0)]).areas(area);
         f.render_widget(
             Paragraph::new(self.status_head())
                 .wrap(Wrap { trim: false })
@@ -1342,11 +1364,10 @@ impl App {
         f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
     }
 
-    /// The token classes as Braille lines on a log10 y-axis — they sit orders
-    /// of magnitude apart (cache reads in the billions, fresh input in the
-    /// millions), which independent per-row scaling could only hide; the log
-    /// axis makes them comparable on one plot. Zero days plot at the floor.
-    /// The legend carries each class's window total.
+    /// The work timeline as Braille lines on a log10 y-axis — tokens in the
+    /// millions, LOC in the thousands, sessions in the tens; the log axis
+    /// makes spend and what it produced comparable on one plot. Zero days
+    /// plot at the floor. The legend carries each series' window total.
     fn draw_token_chart(&self, f: &mut Frame, area: Rect, weeks: usize) {
         let c = &self.cache;
         if c.stats_gmax == 0 || area.height < 3 {
@@ -1354,19 +1375,20 @@ impl App {
         }
         let start = week_start_for(c.stats_gmax, weeks);
         let n_days = (weeks * 7) as i32;
-        // Four maximally-separated brand hues — line identity is carried by
-        // color alone, and the muted table palette blended on a dark plot.
-        const CLASSES: [(&str, Color); 4] = [
-            ("out", theme::ACCENT),     // coral — the headline cost
-            ("in", theme::SAGE),        // green
-            ("cache-r", theme::GITHUB), // sky — the big flow
-            ("cache-w", theme::MERGED), // violet
+        // Maximally-separated brand hues — line identity is carried by color
+        // alone, and the muted table palette blended on a dark plot.
+        const CLASSES: [(&str, Color); 5] = [
+            ("tokens", theme::ACCENT),   // coral — the spend (in + out)
+            ("sessions", theme::MERGED), // violet
+            ("prs", theme::GITHUB),      // sky
+            ("loc+", theme::SAGE),       // green — code landed
+            ("loc-", theme::CLOSED),     // muted red — code removed
         ];
         // (series points, legend name) per class; data must outlive the chart.
         let mut series: Vec<(Vec<(f64, f64)>, String)> = Vec::new();
         let mut top = 0u64;
         for (i, (name, _)) in CLASSES.iter().enumerate() {
-            let map = &c.stats_rows[i].1; // rows 0-3 are the token classes
+            let map = &c.chart_rows[i].1;
             let mut pts = Vec::with_capacity(n_days as usize);
             let mut total = 0u64;
             for d in 0..n_days {
@@ -1377,7 +1399,9 @@ impl App {
             }
             series.push((pts, format!("{name} {}", crate::view::fmt_tokens(total))));
         }
-        let y_max = ((top.max(10) as f64).log10()).ceil();
+        // Bounds snapped to a multiple of 3 so the evenly-spaced labels land
+        // exactly on 1 / 1k / 1M / 1B.
+        let y_max = (((top.max(10) as f64).log10()).ceil() / 3.0).ceil() * 3.0;
         let datasets: Vec<Dataset> = series
             .iter()
             .zip(CLASSES.iter())
@@ -1390,15 +1414,16 @@ impl App {
                     .data(pts)
             })
             .collect();
-        // Y labels at the powers of ten that exist in the window.
+        // Ratatui spreads labels evenly across the axis, so every label must
+        // sit at an even fraction of the bounds to be truthful.
         let y_labels: Vec<Span> = (0..=y_max as usize)
             .step_by(3)
             .map(|p| Span::styled(crate::view::fmt_tokens(10u64.pow(p as u32)), Style::new().fg(theme::DIM)))
             .collect();
-        let x_labels: Vec<Span> = (0..weeks)
-            .step_by((weeks / 4).max(1))
-            .filter_map(|w| {
-                NaiveDate::from_num_days_from_ce_opt(start + (w as i32) * 7)
+        let x_labels: Vec<Span> = (0..4)
+            .filter_map(|i| {
+                let day = (n_days - 1) * i / 3;
+                NaiveDate::from_num_days_from_ce_opt(start + day)
                     .map(|d| Span::styled(format!("{}/{}", d.month(), d.day()), Style::new().fg(theme::DIM)))
             })
             .collect();
@@ -1431,7 +1456,7 @@ impl App {
         let start = week_start_for(c.stats_gmax, weeks);
         let n_days = weeks * 7;
         let mut lines = vec![Line::from(Span::styled(format!("{:9}{}", "", week_labels(start, weeks)), dim))];
-        for (label, map) in c.stats_rows.iter().skip(4) {
+        for (label, map) in c.stats_rows.iter() {
             let mut days = vec![0u64; n_days];
             for (d, v) in map {
                 let off = d - start;
@@ -1953,7 +1978,7 @@ mod tests {
         ];
         let topics = vec![TopicUnits { id: 0, cache_key: "t0".into(), label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()), name: Some("OCR & Document Extraction".into()), span: Some(("2026-05-29".into(), "2026-05-31".into())) }];
         App {
-            cache: ViewCache::build(&topics, &work, &test_day_stats()),
+            cache: ViewCache::build(&topics, &work, &test_day_stats(), &test_loc_days()),
             docs,
             doc_by_id,
             sess_by_id: [("S1".to_string(), 0)].into_iter().collect(),
@@ -1982,6 +2007,10 @@ mod tests {
             brx: channel::<Bundle>().1,
             reload_pending: false,
         }
+    }
+
+    fn test_loc_days() -> HashMap<String, (u64, u64)> {
+        [("2026-05-31".to_string(), (120u64, 40u64))].into_iter().collect()
     }
 
     fn test_day_stats() -> HashMap<String, units::DayStat> {
@@ -2015,7 +2044,7 @@ mod tests {
             name: Some("Infra & Terraform".into()),
             span: Some(("2026-05-28".into(), "2026-05-30".into())),
         });
-        a.cache = ViewCache::build(&a.topics, &a.work, &test_day_stats());
+        a.cache = ViewCache::build(&a.topics, &a.work, &test_day_stats(), &test_loc_days());
         a
     }
 
@@ -2063,6 +2092,7 @@ mod tests {
             topics: donor.topics,
             status: donor.status,
             day_stats: test_day_stats(),
+            loc_days: test_loc_days(),
         };
         a.apply(b);
         let vi = a.drill_topic.expect("drill survives the reload");
@@ -2251,11 +2281,10 @@ mod tests {
         // token classes (legend carries the window totals) over height-bar
         // rows for the counts, windowed to whatever the width fits.
         assert!(text.contains("tokens & tools · 12 weeks"), "panel should size to the width: {text}");
-        assert!(text.contains("out 20.9k") && text.contains("cache-r 310k"), "chart legend totals missing: {text}");
+        assert!(text.contains("tokens 25.1k") && text.contains("loc+ 120") && text.contains("loc- 40") && text.contains("prs 1"), "chart legend totals missing: {text}");
         assert!(text.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)), "braille plot missing: {text}");
-        assert!(text.contains("tools") && text.contains("sessions"), "count rows missing");
+        assert!(text.contains("tools") && text.contains("issues") && text.contains("cache r"), "bar rows missing");
         assert!(text.contains("█"), "count bars missing");
-        assert!(text.contains("prs") && text.contains("issues"), "artifact rows missing: {text}");
         // segmentation: repo rows carry token/tool spend, the fleet-wide tool
         // mix names tools with their agent, and models get their own table.
         assert!(text.contains("TOK") && text.contains("TOOLS"), "facet spend columns missing: {text}");

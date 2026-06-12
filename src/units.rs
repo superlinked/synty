@@ -669,6 +669,32 @@ impl ToolFold {
     }
 }
 
+/// Merged lines of code per day, straight from the scraped PR corpus:
+/// day(mergedAt) → (additions, deletions). Only MERGED PRs count — LOC that
+/// actually landed.
+pub fn gh_loc_by_day() -> HashMap<String, (u64, u64)> {
+    let mut out: HashMap<String, (u64, u64)> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("corpus/github") else { return out };
+    for e in entries.filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("prs-") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(e.path()) else { continue };
+        let Ok(prs) = serde_json::from_str::<Vec<Value>>(&raw) else { continue };
+        for p in &prs {
+            if p["state"].as_str() != Some("MERGED") {
+                continue;
+            }
+            let Some(day) = p["mergedAt"].as_str().and_then(|t| t.split('T').next()).filter(|d| d.len() == 10) else { continue };
+            let d = out.entry(day.to_string()).or_default();
+            d.0 += p["additions"].as_u64().unwrap_or(0);
+            d.1 += p["deletions"].as_u64().unwrap_or(0);
+        }
+    }
+    out
+}
+
 /// Profile one tool's use across every tracked session, on demand.
 pub fn tool_profile(name: &str) -> ToolProfile {
     let mut f = ToolFold { target: name.to_string(), ..Default::default() };

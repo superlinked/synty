@@ -147,18 +147,24 @@ enum Kind {
 /// updated at or after `floor` and stopping once they fall older — so an
 /// incremental scrape touches only what changed (new items AND state flips on
 /// old ones). Each node is reshaped into the JSON `ingest` expects (number,
-/// title, body, author.login, url, labels, state, createdAt).
+/// title, body, author.login, url, labels, state, createdAt — plus, for PRs,
+/// additions/deletions/mergedAt for the LOC stats).
 fn fetch(agent: &ureq::Agent, token: &str, owner: &str, repo: &str, kind: Kind, floor: &str) -> Result<Vec<Value>> {
     let conn = match kind {
         Kind::Pr => "pullRequests",
         Kind::Issue => "issues",
+    };
+    // PR-only fields — requesting them on Issue nodes is a GraphQL error.
+    let extra = match kind {
+        Kind::Pr => " additions deletions mergedAt",
+        Kind::Issue => "",
     };
     let query = format!(
         r#"query($owner:String!,$name:String!,$cursor:String){{
   repository(owner:$owner,name:$name){{
     {conn}(first:{PAGE},after:$cursor,orderBy:{{field:UPDATED_AT,direction:DESC}}){{
       pageInfo{{hasNextPage endCursor}}
-      nodes{{number title body state url createdAt updatedAt author{{login}} labels(first:20){{nodes{{name}}}}}}
+      nodes{{number title body state url createdAt updatedAt author{{login}} labels(first:20){{nodes{{name}}}}{extra}}}
     }}
   }}
 }}"#
@@ -203,6 +209,11 @@ fn reshape(n: &Value) -> Value {
         "createdAt": n["createdAt"],
         "author": {"login": n["author"]["login"].as_str().unwrap_or("")},
         "labels": labels,
+        // PR-only; null on issues. The LOC stats read these from the raw
+        // corpus directly — ingest's doc shape is unaffected.
+        "additions": n["additions"],
+        "deletions": n["deletions"],
+        "mergedAt": n["mergedAt"],
     })
 }
 
