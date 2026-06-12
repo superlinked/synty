@@ -120,6 +120,7 @@ struct App {
     view: View,
     sel: usize,
     drill_topic: Option<usize>, // Topics: viewing a topic's units (index into visible())
+    drill_unit: bool,           // Topics, drilled: the selected unit's detail pane is open
     filter: Option<Facet>,      // Topics/Work: show only items touching this repo/person
     query: String,
     results: Vec<i64>, // doc ids
@@ -357,6 +358,7 @@ impl App {
             view: View::Topics,
             sel: 0,
             drill_topic: None,
+            drill_unit: false,
             filter: None,
             query: String::new(),
             results: vec![],
@@ -459,6 +461,9 @@ impl App {
         if let Some(key) = drill_key {
             let vis = self.visible();
             self.drill_topic = vis.iter().position(|&i| self.topics[i].cache_key == key);
+        }
+        if self.drill_topic.is_none() {
+            self.drill_unit = false; // the drilled topic vanished; no unit to detail
         }
         self.sel = self.sel.min(self.list_len().saturating_sub(1));
 
@@ -637,7 +642,9 @@ impl App {
         }
         match code {
             KeyCode::Char('q') => {
-                if let Some(ti) = self.drill_topic.take() {
+                if self.drill_unit {
+                    self.drill_unit = false;
+                } else if let Some(ti) = self.drill_topic.take() {
                     self.sel = ti; // back to the topic we drilled
                 } else {
                     self.quit = true;
@@ -648,13 +655,23 @@ impl App {
             KeyCode::Char('g') => self.sel = 0,
             KeyCode::Char('G') => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.view == View::Topics && self.drill_topic.is_none() && !self.visible().is_empty() {
-                    self.drill_topic = Some(self.sel);
-                    self.sel = 0;
+                if self.view == View::Topics {
+                    if self.drill_topic.is_none() {
+                        if !self.visible().is_empty() {
+                            self.drill_topic = Some(self.sel);
+                            self.sel = 0;
+                        }
+                    } else if self.list_len() > 0 {
+                        // second level: open the selected unit's detail pane
+                        // (the same content Work shows for it).
+                        self.drill_unit = true;
+                    }
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if let Some(ti) = self.drill_topic.take() {
+                if self.drill_unit {
+                    self.drill_unit = false;
+                } else if let Some(ti) = self.drill_topic.take() {
                     self.sel = ti;
                 }
             }
@@ -697,6 +714,7 @@ impl App {
         self.view = v;
         self.sel = 0;
         self.drill_topic = None;
+        self.drill_unit = false;
     }
     fn move_sel(&mut self, d: i32) {
         let n = self.list_len();
@@ -705,10 +723,13 @@ impl App {
         }
     }
 
-    /// Esc: peel back one layer of state — exit a drill, then clear the filter,
-    /// then clear a search query — and quit only when nothing is left to reset.
+    /// Esc: peel back one layer of state — close a unit detail, exit a drill,
+    /// then clear the filter, then clear a search query — and quit only when
+    /// nothing is left to reset.
     fn reset(&mut self) {
-        if let Some(ti) = self.drill_topic.take() {
+        if self.drill_unit {
+            self.drill_unit = false;
+        } else if let Some(ti) = self.drill_topic.take() {
             self.sel = ti;
         } else if self.filter.take().is_some() {
             self.sel = 0;
@@ -811,7 +832,13 @@ impl App {
     fn breadcrumb(&self) -> String {
         let filt = self.filter.as_ref().map(|f| format!(" · {}", f.tag())).unwrap_or_default();
         match (self.view, self.drill_topic) {
-            (View::Topics, Some(t)) => format!("synty › Topics › {}", self.drilled(t).map(|x| x.title()).unwrap_or("")),
+            (View::Topics, Some(t)) => {
+                let base = format!("synty › Topics › {}", self.drilled(t).map(|x| x.title()).unwrap_or(""));
+                match self.drilled(t).filter(|_| self.drill_unit).and_then(|x| x.units.get(self.sel)) {
+                    Some(u) => format!("{base} › {}", crate::excerpt(&unit_lines(u).0, 40)),
+                    None => base,
+                }
+            }
             (View::Topics, None) => format!("synty › Topics ({}){filt}", self.visible().len()),
             (View::Work, _) => format!("synty › Work ({})", self.work.len()),
             (View::Search, _) => format!("synty › Search ({})", self.results.len()),
@@ -881,13 +908,15 @@ impl App {
         }
     }
 
-    /// The drill-down: full-screen on a narrow terminal, else an overlay over the
-    /// right two-thirds of the list.
+    /// The drill-down: full-screen on a narrow terminal, else an overlay over
+    /// the right three-quarters of the list. A second Enter splits the unit
+    /// list with the selected unit's detail — the same content Work's right
+    /// pane shows — and the detail follows the selection.
     fn draw_topic_overlay(&self, f: &mut Frame, full: Rect, t: &TopicUnits) {
         let area = if full.width < 100 {
             full
         } else {
-            let [_, r] = Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)]).areas(full);
+            let [_, r] = Layout::horizontal([Constraint::Percentage(24), Constraint::Percentage(76)]).areas(full);
             r
         };
         f.render_widget(Clear, area);
@@ -897,6 +926,27 @@ impl App {
 
         let [facets, units] = Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).areas(inner);
         f.render_widget(Paragraph::new(self.topic_facets(t)).wrap(Wrap { trim: false }), facets);
+
+        let list = if self.drill_unit {
+            // Master-detail inside the overlay; side-by-side when there's room.
+            let (l, d) = if units.width >= 80 {
+                let [l, d] = Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).areas(units);
+                (l, d)
+            } else {
+                let [l, d] = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(units);
+                (l, d)
+            };
+            let detail = t.units.get(self.sel.min(t.units.len().saturating_sub(1))).map(|u| self.unit_detail(u)).unwrap_or_default();
+            f.render_widget(
+                Paragraph::new(detail)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().border_style(Style::new().fg(theme::BORDER))),
+                d,
+            );
+            l
+        } else {
+            units
+        };
 
         let dim = Style::new().fg(theme::DIM);
         let rows: Vec<Row> = t
@@ -920,7 +970,7 @@ impl App {
         let table = Table::new(rows, [Constraint::Length(11), Constraint::Length(8), Constraint::Min(20), Constraint::Length(8)])
             .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD))
             .highlight_symbol("▌");
-        f.render_stateful_widget(table, units, &mut ts);
+        f.render_stateful_widget(table, list, &mut ts);
     }
 
     /// Facets for a topic overlay: the reduced summary, then counts, repos,
@@ -1181,7 +1231,8 @@ impl App {
                 Engine::Err(e) => return format!("  {e}"),
                 Engine::Ready => "type · Enter search · ↑↓ results · Esc clear",
             },
-            _ if self.drill_topic.is_some() => "↑↓ units · Esc/h back · q quit",
+            _ if self.drill_unit => "↑↓ units · Esc/h close · q quit",
+            _ if self.drill_topic.is_some() => "↑↓ units · Enter detail · Esc/h back · q quit",
             View::Topics => "↑↓ move · Enter drill · Esc reset · Tab cycle · q quit",
             View::Status => "a autostart · Tab cycle · q quit",
             View::Work => "↑↓ move · Esc reset · Tab cycle · q quit",
@@ -1516,6 +1567,7 @@ mod tests {
             view: View::Topics,
             sel: 0,
             drill_topic: None,
+            drill_unit: false,
             filter: None,
             query: String::new(),
             results: vec![],
@@ -1647,6 +1699,35 @@ mod tests {
         a.on_key(KeyCode::Char('h'));
         assert!(a.drill_topic.is_none());
         assert_eq!(a.sel, 0);
+    }
+
+    // Inside a drilled topic, Enter opens the selected unit's detail — the
+    // same content Work's right pane shows — the detail follows ↑↓, and
+    // Esc peels one layer at a time: detail → overlay → list.
+    #[test]
+    fn unit_drill_shows_detail_inside_topic_overlay() {
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let mut a = app();
+        a.on_key(KeyCode::Enter); // drill the topic
+        a.on_key(KeyCode::Enter); // open unit 0 (the session) detail
+        assert!(a.drill_unit);
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("3 prompts · 5 assistant"), "session detail missing: {text}");
+        assert!(text.contains("ask:"), "session detail missing the ask");
+        // the detail follows the selection: move to the PR unit
+        a.on_key(KeyCode::Down);
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(!text.contains("3 prompts"), "detail should follow the selection off the session");
+        // Esc closes only the detail, then only the overlay
+        a.on_key(KeyCode::Esc);
+        assert!(!a.drill_unit && a.drill_topic.is_some());
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(!text.contains("ask:"), "detail pane should be gone");
+        a.on_key(KeyCode::Esc);
+        assert!(a.drill_topic.is_none());
     }
 
     #[test]

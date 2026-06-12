@@ -73,8 +73,11 @@ Truecolor; degrades to the nearest 16-color on terminals without it.
 Master/detail split ~40/60. The detail pane scrolls. A top tab strip names the
 four views (Topics, Work, Search, Status) and highlights the active one in
 accent. The Topics list carries a per-day activity strip (last four weeks, week
-dividers) and drilling a topic opens an overlay with its description, repos,
-people, and member units.
+dividers) and drilling a topic opens an overlay (the right three-quarters of
+the screen; full-screen when narrow) with its description, repos, people, and
+member units. Enter on a member unit splits the overlay with that unit's
+detail — the same content Work's right pane shows — following the selection;
+Esc/h peel one layer at a time (detail → overlay → list).
 
 ## Keymap
 
