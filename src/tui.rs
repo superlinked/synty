@@ -13,7 +13,8 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap};
+use ratatui::symbols::Marker;
+use ratatui::widgets::{Axis, Block, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -1233,7 +1234,7 @@ impl App {
     /// sessions per repo and per account.
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let [head, stats, cols] =
-            Layout::vertical([Constraint::Length(6), Constraint::Length(11), Constraint::Min(0)]).areas(area);
+            Layout::vertical([Constraint::Length(6), Constraint::Length(15), Constraint::Min(0)]).areas(area);
         f.render_widget(
             Paragraph::new(self.status_head())
                 .wrap(Wrap { trim: false })
@@ -1241,15 +1242,14 @@ impl App {
             head,
         );
         let weeks = Self::stats_weeks(stats.width.saturating_sub(2));
-        f.render_widget(
-            Paragraph::new(self.stats_panel(weeks))
-                .block(
-                    Block::bordered()
-                        .border_style(Style::new().fg(theme::BORDER))
-                        .title(format!(" tokens & tools · {weeks} weeks ")),
-                ),
-            stats,
-        );
+        let block = Block::bordered()
+            .border_style(Style::new().fg(theme::BORDER))
+            .title(format!(" tokens & tools · {weeks} weeks "));
+        let inner = block.inner(stats);
+        f.render_widget(block, stats);
+        let [plot, counts] = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).areas(inner);
+        self.draw_token_chart(f, plot, weeks);
+        f.render_widget(Paragraph::new(self.stats_panel(weeks)), counts);
         let [upper, lower] = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(cols);
         let [rcol, ucol] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(upper);
         f.render_widget(facet_table("Repos", &self.status.by_repo), rcol);
@@ -1342,6 +1342,73 @@ impl App {
         f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
     }
 
+    /// The token classes as Braille lines on a log10 y-axis — they sit orders
+    /// of magnitude apart (cache reads in the billions, fresh input in the
+    /// millions), which independent per-row scaling could only hide; the log
+    /// axis makes them comparable on one plot. Zero days plot at the floor.
+    /// The legend carries each class's window total.
+    fn draw_token_chart(&self, f: &mut Frame, area: Rect, weeks: usize) {
+        let c = &self.cache;
+        if c.stats_gmax == 0 || area.height < 3 {
+            return;
+        }
+        let start = week_start_for(c.stats_gmax, weeks);
+        let n_days = (weeks * 7) as i32;
+        const CLASSES: [(&str, Color); 4] = [
+            ("out", theme::SESSION),
+            ("in", theme::FG),
+            ("cache-r", theme::GITHUB),
+            ("cache-w", theme::DIM),
+        ];
+        // (series points, legend name) per class; data must outlive the chart.
+        let mut series: Vec<(Vec<(f64, f64)>, String)> = Vec::new();
+        let mut top = 0u64;
+        for (i, (name, _)) in CLASSES.iter().enumerate() {
+            let map = &c.stats_rows[i].1; // rows 0-3 are the token classes
+            let mut pts = Vec::with_capacity(n_days as usize);
+            let mut total = 0u64;
+            for d in 0..n_days {
+                let v = map.get(&(start + d)).copied().unwrap_or(0);
+                total += v;
+                top = top.max(v);
+                pts.push((d as f64, if v == 0 { 0.0 } else { (v as f64).log10() }));
+            }
+            series.push((pts, format!("{name} {}", crate::view::fmt_tokens(total))));
+        }
+        let y_max = ((top.max(10) as f64).log10()).ceil();
+        let datasets: Vec<Dataset> = series
+            .iter()
+            .zip(CLASSES.iter())
+            .map(|((pts, name), (_, color))| {
+                Dataset::default()
+                    .name(name.clone())
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::new().fg(*color))
+                    .data(pts)
+            })
+            .collect();
+        // Y labels at the powers of ten that exist in the window.
+        let y_labels: Vec<Span> = (0..=y_max as usize)
+            .step_by(3)
+            .map(|p| Span::styled(crate::view::fmt_tokens(10u64.pow(p as u32)), Style::new().fg(theme::DIM)))
+            .collect();
+        let x_labels: Vec<Span> = (0..weeks)
+            .step_by((weeks / 4).max(1))
+            .filter_map(|w| {
+                NaiveDate::from_num_days_from_ce_opt(start + (w as i32) * 7)
+                    .map(|d| Span::styled(format!("{}/{}", d.month(), d.day()), Style::new().fg(theme::DIM)))
+            })
+            .collect();
+        let chart = Chart::new(datasets)
+            // the legend carries the totals — never hide it (the default
+            // hides legends taller than a quarter of the plot).
+            .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 1)))
+            .x_axis(Axis::default().bounds([0.0, (n_days - 1) as f64]).labels(x_labels))
+            .y_axis(Axis::default().bounds([0.0, y_max]).labels(y_labels));
+        f.render_widget(chart, area);
+    }
+
     /// How many whole Mon-aligned weeks of chart fit a panel of `width`:
     /// 9 chars of label + the bars (8 per week incl. divider, minus the last
     /// divider) + ~10 for the window total.
@@ -1350,10 +1417,9 @@ impl App {
         ((avail + 1) / 8).clamp(4, 26)
     }
 
-    /// The stats chart: one bar row per metric — day bars scaled by height
-    /// (▁..█) against the row's own peak, since the metrics sit orders of
-    /// magnitude apart — over as many Mon-aligned weeks as the width fits,
-    /// with the window total on the right.
+    /// The count rows under the token chart: day bars scaled by height (▁..█)
+    /// against each row's own peak, over the same window — tools, sessions,
+    /// and the GitHub artifacts, with window totals on the right.
     fn stats_panel(&self, weeks: usize) -> Text<'static> {
         let c = &self.cache;
         if c.stats_gmax == 0 {
@@ -1363,7 +1429,7 @@ impl App {
         let start = week_start_for(c.stats_gmax, weeks);
         let n_days = weeks * 7;
         let mut lines = vec![Line::from(Span::styled(format!("{:9}{}", "", week_labels(start, weeks)), dim))];
-        for (label, map) in &c.stats_rows {
+        for (label, map) in c.stats_rows.iter().skip(4) {
             let mut days = vec![0u64; n_days];
             for (d, v) in map {
                 let off = d - start;
@@ -2179,12 +2245,14 @@ mod tests {
         assert!(text.contains("SESS") && text.contains("GH") && text.contains("DOCS"), "table headers missing");
         assert!(text.contains("sie") && text.contains("alice"), "facet rows missing");
         assert!(text.contains("autostart") && text.contains("OFF"), "autostart state missing");
-        // the tokens & tools time-series panel sits above the breakdowns, one
-        // strip row per metric with the 4-week total (18.9k + 2k out).
+        // the tokens & tools panel: a log-scale braille line chart for the
+        // token classes (legend carries the window totals) over height-bar
+        // rows for the counts, windowed to whatever the width fits.
         assert!(text.contains("tokens & tools · 12 weeks"), "panel should size to the width: {text}");
-        assert!(text.contains("tok out") && text.contains("cache r") && text.contains("sessions"), "metric rows missing");
-        assert!(text.contains("20.9k"), "window total missing: {text}");
-        assert!(text.contains("█") && text.contains("▁"), "height bars missing (18.9k peak vs 2k day): {text}");
+        assert!(text.contains("out 20.9k") && text.contains("cache-r 310k"), "chart legend totals missing: {text}");
+        assert!(text.chars().any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch)), "braille plot missing: {text}");
+        assert!(text.contains("tools") && text.contains("sessions"), "count rows missing");
+        assert!(text.contains("█"), "count bars missing");
         assert!(text.contains("prs") && text.contains("issues"), "artifact rows missing: {text}");
         // segmentation: repo rows carry token/tool spend, the fleet-wide tool
         // mix names tools with their agent, and models get their own table.
