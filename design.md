@@ -121,8 +121,7 @@ runs on CI or a server without a developer machine.
   totals exclude children until a rollup over the existing `subagent_parent`
   edges; per-model tables, tool durations, and an optional pricing map are
   deferred with it. `[metrics stats]` reports `usage_coverage_pct` — the
-  share of sessions whose source recorded usage, which rises as the native
-  tracker supersedes the v1 agent. *Built (P1).*
+  share of sessions whose source recorded usage. *Built (P1).*
 
 ## Surfaces
 

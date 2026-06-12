@@ -15,10 +15,9 @@ use ndarray::Array2;
 
 pub struct EmbStore {
     bucket: Box<dyn Bucket>,
-    /// Model namespace: vectors from different encoders are incompatible, so a
-    /// non-default model gets its own prefix — a mixed-model fleet can never
-    /// silently share wrong vectors. The default model is pinned to the
-    /// original unprefixed layout, so upgrading to this scheme migrates nothing.
+    /// Model namespace: vectors from different encoders are incompatible, so
+    /// every model gets its own prefix — a mixed-model fleet can never
+    /// silently share wrong vectors.
     ns: String,
 }
 
@@ -32,8 +31,8 @@ impl EmbStore {
 
     pub fn get(&self, hash: u64) -> Result<Option<Array2<f32>>> {
         match self.bucket.get(&self.key(hash))? {
-            // An unreadable blob (e.g. an older f32 entry) is treated as a miss,
-            // so a format change just re-encodes rather than failing the build.
+            // An unreadable blob is treated as a miss, so corruption just
+            // re-encodes rather than failing the build.
             Some(bytes) => Ok(decode(&bytes).ok()),
             None => Ok(None),
         }
@@ -56,11 +55,7 @@ impl EmbStore {
 }
 
 fn model_ns(model: &str) -> String {
-    if model == crate::DEFAULT_MODEL {
-        String::new()
-    } else {
-        format!("m{:08x}/", crate::index::fnv1a(model.as_bytes()) as u32)
-    }
+    format!("m{:08x}/", crate::index::fnv1a(model.as_bytes()) as u32)
 }
 
 /// Content-addressed summary store over a `Bucket`: one write-once object per
@@ -207,15 +202,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Sharded, content-addressed keys: the default model keeps the original
-    // layout (zero migration); others are namespaced.
+    // Sharded, content-addressed, model-namespaced keys: every encoder gets
+    // its own prefix, so vectors from different models can never mix.
     #[test]
     fn key_is_sharded_and_model_namespaced() {
         let def = EmbStore { bucket: bucket::open("/tmp").unwrap(), ns: model_ns(crate::DEFAULT_MODEL) };
-        assert_eq!(def.key(0xABCD), "embeddings/cd/000000000000abcd.emb");
+        assert!(def.key(0xABCD).starts_with("embeddings/m"));
+        assert!(def.key(0xABCD).ends_with("/cd/000000000000abcd.emb"));
         let other = EmbStore { bucket: bucket::open("/tmp").unwrap(), ns: model_ns("some/other-encoder") };
-        assert!(other.key(0xABCD).starts_with("embeddings/m"));
-        assert!(other.key(0xABCD).ends_with("/cd/000000000000abcd.emb"));
+        assert_ne!(def.key(0xABCD), other.key(0xABCD), "models never share a namespace");
     }
 
     // The collaboration contract: the first viewer's summary serves the fleet —

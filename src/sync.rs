@@ -165,9 +165,6 @@ pub fn pull_github(bucket_uri: &str, dir: &str) -> Result<usize> {
 /// Returns the number of objects uploaded (0 = bucket already current).
 pub fn publish(bucket_uri: &str) -> Result<usize> {
     let Some(cur) = readmodel::current() else { return Ok(0) };
-    if cur.build == "legacy" {
-        return Ok(0); // pre-versioning local layout; the next `index` migrates
-    }
     let b = bucket::open(bucket_uri)?;
     if b.get(POINTER_KEY)?.and_then(|raw| serde_json::from_slice::<readmodel::Current>(&raw).ok())
         == Some(cur.clone())

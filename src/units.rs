@@ -66,17 +66,10 @@ pub type SummaryCache = HashMap<String, CachedSummary>;
 /// The cache lives under .synty/, NOT index/ — a full index rebuild wipes
 /// index/, and hours of local-LLM summarization must survive that.
 const SUMMARIES_PATH: &str = ".synty/summaries.json";
-const SUMMARIES_PATH_LEGACY: &str = "index/summaries.json";
 
 /// Read the on-disk summary cache (empty if the summarizer hasn't run).
-/// Falls back to the pre-relocation path so existing caches migrate on the
-/// next `save_summary_cache`.
 pub fn load_summary_cache() -> SummaryCache {
-    std::fs::read_to_string(SUMMARIES_PATH)
-        .or_else(|_| std::fs::read_to_string(SUMMARIES_PATH_LEGACY))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    std::fs::read_to_string(SUMMARIES_PATH).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 /// Persist the summary cache next to the index.
@@ -524,15 +517,14 @@ fn struggle_scores(raw: &[[f64; 4]]) -> Vec<f32> {
 // ── topic membership (unit-level) ─────────────────────────────────────────
 
 /// One unit's clustering row, parsed from unit_clusters.json (written by
-/// `cluster`). The stable key falls back to the index string for pre-I1 files;
-/// the rank (0 = medoid) falls back to i64::MAX for files written before it
-/// existed, so ordering by rank degrades to the callers' existing order.
+/// `cluster`). Rank 0 = the medoid; `dup` names the representative when this
+/// unit is a collapsed near-duplicate.
 struct UnitTopic {
     cluster: i64,
     stable: String,
     label: String,
     rank: i64,
-    dup: Option<String>, // the representative's key, when this unit is a collapsed near-duplicate
+    dup: Option<String>,
 }
 
 /// unit key → its clustering row. Empty until clustering has run.
@@ -541,14 +533,11 @@ fn unit_topics() -> HashMap<String, UnitTopic> {
     let arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
     arr.iter()
         .filter_map(|it| {
-            let key = it["key"].as_str()?.to_string();
-            let cluster = it["cluster"].as_i64()?;
-            let stable = it["topic"].as_str().map(String::from).unwrap_or_else(|| cluster.to_string());
-            Some((key, UnitTopic {
-                cluster,
-                stable,
+            Some((it["key"].as_str()?.to_string(), UnitTopic {
+                cluster: it["cluster"].as_i64()?,
+                stable: it["topic"].as_str()?.to_string(),
                 label: it["label"].as_str().unwrap_or("").to_string(),
-                rank: it["rank"].as_i64().unwrap_or(i64::MAX),
+                rank: it["rank"].as_i64()?,
                 dup: it["dup"].as_str().map(String::from),
             }))
         })

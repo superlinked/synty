@@ -241,16 +241,10 @@ pub fn run(resolution: f64, model_id: &str, bucket: &str) -> Result<()> {
     }
     // Clusters are a derived artifact OF a build: write the next rev as a new
     // file in the build dir (additive — never rewrites what a reader holds)
-    // and repoint. Legacy layouts keep the flat path until the next `index`.
-    let dest = if cur.build == "legacy" {
-        "unit_clusters.json".to_string()
-    } else {
-        cur.dir().join(format!("unit_clusters.{}.json", cur.rev + 1)).to_string_lossy().into_owned()
-    };
+    // and repoint.
+    let dest = cur.dir().join(format!("unit_clusters.{}.json", cur.rev + 1)).to_string_lossy().into_owned();
     crate::write_atomic(&dest, serde_json::to_string(&assign)?.as_bytes())?;
-    if cur.build != "legacy" {
-        crate::readmodel::repoint(&cur.build, cur.rev + 1)?;
-    }
+    crate::readmodel::repoint(&cur.build, cur.rev + 1)?;
     eprintln!("topics: wrote {dest}");
     let qual = report_quality(&results, &of, &labels, &units);
     diag(&units, &results, &of, &labels);

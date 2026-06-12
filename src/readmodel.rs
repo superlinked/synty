@@ -49,43 +49,20 @@ impl Current {
         build_dir(&self.build)
     }
     pub fn docs(&self) -> PathBuf {
-        if self.build == LEGACY {
-            PathBuf::from(crate::DOCS_PATH)
-        } else {
-            self.dir().join("docs.jsonl")
-        }
+        self.dir().join("docs.jsonl")
     }
     pub fn clusters(&self) -> PathBuf {
-        if self.build == LEGACY {
-            PathBuf::from("unit_clusters.json")
-        } else {
-            self.dir().join(format!("unit_clusters.{}.json", self.rev))
-        }
+        self.dir().join(format!("unit_clusters.{}.json", self.rev))
     }
 }
 
-/// Sentinel for a pre-versioning install: a flat `index/` with no pointer.
-/// Readers keep working off it until the first versioned build repoints.
-const LEGACY: &str = "legacy";
-
 pub fn build_dir(build: &str) -> PathBuf {
-    if build == LEGACY {
-        PathBuf::from(ROOT)
-    } else {
-        Path::new(ROOT).join("builds").join(build)
-    }
+    Path::new(ROOT).join("builds").join(build)
 }
 
 /// Resolve the current build, or None when nothing is built yet.
 pub fn current() -> Option<Current> {
-    if let Some(cur) = std::fs::read_to_string(POINTER).ok().and_then(|s| serde_json::from_str(&s).ok()) {
-        return Some(cur);
-    }
-    // Legacy flat layout (pre-pointer installs).
-    Path::new(ROOT)
-        .join("doc_hashes.json")
-        .exists()
-        .then(|| Current { build: LEGACY.into(), rev: 0, format: 1, writer: String::new() })
+    std::fs::read_to_string(POINTER).ok().and_then(|s| serde_json::from_str(&s).ok())
 }
 
 /// Atomically repoint readers at `build`/`rev`. The build directory must be
@@ -101,9 +78,9 @@ pub fn repoint(build: &str, rev: u64) -> Result<()> {
     crate::write_atomic(POINTER, serde_json::to_string(&cur)?.as_bytes())
 }
 
-/// Reader conveniences: resolve through the pointer, with the legacy flat
-/// paths as the no-pointer fallback (so a fresh checkout still reads the
-/// working corpus before any build exists).
+/// Reader conveniences: resolve through the pointer, with the working-corpus
+/// paths as the no-pointer fallback (a fresh checkout reads what `ingest`
+/// wrote before any build exists).
 pub fn docs_path() -> PathBuf {
     current().map(|c| c.docs()).unwrap_or_else(|| PathBuf::from(crate::DOCS_PATH))
 }
@@ -116,14 +93,10 @@ pub fn index_dir() -> PathBuf {
     current().map(|c| c.dir()).unwrap_or_else(|| PathBuf::from(crate::INDEX_PATH))
 }
 
-/// The mtime of the pointer (or the legacy manifest) — "when was the
-/// read-model last refreshed", for staleness checks.
+/// The mtime of the pointer — "when was the read-model last refreshed", for
+/// staleness checks.
 pub fn last_updated() -> Option<std::time::SystemTime> {
-    std::fs::metadata(POINTER)
-        .or_else(|_| std::fs::metadata(Path::new(ROOT).join("doc_hashes.json")))
-        .ok()?
-        .modified()
-        .ok()
+    std::fs::metadata(POINTER).ok()?.modified().ok()
 }
 
 /// Clone a build directory for an incremental append: CoW where the filesystem
@@ -198,15 +171,6 @@ mod tests {
         assert_eq!(c.dir(), Path::new("index/builds/abc123"));
         assert!(c.docs().ends_with("index/builds/abc123/docs.jsonl"));
         assert!(c.clusters().ends_with("index/builds/abc123/unit_clusters.2.json"));
-    }
-
-    // Legacy installs (flat index/, no pointer) keep resolving to the old paths.
-    #[test]
-    fn legacy_fallback_paths() {
-        let c = Current { build: LEGACY.into(), rev: 0, format: 1, writer: String::new() };
-        assert_eq!(c.dir(), Path::new("index"));
-        assert_eq!(c.docs(), Path::new(crate::DOCS_PATH));
-        assert_eq!(c.clusters(), Path::new("unit_clusters.json"));
     }
 
     // Pointers from before the format field read as format 1; identity ignores
