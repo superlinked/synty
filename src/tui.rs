@@ -194,7 +194,14 @@ impl Freshen {
     fn spawn(bucket: &str) -> anyhow::Result<Self> {
         std::fs::create_dir_all(".synty")?;
         let log_w = std::fs::File::create(BUILD_LOG)?;
-        let child = std::process::Command::new(std::env::current_exe()?)
+        // Low priority: a full re-index saturates every core by design
+        // (k-means + quantization), and the freshen is a background courtesy —
+        // it must never make the machine the user is typing on feel fried.
+        let exe = std::env::current_exe()?;
+        let child = std::process::Command::new("/usr/bin/nice")
+            .arg("-n")
+            .arg("15")
+            .arg(exe)
             .args(["build", "--no-track", "--bucket", bucket])
             .env("SYNTY_PROGRESS", "1")
             .stdin(std::process::Stdio::null())

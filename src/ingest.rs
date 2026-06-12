@@ -290,14 +290,19 @@ fn input_manifest<'a>(files: impl Iterator<Item = &'a PathBuf>) -> String {
     out
 }
 
-/// Keep the `cap` most recent docs (ISO8601 ts sorts lexicographically),
-/// ordered oldest-first with sequential ids. The order is then made stable
-/// against the previous output by `stable_order` — recency only decides what
-/// is KEPT. Returns (kept, dropped_count).
+/// Keep the most recent docs (ISO8601 ts sorts lexicographically), ordered
+/// oldest-first with sequential ids. The order is then made stable against the
+/// previous output by `stable_order` — recency only decides what is KEPT.
+/// Crossing the cap cuts 10% deeper than it has to: a head-drop breaks the
+/// index's prefix and forces a FULL re-quantization, so dropping to exactly
+/// `cap` would pay that full rebuild on every single build once the corpus
+/// rides the cap — the hysteresis amortizes it to one rebuild per ~cap/10
+/// docs of new work. Returns (kept, dropped_count).
 pub fn cap_by_recency(mut docs: Vec<Doc>, cap: usize) -> (Vec<Doc>, usize) {
     docs.sort_by(|a, b| b.meta.ts.cmp(&a.meta.ts));
-    let dropped = docs.len().saturating_sub(cap);
-    docs.truncate(cap);
+    let keep = if docs.len() > cap { cap - cap / 10 } else { docs.len() };
+    let dropped = docs.len() - keep;
+    docs.truncate(keep);
     docs.reverse();
     for (i, d) in docs.iter_mut().enumerate() {
         d.id = i as i64;
@@ -327,12 +332,25 @@ fn stable_order(docs: Vec<Doc>, prev_path: &str) -> Vec<Doc> {
         by_hash.entry(h).or_default().push_back(i);
     }
     let mut out: Vec<Doc> = Vec::with_capacity(slots.len());
+    let (mut missed, mut sample) = (0usize, String::new());
     for p in &prev {
-        if let Some(q) = by_hash.get_mut(&crate::index::fnv1a(p.text.as_bytes())) {
-            if let Some(i) = q.pop_front() {
-                out.push(slots[i].take().expect("each slot consumed once"));
+        match by_hash.get_mut(&crate::index::fnv1a(p.text.as_bytes())).and_then(|q| q.pop_front()) {
+            Some(i) => out.push(slots[i].take().expect("each slot consumed once")),
+            None => {
+                // A previously-indexed doc left the corpus — the gap breaks
+                // the index's prefix and the next `index` pays a FULL
+                // re-quantization. Say which docs did it, so a recurring
+                // shrink (edited bodies, vanished sources) is diagnosable
+                // instead of a mystery load spike.
+                missed += 1;
+                if sample.is_empty() {
+                    sample = crate::excerpt(&p.text, 60);
+                }
             }
         }
+    }
+    if missed > 0 {
+        eprintln!("ingest: {missed} previously-indexed doc(s) left the corpus → next index is a full rebuild (e.g. {sample:?})");
     }
     for s in &mut slots {
         if let Some(d) = s.take() {
@@ -629,5 +647,10 @@ mod tests {
         assert_eq!(kept[1].meta.ts, "2026-03-01");
         assert_eq!(kept[0].id, 0);
         assert_eq!(kept[1].id, 1);
+        // At scale, crossing the cap cuts 10% deeper (hysteresis): a head-drop
+        // costs a full re-quantization, so it must not repeat every build.
+        let many: Vec<Doc> = (0..120).map(|i| mk(&format!("2026-01-{:02}T{:02}:00:00Z", 1 + i / 24, i % 24))).collect();
+        let (kept, dropped) = cap_by_recency(many, 100);
+        assert_eq!((kept.len(), dropped), (90, 30));
     }
 }
