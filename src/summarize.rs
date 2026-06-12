@@ -30,6 +30,15 @@ pub fn dump_inputs() -> Result<()> {
 fn session_summaries(n: usize) -> Result<()> {
     let mut all = crate::units::sessions()?;
     all.sort_by(|a, b| b.ended.cmp(&a.ended));
+    // Capture coverage for the token accounting: the share of sessions whose
+    // source actually recorded usage (cowork and pre-capture envelopes
+    // don't). Emitted here, not in the LLM pass — this path always runs.
+    let with = all.iter().filter(|s| s.has_usage()).count();
+    crate::metrics::Run::new("stats")
+        .set("sessions", all.len())
+        .set("with_usage", with)
+        .set("usage_coverage_pct", 100.0 * with as f64 / all.len().max(1) as f64)
+        .emit();
     println!("# session summaries (most recent {n})\n");
     for s in all.into_iter().take(n) {
         println!(
@@ -46,6 +55,9 @@ fn session_summaries(n: usize) -> Result<()> {
             s.files.len(),
             crate::view::meter(s.struggle)
         );
+        for line in [crate::view::usage_line(&s), crate::view::tools_line(&s)].into_iter().flatten() {
+            println!("{line}");
+        }
         println!("ask: {}", s.ask);
         if let Some(sum) = &s.summary {
             println!("summary: {sum}");

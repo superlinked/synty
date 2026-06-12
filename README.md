@@ -161,6 +161,10 @@ delay, redaction) is the planned answer where it isn't.
 - **Source of truth** — sessions and GitHub items become append-only event
   envelopes; the index and its metadata are derived projections, rebuildable
   from the events at any time (and shareable through a bucket).
+- **Session stats** — per-session token totals (in · out · cache-read ·
+  cache-write, from the agent's own usage records, never estimated) and the
+  tool-call mix with error counts; sessions whose source recorded no usage
+  show no number rather than a fake zero.
 
 Architecture and rationale live in `design.md`; the milestone plan in
 `roadmap.md`; validation on real data in `eval_report.md`.

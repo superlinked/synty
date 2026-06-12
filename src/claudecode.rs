@@ -162,6 +162,36 @@ impl FileParser for ParserV21 {
                 let model = r.message.get("model").and_then(Value::as_str).unwrap_or("");
                 let content = r.message.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
                 out.extend(crate::blocks::assistant_content(&content, model, "claudecode", ts_ms, &ts, &r.session_id, ec));
+                // The API's own token accounting, as its own envelope — NOT on
+                // the assistant_message payload, which is only emitted for text
+                // chunks and would silently drop usage for tool-use-only turns
+                // (the dominant, token-heaviest shape). Streamed turns repeat
+                // the identical usage on every line of one message id; the
+                // aggregator dedups by msg_id. Mapping: in = input_tokens
+                // (uncached), out = output_tokens, cache_read/cache_create =
+                // the prompt-cache classes — kept separate, they price ~10x
+                // apart. Emitted after the sidechain rewrite, so subagent
+                // usage lands on the child session.
+                if let Some(u) = r.message.get("usage").filter(|u| u.is_object()) {
+                    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    out.push(ec.event(
+                        ts_ms,
+                        &ts,
+                        kind::AGENT_META,
+                        &r.session_id,
+                        json!({
+                            "subtype": "usage",
+                            "msg_id": r.message.get("id").and_then(Value::as_str).unwrap_or(""),
+                            "model": model,
+                            "usage": {
+                                "in": n("input_tokens"),
+                                "out": n("output_tokens"),
+                                "cache_read": n("cache_read_input_tokens"),
+                                "cache_create": n("cache_creation_input_tokens"),
+                            },
+                        }),
+                    ));
+                }
             }
             "attachment" => out.push(ec.event(
                 ts_ms,
@@ -234,6 +264,29 @@ mod tests {
         let mut started = HashSet::new();
         let mut ec = EmitCtx::new("edge-x-claudecode".into(), &src, &mut seq, &mut started);
         drive(&mut *parser, lines.as_bytes(), "f.jsonl", 0, 1_700_000_000_000, &mut ec).0
+    }
+
+    // Every assistant line carrying the API's usage object yields one usage
+    // meta — INCLUDING tool-use-only lines, which emit no assistant_message
+    // (usage embedded there would be silently lost). Streamed lines of one
+    // turn repeat the same msg_id; the aggregator dedups on it. A line
+    // without usage yields none.
+    #[test]
+    fn assistant_usage_meta_per_line_with_msg_id() {
+        let text = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-05-31T20:01:00Z","message":{"role":"assistant","id":"m1","model":"claude-fable-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":7},"content":[{"type":"text","text":"editing auth.ts now"}]}}"#;
+        let tool_only = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-05-31T20:01:01Z","message":{"role":"assistant","id":"m1","model":"claude-fable-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":7},"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/c/sie/a.ts"}}]}}"#;
+        let no_usage = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-05-31T20:01:02Z","message":{"role":"assistant","model":"claude-fable-5","content":[{"type":"text","text":"done with the edit"}]}}"#;
+        let evts = run(&[text, tool_only, no_usage].join("\n"));
+        let usage: Vec<&Event> = evts
+            .iter()
+            .filter(|e| e.kind == "agent_meta" && e.payload["subtype"] == "usage")
+            .collect();
+        assert_eq!(usage.len(), 2, "one usage meta per usage-bearing line: {evts:?}");
+        for u in &usage {
+            assert_eq!(u.payload["msg_id"], "m1");
+            assert_eq!(u.payload["usage"]["in"], 10);
+            assert_eq!(u.payload["usage"]["cache_read"], 100);
+        }
     }
 
     #[test]

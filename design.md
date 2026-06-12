@@ -103,6 +103,26 @@ runs on CI or a server without a developer machine.
   the `llm` feature). Per topic: a one-line summary reduced from the member
   summaries plus the short gated name, same model and cache; counts and repos
   stay extractive. *Built (extractive + local LLM session summaries).*
+- **Session stats (tokens & tool calls).** Per-session token totals and tool
+  mix, derived at view time from the raw envelopes — the agent's own usage
+  records, never tokenizer estimates. Capture per source: Claude Code emits a
+  usage envelope per raw assistant line (streamed turns repeat the identical
+  object across the lines of one message id — measured 2–4× — so aggregation
+  dedups by msg_id; embedding usage on the message payload would silently drop
+  tool-use-only turns, hence its own envelope); Codex token_count snapshots
+  are cumulative, so the last one is the session total, normalized at read
+  time (fresh in = input − cached; the corpus keeps codex's raw semantics, so
+  the policy is retroactively revisable — historical codex sessions lit up
+  with no re-tracking); Cowork records no usage. The four classes stay
+  separate end-to-end (in · out · cache-read · cache-write — a cache read is
+  not a fresh input), tool calls tally by name with errors from
+  `tool_result.is_error`, and a session without usage shows no number at all
+  (never a fake 0). Subagent (`agent-`) sessions count separately — parent
+  totals exclude children until a rollup over the existing `subagent_parent`
+  edges; per-model tables, tool durations, and an optional pricing map are
+  deferred with it. `[metrics stats]` reports `usage_coverage_pct` — the
+  share of sessions whose source recorded usage, which rises as the native
+  tracker supersedes the v1 agent. *Built (P1).*
 
 ## Surfaces
 

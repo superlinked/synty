@@ -1130,6 +1130,10 @@ impl App {
             s.thinking,
             s.tools,
         );
+        for line in [crate::view::usage_line(s), crate::view::tools_line(s)].into_iter().flatten() {
+            o.push_str(&line);
+            o.push('\n');
+        }
         if let Some(sum) = &s.summary {
             o.push_str(&format!("summary: {sum}\n"));
         }
@@ -1548,6 +1552,13 @@ mod tests {
             linked_pr: None,
             topic: Some(0),
             struggle: 0.6,
+            tok_in: 4_200,
+            tok_out: 18_900,
+            cache_read: 310_000,
+            cache_create: 12_000,
+            usage_turns: 7,
+            tools_by_name: vec![("Bash".into(), 5), ("Edit".into(), 3)],
+            tool_err: 1,
             summary: Some("Added an OCR adapter to the sie pipeline.".into()),
             author: String::new(),
         };

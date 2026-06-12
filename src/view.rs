@@ -227,6 +227,56 @@ pub fn meter(score: f32) -> String {
     format!("[{}{}]", "●".repeat(filled), "○".repeat(5 - filled))
 }
 
+/// Humanize a token count: 999, 46.1k, 1.2M. One decimal, ".0" trimmed.
+pub fn fmt_tokens(n: u64) -> String {
+    let scaled = |v: f64, suffix: &str| {
+        let s = format!("{v:.1}");
+        format!("{}{suffix}", s.strip_suffix(".0").unwrap_or(&s))
+    };
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => scaled(n as f64 / 1_000.0, "k"),
+        _ => scaled(n as f64 / 1_000_000.0, "M"),
+    }
+}
+
+/// One-line token accounting for a session — None when the source recorded no
+/// usage (no number beats a fake 0; cowork and pre-capture envelopes record
+/// none). Cache classes stay separate: a cache read is not a fresh input.
+pub fn usage_line(s: &crate::units::Session) -> Option<String> {
+    if !s.has_usage() {
+        return None;
+    }
+    let mut o = format!(
+        "tokens: {} in · {} out · {} cache-read · {} cache-write",
+        fmt_tokens(s.tok_in),
+        fmt_tokens(s.tok_out),
+        fmt_tokens(s.cache_read),
+        fmt_tokens(s.cache_create),
+    );
+    if s.usage_turns > 0 {
+        o.push_str(&format!(" · {} turns", s.usage_turns));
+    }
+    Some(o)
+}
+
+/// One-line tool mix for a session — the top names by call count, plus the
+/// error count straight off tool_result. None when nothing tallied by name.
+pub fn tools_line(s: &crate::units::Session) -> Option<String> {
+    if s.tools_by_name.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = s.tools_by_name.iter().take(6).map(|(n, c)| format!("{n}×{c}")).collect();
+    let mut o = format!("tools: {}", shown.join(" · "));
+    if s.tools_by_name.len() > 6 {
+        o.push_str(&format!(" (+{} more)", s.tools_by_name.len() - 6));
+    }
+    if s.tool_err > 0 {
+        o.push_str(&format!(" · {} errors", s.tool_err));
+    }
+    Some(o)
+}
+
 fn counts(it: impl Iterator<Item = String>) -> Vec<(String, usize)> {
     let mut m: HashMap<String, usize> = HashMap::new();
     for x in it {
@@ -287,6 +337,67 @@ mod tests {
         assert_eq!(meter(0.0), "[○○○○○]");
         assert_eq!(meter(1.0), "[●●●●●]");
         assert_eq!(meter(0.5), "[●●●○○]");
+    }
+
+    fn session() -> crate::units::Session {
+        crate::units::Session {
+            id: "s".into(),
+            repo: String::new(),
+            started: String::new(),
+            ended: String::new(),
+            ask: String::new(),
+            prompts: 1,
+            assistant: 1,
+            thinking: 0,
+            tools: 0,
+            files: vec![],
+            linked_pr: None,
+            topic: None,
+            struggle: 0.0,
+            tok_in: 0,
+            tok_out: 0,
+            cache_read: 0,
+            cache_create: 0,
+            usage_turns: 0,
+            tools_by_name: vec![],
+            tool_err: 0,
+            summary: None,
+            author: String::new(),
+        }
+    }
+
+    #[test]
+    fn fmt_tokens_humanizes() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(46_100), "46.1k");
+        assert_eq!(fmt_tokens(2_000), "2k");
+        assert_eq!(fmt_tokens(1_200_000), "1.2M");
+    }
+
+    // No usage recorded → no line at all; a fake "0 tokens" would read as a
+    // measurement. With usage, the four cache classes stay separate.
+    #[test]
+    fn usage_line_absent_without_usage() {
+        assert_eq!(usage_line(&session()), None);
+        let mut s = session();
+        (s.tok_in, s.tok_out, s.cache_read, s.cache_create, s.usage_turns) = (46_100, 12_300, 1_200_000, 96_000, 12);
+        let line = usage_line(&s).unwrap();
+        assert_eq!(line, "tokens: 46.1k in · 12.3k out · 1.2M cache-read · 96k cache-write · 12 turns");
+        s.usage_turns = 0; // codex's cumulative path has no turn count
+        assert!(!usage_line(&s).unwrap().contains("turns"));
+    }
+
+    #[test]
+    fn tools_line_caps_and_counts_errors() {
+        assert_eq!(tools_line(&session()), None);
+        let mut s = session();
+        s.tools_by_name = (0..8).map(|i| (format!("T{i}"), 8 - i)).collect();
+        s.tool_err = 2;
+        let line = tools_line(&s).unwrap();
+        assert!(line.starts_with("tools: T0×8"));
+        assert!(line.contains("(+2 more)") && line.ends_with("2 errors"), "{line}");
+        assert!(!line.contains("T6×"), "capped at six names: {line}");
     }
 
     fn doc(source: &str, kind: &str, repo: &str, author: &str, sid: &str) -> Doc {

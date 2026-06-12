@@ -28,10 +28,29 @@ pub struct Session {
     pub linked_pr: Option<String>,
     pub topic: Option<i64>,
     pub struggle: f32, // 0..1, normalized across sessions
+    // Token accounting from the agent's own usage records, cache classes kept
+    // separate (see Agg). All zero when the source recorded no usage — the
+    // views then show nothing rather than a fake 0.
+    pub tok_in: u64,
+    pub tok_out: u64,
+    pub cache_read: u64,
+    pub cache_create: u64,
+    pub usage_turns: usize, // deduped API turns (0 for codex's cumulative path)
+    pub tools_by_name: Vec<(String, usize)>, // count desc, then name
+    pub tool_err: usize,
     pub summary: Option<String>, // abstractive one-liner (local LLM), if cached
     /// The actor the tracker stamped on session_start; empty for sessions
     /// tracked before stamping (callers fall back to the local actor).
     pub author: String,
+}
+
+impl Session {
+    /// True when the source actually recorded token usage. The display rule:
+    /// no usage → no number — a rendered "0 tokens" would read as a
+    /// measurement, and cowork (plus pre-capture envelopes) record none.
+    pub fn has_usage(&self) -> bool {
+        self.usage_turns > 0 || self.tok_in + self.tok_out + self.cache_read + self.cache_create > 0
+    }
 }
 
 /// A session's cached LLM summary, keyed by a hash of its inputs so the
@@ -158,6 +177,146 @@ struct Agg {
     seen_files: std::collections::HashSet<String>,
     linked_pr: Option<String>,
     texts: Vec<String>, // message texts, for the summarizer's turn selection
+    // Token accounting from the agent's own usage records — never estimated.
+    // The four classes stay separate end-to-end: a cache read prices ~10x
+    // below fresh input, so one conflated "input" number would be a lie.
+    tok_in: u64,
+    tok_out: u64,
+    cache_read: u64,
+    cache_create: u64,
+    usage_turns: usize,
+    seen_msgs: std::collections::HashSet<String>, // streamed lines repeat usage per msg_id
+    tool_counts: HashMap<String, usize>,
+    tool_err: usize,
+    /// Codex reports cumulative (input_total, cached, output) snapshots; the
+    /// last one is the session total. Kept raw here, normalized in sessions().
+    codex_usage: Option<(u64, u64, u64)>,
+}
+
+/// Fold one envelope line into the per-session tallies. Split from
+/// `aggregate()` so scenario tests can feed envelope strings directly; the
+/// event-id `seen` set stays caller-owned because dedup spans files.
+fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<u64>, aggs: &mut HashMap<String, Agg>) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let Ok(ev) = serde_json::from_str::<Value>(line) else { return };
+    if !crate::event::first_sighting(seen, ev["event_id"].as_str().unwrap_or("")) {
+        return;
+    }
+    let sid = ev["session_id"].as_str().unwrap_or("");
+    if sid.is_empty() {
+        return;
+    }
+    let a = aggs.entry(sid.to_string()).or_default();
+    let ts = ev["ts"].as_str().unwrap_or("");
+    if !ts.is_empty() {
+        if a.first.is_empty() || ts < a.first.as_str() {
+            a.first = ts.to_string();
+        }
+        if ts > a.last.as_str() {
+            a.last = ts.to_string();
+        }
+    }
+    match ev["kind"].as_str().unwrap_or("") {
+        "session_start" => {
+            if let Some(cwd) = ev["payload"]["cwd"].as_str() {
+                a.repo = resolve_repo(cwd, known);
+            }
+            if let Some(actor) = ev["payload"]["actor"].as_str() {
+                a.actor = actor.to_string();
+            }
+        }
+        "user_prompt" => {
+            // Skip slash-command echoes / hook output so the "ask" is the
+            // real first human prompt and the count reflects real turns.
+            if let Some(t) = ev["payload"]["text"].as_str() {
+                let t = t.trim();
+                if t.len() >= 12 && !crate::ingest::is_noise(t) {
+                    a.prompts += 1;
+                    a.texts.push(t.to_string());
+                    if a.ask.is_empty() {
+                        a.ask = crate::excerpt(t, 200);
+                    }
+                }
+            }
+        }
+        "assistant_message" => {
+            a.assistant += 1;
+            if let Some(t) = ev["payload"]["text"].as_str() {
+                if t.trim().len() >= 12 {
+                    a.texts.push(t.trim().to_string());
+                }
+            }
+        }
+        "thinking" => a.thinking += 1,
+        "tool_call" => {
+            a.tools += 1;
+            if let Some(name) = ev["payload"]["name"].as_str().filter(|n| !n.is_empty()) {
+                *a.tool_counts.entry(name.to_string()).or_default() += 1;
+            }
+        }
+        "tool_result" => {
+            if ev["payload"]["is_error"].as_bool().unwrap_or(false) {
+                a.tool_err += 1;
+            }
+        }
+        "attachment_ref" => {
+            if FILE_TOOLS.contains(&ev["payload"]["tool_name"].as_str().unwrap_or("")) {
+                if let Some(tok) = ev["payload"]["local_path"].as_str().and_then(file_token) {
+                    if a.seen_files.insert(tok.clone()) {
+                        a.files.push(tok);
+                    }
+                }
+            }
+        }
+        "agent_meta" => {
+            let p = &ev["payload"];
+            match p["subtype"].as_str().unwrap_or("") {
+                // Claude Code: one usage record per raw assistant line; a
+                // streamed turn repeats the IDENTICAL object on every line of
+                // one msg_id (measured 2-4x), so count each msg_id once. A
+                // record without msg_id can't be deduped — count it as-is.
+                "usage" => {
+                    let dedup = p["msg_id"].as_str().filter(|m| !m.is_empty()).map(String::from);
+                    if dedup.map(|m| a.seen_msgs.insert(m)).unwrap_or(true) {
+                        let n = |k: &str| p["usage"][k].as_u64().unwrap_or(0);
+                        a.tok_in += n("in");
+                        a.tok_out += n("out");
+                        a.cache_read += n("cache_read");
+                        a.cache_create += n("cache_create");
+                        a.usage_turns += 1;
+                    }
+                }
+                // Codex: token_count snapshots are CUMULATIVE; one rollout
+                // file per session in append order, so the last one seen is
+                // the session total. The corpus keeps codex's raw semantics
+                // (input includes cached; output includes reasoning), so this
+                // policy is retroactively revisable from the same events.
+                "event_msg" if p["event_kind"] == "token_count" => {
+                    let u = &p["payload"]["info"]["total_token_usage"];
+                    if u.is_object() {
+                        a.codex_usage = Some((
+                            u["input_tokens"].as_u64().unwrap_or(0),
+                            u["cached_input_tokens"].as_u64().unwrap_or(0),
+                            u["output_tokens"].as_u64().unwrap_or(0),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            if a.linked_pr.is_none() {
+                if let Some(url) = p["pr_url"].as_str().filter(|u| !u.is_empty()) {
+                    a.linked_pr = Some(url.to_string());
+                } else if let (Some(repo), Some(num)) = (p["pr_repository"].as_str(), p["pr_number"].as_i64()) {
+                    if num > 0 {
+                        a.linked_pr = Some(format!("{repo}#{num}"));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Aggregate the raw envelopes under corpus/local into per-session tallies.
@@ -171,83 +330,7 @@ fn aggregate() -> HashMap<String, Agg> {
     for f in jsonl_files(Path::new(LOCAL_DIR)) {
         let Ok(data) = std::fs::read_to_string(&f) else { continue };
         for line in data.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
-            if !crate::event::first_sighting(&mut seen, ev["event_id"].as_str().unwrap_or("")) {
-                continue;
-            }
-            let sid = ev["session_id"].as_str().unwrap_or("");
-            if sid.is_empty() {
-                continue;
-            }
-            let a = aggs.entry(sid.to_string()).or_default();
-            let ts = ev["ts"].as_str().unwrap_or("");
-            if !ts.is_empty() {
-                if a.first.is_empty() || ts < a.first.as_str() {
-                    a.first = ts.to_string();
-                }
-                if ts > a.last.as_str() {
-                    a.last = ts.to_string();
-                }
-            }
-            match ev["kind"].as_str().unwrap_or("") {
-                "session_start" => {
-                    if let Some(cwd) = ev["payload"]["cwd"].as_str() {
-                        a.repo = resolve_repo(cwd, &known);
-                    }
-                    if let Some(actor) = ev["payload"]["actor"].as_str() {
-                        a.actor = actor.to_string();
-                    }
-                }
-                "user_prompt" => {
-                    // Skip slash-command echoes / hook output so the "ask" is the
-                    // real first human prompt and the count reflects real turns.
-                    if let Some(t) = ev["payload"]["text"].as_str() {
-                        let t = t.trim();
-                        if t.len() >= 12 && !crate::ingest::is_noise(t) {
-                            a.prompts += 1;
-                            a.texts.push(t.to_string());
-                            if a.ask.is_empty() {
-                                a.ask = crate::excerpt(t, 200);
-                            }
-                        }
-                    }
-                }
-                "assistant_message" => {
-                    a.assistant += 1;
-                    if let Some(t) = ev["payload"]["text"].as_str() {
-                        if t.trim().len() >= 12 {
-                            a.texts.push(t.trim().to_string());
-                        }
-                    }
-                }
-                "thinking" => a.thinking += 1,
-                "tool_call" => a.tools += 1,
-                "attachment_ref" => {
-                    if FILE_TOOLS.contains(&ev["payload"]["tool_name"].as_str().unwrap_or("")) {
-                        if let Some(tok) = ev["payload"]["local_path"].as_str().and_then(file_token) {
-                            if a.seen_files.insert(tok.clone()) {
-                                a.files.push(tok);
-                            }
-                        }
-                    }
-                }
-                "agent_meta" => {
-                    if a.linked_pr.is_none() {
-                        let p = &ev["payload"];
-                        if let Some(url) = p["pr_url"].as_str().filter(|u| !u.is_empty()) {
-                            a.linked_pr = Some(url.to_string());
-                        } else if let (Some(repo), Some(num)) = (p["pr_repository"].as_str(), p["pr_number"].as_i64()) {
-                            if num > 0 {
-                                a.linked_pr = Some(format!("{repo}#{num}"));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+            fold_line(line, &known, &mut seen, &mut aggs);
         }
     }
     aggs
@@ -272,6 +355,17 @@ pub fn sessions() -> Result<Vec<Session>> {
         .filter(|(_, id)| aggs[*id].prompts > 0) // real sessions only
         .map(|(i, id)| {
             let a = &aggs[id];
+            // Claude path: the summed, msg_id-deduped per-turn usage. Codex
+            // path: its last cumulative snapshot wins, normalized to the
+            // shared classes — fresh in = input − cached, cache_read = cached
+            // (codex exposes no cache creation), out = output (incl.
+            // reasoning, comparable to Claude's output incl. thinking).
+            let (tok_in, tok_out, cache_read, cache_create) = match a.codex_usage {
+                Some((input, cached, output)) => (input.saturating_sub(cached), output, cached, 0),
+                None => (a.tok_in, a.tok_out, a.cache_read, a.cache_create),
+            };
+            let mut tools_by_name: Vec<(String, usize)> = a.tool_counts.clone().into_iter().collect();
+            tools_by_name.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
             Session {
                 id: id.clone(),
                 repo: a.repo.clone(),
@@ -284,6 +378,13 @@ pub fn sessions() -> Result<Vec<Session>> {
                 tools: a.tools,
                 files: a.files.clone(),
                 linked_pr: a.linked_pr.clone(),
+                tok_in,
+                tok_out,
+                cache_read,
+                cache_create,
+                usage_turns: a.usage_turns,
+                tools_by_name,
+                tool_err: a.tool_err,
                 topic: topic_of.get(id).map(|t| t.cluster),
                 struggle: scores[i],
                 summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
@@ -805,6 +906,105 @@ fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aggs_of(text: &str) -> HashMap<String, Agg> {
+        let known = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut aggs = HashMap::new();
+        for line in text.lines() {
+            fold_line(line, &known, &mut seen, &mut aggs);
+        }
+        aggs
+    }
+
+    // A streamed turn repeats the identical usage object on every raw line of
+    // one msg_id (measured 2-4x in real logs) — it must count exactly once,
+    // or token totals overcount ~3x.
+    #[test]
+    fn usage_dedups_by_msg_id() {
+        let lines = [
+            r#"{"event_id":"e1","session_id":"S","ts":"t1","kind":"agent_meta","payload":{"subtype":"usage","msg_id":"m1","usage":{"in":10,"out":5,"cache_read":100,"cache_create":7}}}"#,
+            r#"{"event_id":"e2","session_id":"S","ts":"t2","kind":"agent_meta","payload":{"subtype":"usage","msg_id":"m1","usage":{"in":10,"out":5,"cache_read":100,"cache_create":7}}}"#,
+            r#"{"event_id":"e3","session_id":"S","ts":"t3","kind":"agent_meta","payload":{"subtype":"usage","msg_id":"m2","usage":{"in":1,"out":2,"cache_read":3,"cache_create":4}}}"#,
+        ]
+        .join("\n");
+        let a = &aggs_of(&lines)["S"];
+        assert_eq!((a.tok_in, a.tok_out, a.cache_read, a.cache_create), (11, 7, 103, 11));
+        assert_eq!(a.usage_turns, 2);
+    }
+
+    // Without a msg_id each event counts once; a literally duplicated
+    // envelope (same event_id, e.g. overlapping trackers) still folds once.
+    #[test]
+    fn usage_without_msg_id_counts_each_once_per_event() {
+        let dup = r#"{"event_id":"e1","session_id":"S","ts":"t1","kind":"agent_meta","payload":{"subtype":"usage","msg_id":"","usage":{"in":10,"out":0,"cache_read":0,"cache_create":0}}}"#;
+        let other = r#"{"event_id":"e2","session_id":"S","ts":"t2","kind":"agent_meta","payload":{"subtype":"usage","msg_id":"","usage":{"in":10,"out":0,"cache_read":0,"cache_create":0}}}"#;
+        let a = &aggs_of(&[dup, dup, other].join("\n"))["S"];
+        assert_eq!(a.tok_in, 20, "two distinct events, the duplicated envelope folded once");
+        assert_eq!(a.usage_turns, 2);
+    }
+
+    // Tool calls tally by name; errors come straight off tool_result.
+    #[test]
+    fn tool_calls_and_result_errors() {
+        let lines = [
+            r#"{"event_id":"e1","session_id":"S","ts":"t1","kind":"tool_call","payload":{"tool_use_id":"t1","name":"Bash"}}"#,
+            r#"{"event_id":"e2","session_id":"S","ts":"t2","kind":"tool_call","payload":{"tool_use_id":"t2","name":"Bash"}}"#,
+            r#"{"event_id":"e3","session_id":"S","ts":"t3","kind":"tool_result","payload":{"tool_use_id":"t1","is_error":true}}"#,
+            r#"{"event_id":"e4","session_id":"S","ts":"t4","kind":"tool_result","payload":{"tool_use_id":"t2","is_error":false}}"#,
+        ]
+        .join("\n");
+        let a = &aggs_of(&lines)["S"];
+        assert_eq!(a.tool_counts["Bash"], 2);
+        assert_eq!(a.tool_err, 1);
+        assert_eq!(a.tools, 2);
+    }
+
+    // Codex snapshots are cumulative: the last one is the session total, and
+    // it normalizes to the shared classes (fresh in = input − cached).
+    #[test]
+    fn codex_token_count_last_wins_and_normalizes() {
+        let lines = [
+            r#"{"event_id":"e1","session_id":"C","ts":"t1","kind":"agent_meta","payload":{"subtype":"event_msg","event_kind":"token_count","payload":{"info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50}}}}}"#,
+            r#"{"event_id":"e2","session_id":"C","ts":"t2","kind":"agent_meta","payload":{"subtype":"event_msg","event_kind":"token_count","payload":{"info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":80,"output_tokens":120}}}}}"#,
+        ]
+        .join("\n");
+        let a = &aggs_of(&lines)["C"];
+        assert_eq!(a.codex_usage, Some((200, 80, 120)), "last cumulative snapshot wins");
+        // sessions() maps it to fresh-in 120 / cache_read 80 / out 120 — the
+        // normalization itself is covered by the builder mapping above.
+    }
+
+    // A session with prompts but no usage records must read as unmeasured —
+    // the coverage denominator, and the no-fake-zero display rule.
+    #[test]
+    fn has_usage_false_for_cowork_like_sessions() {
+        let s = Session {
+            id: "x".into(),
+            repo: String::new(),
+            started: String::new(),
+            ended: String::new(),
+            ask: "do things".into(),
+            prompts: 3,
+            assistant: 5,
+            thinking: 0,
+            tools: 2,
+            files: vec![],
+            linked_pr: None,
+            topic: None,
+            struggle: 0.0,
+            tok_in: 0,
+            tok_out: 0,
+            cache_read: 0,
+            cache_create: 0,
+            usage_turns: 0,
+            tools_by_name: vec![("Bash".into(), 2)],
+            tool_err: 0,
+            summary: None,
+            author: String::new(),
+        };
+        assert!(!s.has_usage());
+    }
 
     // The session embed leads with the project (type prefix, repo, files) and
     // appends the summary — which must survive the cap intact even when file
