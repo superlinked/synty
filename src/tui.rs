@@ -772,7 +772,8 @@ impl App {
             View::Work | View::Search => self.draw_master_detail(f, body),
         }
         // footer: contextual keys (left) · freshness (middle) · autostart (right)
-        let auto = if self.autostart { " autostart ✓ " } else { " autostart ✗ " };
+        // glyph-first, matching the freshness cell ("✓ fresh").
+        let auto = if self.autostart { " ✓ autostart " } else { " ✗ autostart " };
         let fresh = format!(" {} ", self.fresh_status());
         let [fkeys, ffresh, fauto] = Layout::horizontal([
             Constraint::Min(0),
@@ -1674,7 +1675,8 @@ mod tests {
         for label in ["Topics", "Work", "Search", "Status"] {
             assert!(text.contains(label), "nav missing {label}");
         }
-        assert!(text.contains("autostart"), "footer missing autostart status");
+        // glyph-first, like the freshness cell ("✓ fresh" / "✗ autostart").
+        assert!(text.contains("✗ autostart"), "footer missing glyph-first autostart status");
         // breadcrumb-only chrome: no redundant TOPIC header, but functional ones remain
         assert!(text.contains("REPOS · ACCOUNTS"), "topics table missing column headers");
         assert!(!text.contains("TOPIC"), "redundant TOPIC header should be gone");

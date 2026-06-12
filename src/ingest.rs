@@ -100,6 +100,7 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
     let total = docs.len();
     let cap = crate::config::load().max_docs.unwrap_or(CAP);
     let (docs, dropped) = cap_by_recency(docs, cap);
+    let docs = stable_order(docs, out_path);
     if dropped > 0 {
         eprintln!(
             "ingest: WARNING — recency cap {cap} dropped the {dropped} oldest docs from the index.\n        Raise `max_docs` in .synty/config.json to keep more history."
@@ -289,10 +290,10 @@ fn input_manifest<'a>(files: impl Iterator<Item = &'a PathBuf>) -> String {
     out
 }
 
-/// Keep the `cap` most recent docs (ISO8601 ts sorts lexicographically) and
-/// assign sequential ids, ordered oldest-first — so new work lands at the tail
-/// and `index` can append to the existing index instead of rebuilding.
-/// Returns (kept, dropped_count).
+/// Keep the `cap` most recent docs (ISO8601 ts sorts lexicographically),
+/// ordered oldest-first with sequential ids. The order is then made stable
+/// against the previous output by `stable_order` — recency only decides what
+/// is KEPT. Returns (kept, dropped_count).
 pub fn cap_by_recency(mut docs: Vec<Doc>, cap: usize) -> (Vec<Doc>, usize) {
     docs.sort_by(|a, b| b.meta.ts.cmp(&a.meta.ts));
     let dropped = docs.len().saturating_sub(cap);
@@ -302,6 +303,46 @@ pub fn cap_by_recency(mut docs: Vec<Doc>, cap: usize) -> (Vec<Doc>, usize) {
         d.id = i as i64;
     }
     (docs, dropped)
+}
+
+/// Order docs so the previous docs.jsonl stays a strict prefix: a doc whose
+/// text already appears there keeps that file's position (with its fresh
+/// meta), and novel docs append at the tail, oldest first. Pure timestamp
+/// order broke `index`'s append path on every active day — a doc routinely
+/// ARRIVES later than its timestamp (a session tailed hours after its
+/// messages, a backfilled PR), and one mid-corpus insertion forced minutes of
+/// full PLAID re-quantization where appending the tail takes seconds. A
+/// vanished text (edited PR body, recency-cap drop) still leaves a gap and
+/// rebuilds in full — rare, and correct. Matching is a multiset on the text
+/// hash, so identical one-liners ("ok") collapse to the right slots.
+fn stable_order(docs: Vec<Doc>, prev_path: &str) -> Vec<Doc> {
+    let prev = match crate::load_docs(prev_path) {
+        Ok(p) if !p.is_empty() => p,
+        _ => return docs,
+    };
+    let mut slots: Vec<Option<Doc>> = docs.into_iter().map(Some).collect();
+    let mut by_hash: HashMap<u64, std::collections::VecDeque<usize>> = HashMap::new();
+    for (i, d) in slots.iter().enumerate() {
+        let h = crate::index::fnv1a(d.as_ref().expect("just filled").text.as_bytes());
+        by_hash.entry(h).or_default().push_back(i);
+    }
+    let mut out: Vec<Doc> = Vec::with_capacity(slots.len());
+    for p in &prev {
+        if let Some(q) = by_hash.get_mut(&crate::index::fnv1a(p.text.as_bytes())) {
+            if let Some(i) = q.pop_front() {
+                out.push(slots[i].take().expect("each slot consumed once"));
+            }
+        }
+    }
+    for s in &mut slots {
+        if let Some(d) = s.take() {
+            out.push(d); // novel docs, still oldest-first among themselves
+        }
+    }
+    for (i, d) in out.iter_mut().enumerate() {
+        d.id = i as i64;
+    }
+    out
 }
 
 /// System-injected pseudo-prompts (hook echoes, tool output, reminders) carry
@@ -489,6 +530,72 @@ mod tests {
         let (docs, _) = session_docs(&lines, &Default::default());
         assert_eq!(docs.len(), 1);
         assert!(docs[0].text.starts_with("please refactor"));
+    }
+
+    fn doc(ts: &str, text: &str) -> Doc {
+        Doc {
+            id: 0,
+            text: text.into(),
+            meta: Meta {
+                source: "github".into(),
+                kind: "issue".into(),
+                repo: "r".into(),
+                author: String::new(),
+                session_id: String::new(),
+                ts: ts.into(),
+                number: None,
+                url: None,
+                state: None,
+                labels: vec![],
+            },
+        }
+    }
+
+    fn write_docs(path: &Path, docs: &[Doc]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let out: String = docs.iter().map(|d| serde_json::to_string(d).unwrap() + "\n").collect();
+        std::fs::write(path, out).unwrap();
+    }
+
+    // A doc that ARRIVES late (a session tailed hours after its timestamps, a
+    // backfilled PR) must append at the tail, not insert mid-corpus by its
+    // timestamp — one insertion forces `index` into a full rebuild.
+    #[test]
+    fn late_arrival_appends_instead_of_inserting() {
+        let dir = std::env::temp_dir().join(format!("synty-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prev_path = dir.join("docs.jsonl");
+        write_docs(&prev_path, &[doc("2026-06-01", "alpha"), doc("2026-06-03", "gamma")]);
+        // The new derivation knows a doc timestamped BETWEEN the existing two.
+        let fresh = vec![doc("2026-06-01", "alpha"), doc("2026-06-02", "beta"), doc("2026-06-03", "gamma")];
+        let out = stable_order(fresh, &prev_path.to_string_lossy());
+        let texts: Vec<&str> = out.iter().map(|d| d.text.as_str()).collect();
+        assert_eq!(texts, ["alpha", "gamma", "beta"], "previous order kept, late arrival at the tail");
+        assert_eq!(out.iter().map(|d| d.id).collect::<Vec<_>>(), [0, 1, 2]);
+        // …and identical texts match as a multiset, not first-wins-forever.
+        write_docs(&prev_path, &[doc("2026-06-01", "ok"), doc("2026-06-02", "ok")]);
+        let out = stable_order(vec![doc("2026-06-01", "ok"), doc("2026-06-02", "ok"), doc("2026-06-03", "ok")], &prev_path.to_string_lossy());
+        assert_eq!(out.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An edited doc vacates its old slot (the gap correctly forces one full
+    // rebuild) and re-enters at the tail; without a previous file the
+    // timestamp order passes through untouched.
+    #[test]
+    fn edited_doc_moves_to_tail_and_no_prev_is_passthrough() {
+        let dir = std::env::temp_dir().join(format!("synty-order2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prev_path = dir.join("docs.jsonl");
+        write_docs(&prev_path, &[doc("2026-06-01", "alpha"), doc("2026-06-02", "beta"), doc("2026-06-03", "gamma")]);
+        let fresh = vec![doc("2026-06-01", "alpha"), doc("2026-06-02", "beta EDITED"), doc("2026-06-03", "gamma")];
+        let out = stable_order(fresh, &prev_path.to_string_lossy());
+        let texts: Vec<&str> = out.iter().map(|d| d.text.as_str()).collect();
+        assert_eq!(texts, ["alpha", "gamma", "beta EDITED"]);
+        let fresh = vec![doc("2026-06-01", "alpha"), doc("2026-06-02", "beta")];
+        let out = stable_order(fresh, &dir.join("absent.jsonl").to_string_lossy());
+        assert_eq!(out.iter().map(|d| d.text.as_str()).collect::<Vec<_>>(), ["alpha", "beta"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Capping keeps the newest and renumbers ids from 0.

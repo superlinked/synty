@@ -43,10 +43,12 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
         }
     }
 
-    // docs.jsonl is oldest-first, so new work extends the tail: when the
-    // previous build is a strict prefix, clone it (CoW) and append only the
-    // tail. Anything else (recency-cap drop, edited history, legacy layout)
-    // → full rebuild into a fresh directory.
+    // ingest keeps docs.jsonl prefix-stable: existing docs hold their
+    // positions and new work appends at the tail even when it arrives late
+    // (see ingest::stable_order). When the previous build is a strict prefix,
+    // clone it (CoW) and append only the tail. Anything else (recency-cap
+    // drop, edited history, a build pulled from another machine, legacy
+    // layout) → full rebuild into a fresh directory.
     let dir = readmodel::build_dir(&build);
     let dir_str = dir.to_string_lossy().into_owned();
     let start = match (&prev, &prev_hashes) {
