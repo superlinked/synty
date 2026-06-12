@@ -1518,7 +1518,7 @@ fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
                 if t.chars == 0 {
                     Cell::from("·").style(dim)
                 } else {
-                    Cell::from(format!("~{}", crate::view::fmt_tokens(t.est_tokens()))).style(Style::new().fg(theme::SESSION))
+                    Cell::from(crate::view::fmt_tokens(t.est_tokens())).style(Style::new().fg(theme::SESSION))
                 },
                 Cell::from(crate::view::fmt_tokens(t.calls)).style(dim),
                 if t.errs == 0 {
@@ -2132,7 +2132,7 @@ mod tests {
         assert!(text.contains("18.9k"), "repo token spend missing");
         assert!(text.contains("Tools (2)") && text.contains("CALLS") && text.contains("Bash"), "tools table missing: {text}");
         assert!(text.contains("AGENT") && text.contains("claude"), "tools agent column missing: {text}");
-        assert!(text.contains("~TOK") && text.contains("~20.3k"), "estimated context column missing: {text}");
+        assert!(text.contains("~TOK") && text.contains("20.3k"), "estimated context column missing: {text}");
         assert!(text.contains("Models (1)") && text.contains("claude-fable-5") && text.contains("CACHE-R"), "models table missing: {text}");
         // the toggle uses the keycap convention, not an explanation sentence.
         assert!(text.contains("autostart[a]"), "autostart keycap hint missing: {text}");

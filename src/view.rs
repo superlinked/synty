@@ -300,7 +300,7 @@ pub fn status_md(s: &Status) -> String {
             o.push_str(&format!(
                 "  {:<24} {:>8} {:>6} {:>6}  {}\n",
                 t.name,
-                format!("~{}", fmt_tokens(t.est_tokens())),
+                fmt_tokens(t.est_tokens()),
                 t.calls,
                 t.errs,
                 t.agent,
