@@ -1475,14 +1475,16 @@ fn styled_names(names: &[String], active: Option<&str>, base: Color, max: usize)
 /// A Status breakdown table: name + sessions/github/docs columns, a dim "·" for
 /// zeros so the meaningful counts stand out. Rows arrive pre-sorted (most docs).
 // Status-table convention: the first numeric column is the sort key — Repos
-// and Accounts sort by DOCS, Tools by ~TOK, Models by OUT.
+// and Accounts sort by DOCS, Tools by ~TOK, Models by OUT — and it alone
+// wears the standout color; every other numeric column is dim. Names stay
+// foreground, zeros are a dim "·" everywhere.
 fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
     let dim = Style::new().fg(theme::DIM);
-    let num = |n: usize, c: Color| {
+    let num = |n: u64, c: Color| {
         if n == 0 {
             Cell::from("·").style(dim)
         } else {
-            Cell::from(n.to_string()).style(Style::new().fg(c))
+            Cell::from(crate::view::fmt_tokens(n)).style(Style::new().fg(c))
         }
     };
     let body: Vec<Row> = rows
@@ -1490,19 +1492,11 @@ fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
         .map(|t| {
             Row::new(vec![
                 Cell::from(t.name.clone()).style(Style::new().fg(theme::FG)),
-                Cell::from(t.docs.to_string()).style(dim),
-                num(t.sessions, theme::SESSION),
-                num(t.github, theme::GITHUB),
-                if t.tok_out == 0 {
-                    Cell::from("·").style(dim)
-                } else {
-                    Cell::from(crate::view::fmt_tokens(t.tok_out)).style(Style::new().fg(theme::FG))
-                },
-                if t.tools == 0 {
-                    Cell::from("·").style(dim)
-                } else {
-                    Cell::from(crate::view::fmt_tokens(t.tools)).style(dim)
-                },
+                num(t.docs as u64, theme::SESSION), // the sort key stands out
+                num(t.sessions as u64, theme::DIM),
+                num(t.github as u64, theme::DIM),
+                num(t.tok_out, theme::DIM),
+                num(t.tools, theme::DIM),
             ])
         })
         .collect();
@@ -1524,14 +1518,13 @@ fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
                 if t.chars == 0 {
                     Cell::from("·").style(dim)
                 } else {
-                    Cell::from(format!("~{}", crate::view::fmt_tokens(t.est_tokens()))).style(Style::new().fg(theme::FG))
+                    Cell::from(format!("~{}", crate::view::fmt_tokens(t.est_tokens()))).style(Style::new().fg(theme::SESSION))
                 },
-                Cell::from(crate::view::fmt_tokens(t.calls)).style(Style::new().fg(theme::SESSION)),
-                // plain foreground: accent/red is the selection language here
+                Cell::from(crate::view::fmt_tokens(t.calls)).style(dim),
                 if t.errs == 0 {
                     Cell::from("·").style(dim)
                 } else {
-                    Cell::from(t.errs.to_string()).style(Style::new().fg(theme::FG))
+                    Cell::from(t.errs.to_string()).style(dim)
                 },
                 Cell::from(t.agent.clone()).style(dim),
             ])
@@ -1548,11 +1541,11 @@ fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
 /// Codex sessions report no model, so their share rides under "codex".
 fn models_table(rows: &[units::ModelUsage]) -> Table<'static> {
     let dim = Style::new().fg(theme::DIM);
-    let tok = |n: u64| {
+    let tok = |n: u64, c: Color| {
         if n == 0 {
             Cell::from("·").style(dim)
         } else {
-            Cell::from(crate::view::fmt_tokens(n)).style(Style::new().fg(theme::FG))
+            Cell::from(crate::view::fmt_tokens(n)).style(Style::new().fg(c))
         }
     };
     let body: Vec<Row> = rows
@@ -1560,10 +1553,10 @@ fn models_table(rows: &[units::ModelUsage]) -> Table<'static> {
         .map(|m| {
             Row::new(vec![
                 Cell::from(m.model.clone()).style(Style::new().fg(theme::FG)),
-                tok(m.tok_out),
-                tok(m.tok_in),
-                tok(m.cache_read),
-                tok(m.cache_create),
+                tok(m.tok_out, theme::SESSION), // the sort key stands out
+                tok(m.tok_in, theme::DIM),
+                tok(m.cache_read, theme::DIM),
+                tok(m.cache_create, theme::DIM),
                 if m.turns == 0 { Cell::from("·").style(dim) } else { Cell::from(m.turns.to_string()).style(dim) },
             ])
         })
