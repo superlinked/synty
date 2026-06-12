@@ -36,7 +36,7 @@ pub struct Session {
     pub cache_read: u64,
     pub cache_create: u64,
     pub usage_turns: usize, // deduped API turns (0 for codex's cumulative path)
-    pub tools_by_name: Vec<(String, usize, usize)>, // (name, calls, attributed errors), calls desc
+    pub tools_by_name: Vec<(String, usize, usize, u64)>, // (name, calls, attributed errors, payload chars), calls desc
     pub tool_err: usize,
     pub by_model: Vec<ModelUsage>, // per-model split of the same totals, tok_out desc
     pub source: String, // envelope source: claude_code | codex_cli | cowork
@@ -66,6 +66,24 @@ pub struct ModelUsage {
     pub cache_read: u64,
     pub cache_create: u64,
     pub turns: usize,
+}
+
+/// The measurable volume of a tool event: the serialized arguments (call
+/// side: Claude's input object, codex's arguments string, a web_search
+/// action) or the result content (Claude's content, codex's output), in
+/// chars. No agent meters tokens per tool call — usage is per API turn — so
+/// payload volume is the honest per-tool basis, surfaced as a clearly-marked
+/// ~chars/4 estimate.
+fn payload_chars(p: &Value) -> u64 {
+    let v = ["input", "arguments", "action", "content", "output"]
+        .iter()
+        .map(|k| &p[*k])
+        .find(|v| !v.is_null());
+    match v {
+        Some(Value::String(s)) => s.chars().count() as u64,
+        Some(other) => serde_json::to_string(other).map(|s| s.chars().count()).unwrap_or(0) as u64,
+        None => 0,
+    }
 }
 
 /// Short agent label from an envelope source ("claude_code" → "claude").
@@ -207,6 +225,7 @@ struct Agg {
     tool_err: usize,
     tool_pending: HashMap<String, String>, // call id → tool name, for error attribution
     tool_errs: HashMap<String, usize>, // per-name errors (Claude only: codex results carry no error flag)
+    tool_chars: HashMap<String, u64>, // per-name payload volume: args + result content, chars
     source: String, // envelope source, first seen wins (a session has one tailer)
     model_usage: HashMap<String, ModelUsage>, // per-model split, same msg_id dedup
     /// Codex reports cumulative (input_total, cached, output) snapshots; the
@@ -280,6 +299,7 @@ fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut s
             a.tools += 1;
             if let Some(name) = ev["payload"]["name"].as_str().filter(|n| !n.is_empty()) {
                 *a.tool_counts.entry(name.to_string()).or_default() += 1;
+                *a.tool_chars.entry(name.to_string()).or_default() += payload_chars(&ev["payload"]);
                 // Both id schemes: Claude's tool_use_id, codex's call_id.
                 let id = ev["payload"]["tool_use_id"].as_str().or_else(|| ev["payload"]["call_id"].as_str());
                 if let Some(id) = id.filter(|i| !i.is_empty()) {
@@ -288,10 +308,14 @@ fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut s
             }
         }
         "tool_result" => {
+            let id = ev["payload"]["tool_use_id"].as_str().or_else(|| ev["payload"]["call_id"].as_str());
+            let name = id.and_then(|i| a.tool_pending.get(i)).cloned();
+            if let Some(name) = &name {
+                *a.tool_chars.entry(name.clone()).or_default() += payload_chars(&ev["payload"]);
+            }
             if ev["payload"]["is_error"].as_bool().unwrap_or(false) {
                 a.tool_err += 1;
-                let id = ev["payload"]["tool_use_id"].as_str().or_else(|| ev["payload"]["call_id"].as_str());
-                if let Some(name) = id.and_then(|i| a.tool_pending.get(i)).cloned() {
+                if let Some(name) = name {
                     *a.tool_errs.entry(name).or_default() += 1;
                 }
             }
@@ -479,6 +503,7 @@ pub struct ToolProfile {
     pub agent: String, // "claude" / "codex" / … / "a+b" when mixed
     pub calls: u64,
     pub errs: u64,
+    pub chars: u64, // args + result payload volume — context, as a ~chars/4 estimate
     pub days: HashMap<String, u64>,
     pub arg_keys: Vec<(String, u64)>, // key → calls carrying it, desc
     pub arg_tops: Vec<(String, Vec<(String, u64)>)>, // low-cardinality keys → top values
@@ -501,6 +526,7 @@ struct ToolFold {
     agents: std::collections::BTreeSet<String>,
     calls: u64,
     errs: u64,
+    chars: u64,
     days: HashMap<String, u64>,
     key_counts: HashMap<String, u64>,
     val_counts: HashMap<String, HashMap<String, u64>>,
@@ -528,6 +554,7 @@ impl ToolFold {
         match ev["kind"].as_str().unwrap_or("") {
             "tool_call" if p["name"].as_str() == Some(self.target.as_str()) => {
                 self.calls += 1;
+                self.chars += payload_chars(p);
                 if let Some(src) = ev["source"].as_str().filter(|s| !s.is_empty()) {
                     self.agents.insert(agent_label(src).to_string());
                 }
@@ -578,6 +605,9 @@ impl ToolFold {
                 }
             }
             "tool_result" if !id.is_empty() => {
+                if self.pending_ts.contains_key(id) {
+                    self.chars += payload_chars(p);
+                }
                 if let Some(call_ms) = self.pending_ts.remove(id) {
                     if let Some(ms) = ts_ms(ev["ts"].as_str().unwrap_or("")) {
                         self.durs.push(ms.saturating_sub(call_ms).max(0) as u64);
@@ -625,6 +655,7 @@ impl ToolFold {
             agent: self.agents.into_iter().collect::<Vec<_>>().join("+"),
             calls: self.calls,
             errs: self.errs,
+            chars: self.chars,
             days: self.days,
             arg_keys,
             arg_tops,
@@ -703,10 +734,10 @@ pub fn sessions() -> Result<Vec<Session>> {
                 None => a.model_usage.values().cloned().collect(),
             };
             by_model.sort_by(|x, y| y.tok_out.cmp(&x.tok_out).then(x.model.cmp(&y.model)));
-            let mut tools_by_name: Vec<(String, usize, usize)> = a
+            let mut tools_by_name: Vec<(String, usize, usize, u64)> = a
                 .tool_counts
                 .iter()
-                .map(|(n, c)| (n.clone(), *c, a.tool_errs.get(n).copied().unwrap_or(0)))
+                .map(|(n, c)| (n.clone(), *c, a.tool_errs.get(n).copied().unwrap_or(0), a.tool_chars.get(n).copied().unwrap_or(0)))
                 .collect();
             tools_by_name.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
             Session {
@@ -1321,10 +1352,10 @@ mod tests {
     #[test]
     fn tool_calls_and_result_errors() {
         let lines = [
-            r#"{"event_id":"e1","session_id":"S","ts":"t1","kind":"tool_call","payload":{"tool_use_id":"t1","name":"Bash"}}"#,
-            r#"{"event_id":"e2","session_id":"S","ts":"t2","kind":"tool_call","payload":{"tool_use_id":"t2","name":"Bash"}}"#,
-            r#"{"event_id":"e3","session_id":"S","ts":"t3","kind":"tool_result","payload":{"tool_use_id":"t1","is_error":true}}"#,
-            r#"{"event_id":"e4","session_id":"S","ts":"t4","kind":"tool_result","payload":{"tool_use_id":"t2","is_error":false}}"#,
+            r#"{"event_id":"e1","session_id":"S","ts":"t1","kind":"tool_call","payload":{"tool_use_id":"t1","name":"Bash","input":{"command":"ls -la"}}}"#,
+            r#"{"event_id":"e2","session_id":"S","ts":"t2","kind":"tool_call","payload":{"tool_use_id":"t2","name":"Bash","input":{"command":"git status"}}}"#,
+            r#"{"event_id":"e3","session_id":"S","ts":"t3","kind":"tool_result","payload":{"tool_use_id":"t1","is_error":true,"content":"command not found"}}"#,
+            r#"{"event_id":"e4","session_id":"S","ts":"t4","kind":"tool_result","payload":{"tool_use_id":"t2","is_error":false,"content":"clean"}}"#,
         ]
         .join("\n");
         let a = &aggs_of(&lines)["S"];
@@ -1332,6 +1363,7 @@ mod tests {
         assert_eq!(a.tool_err, 1);
         assert_eq!(a.tool_errs["Bash"], 1, "the error is attributed to its tool by id");
         assert_eq!(a.tools, 2);
+        assert!(a.tool_chars["Bash"] > 0, "args + result volume accumulates per tool");
     }
 
     // Codex snapshots are cumulative: the last one is the session total, and
@@ -1411,7 +1443,7 @@ mod tests {
             cache_read: 0,
             cache_create: 0,
             usage_turns: 0,
-            tools_by_name: vec![("Bash".into(), 2, 0)],
+            tools_by_name: vec![("Bash".into(), 2, 0, 640)],
             tool_err: 0,
             by_model: vec![],
             source: "cowork".into(),

@@ -1282,6 +1282,9 @@ impl App {
         if p.input_p95 > 0 {
             head.push_str(&format!(" · input p50 {} / p95 {} chars", p.input_p50, p.input_p95));
         }
+        if p.chars > 0 {
+            head.push_str(&format!(" · context ~{} tok", crate::view::fmt_tokens(p.chars / 4)));
+        }
         lines.push(Line::from(Span::styled(head, fg)));
         lines.push(Line::from(""));
 
@@ -1523,11 +1526,16 @@ fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
                 } else {
                     Cell::from(t.errs.to_string()).style(Style::new().fg(theme::ACCENT))
                 },
+                if t.chars == 0 {
+                    Cell::from("·").style(dim)
+                } else {
+                    Cell::from(format!("~{}", crate::view::fmt_tokens(t.est_tokens()))).style(Style::new().fg(theme::FG))
+                },
             ])
         })
         .collect();
-    Table::new(body, [Constraint::Min(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(5)])
-        .header(Row::new(["", "AGENT", "CALLS", "ERR"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
+    Table::new(body, [Constraint::Min(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(5), Constraint::Length(7)])
+        .header(Row::new(["", "AGENT", "CALLS", "ERR", "~TOK"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
         .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌")
         .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" Tools ({}) · Enter inspects ", rows.len())))
@@ -1810,7 +1818,7 @@ mod tests {
             cache_read: 310_000,
             cache_create: 12_000,
             usage_turns: 7,
-            tools_by_name: vec![("Bash".into(), 5, 1), ("Edit".into(), 3, 0)],
+            tools_by_name: vec![("Bash".into(), 5, 1, 2_000), ("Edit".into(), 3, 0, 800)],
             tool_err: 1,
             by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }],
             source: "claude_code".into(),
@@ -1830,7 +1838,7 @@ mod tests {
             sessions: vec![session],
             work,
             topics,
-            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false },
+            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1, chars: 81_200 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0, chars: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false },
             view: View::Topics,
             sel: 0,
             drill_topic: None,
@@ -2128,6 +2136,7 @@ mod tests {
         assert!(text.contains("18.9k"), "repo token spend missing");
         assert!(text.contains("Tools (2)") && text.contains("CALLS") && text.contains("Bash"), "tools table missing: {text}");
         assert!(text.contains("AGENT") && text.contains("claude"), "tools agent column missing: {text}");
+        assert!(text.contains("~TOK") && text.contains("~20.3k"), "estimated context column missing: {text}");
         assert!(text.contains("Models (1)") && text.contains("claude-fable-5") && text.contains("CACHE-R"), "models table missing: {text}");
         // the toggle uses the keycap convention, not an explanation sentence.
         assert!(text.contains("autostart[a]"), "autostart keycap hint missing: {text}");
@@ -2146,6 +2155,7 @@ mod tests {
             agent: "claude".into(),
             calls: 3665,
             errs: 106,
+            chars: 5_600_000,
             days: [("2026-05-31".to_string(), 12u64)].into_iter().collect(),
             arg_keys: vec![("command".into(), 3665), ("run_in_background".into(), 3665), ("timeout".into(), 420)],
             arg_tops: vec![("run_in_background".into(), vec![("false".into(), 3600), ("true".into(), 65)])],
@@ -2161,6 +2171,7 @@ mod tests {
         assert!(text.contains("Bash · claude"), "overlay title missing: {text}");
         assert!(text.contains("3.7k calls") && text.contains("106 errors"), "volume line missing: {text}");
         assert!(text.contains("p50 740ms"), "latency missing");
+        assert!(text.contains("context ~1.4M tok"), "context estimate missing: {text}");
         assert!(text.contains("args (share of calls):") && text.contains("command"), "args section missing");
         assert!(text.contains("false×3600"), "common values missing");
         assert!(text.contains("cargo test"), "recent sample missing");

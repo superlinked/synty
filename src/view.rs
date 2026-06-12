@@ -27,6 +27,17 @@ pub struct ToolTally {
     pub agent: String,
     pub calls: u64,
     pub errs: u64,
+    /// Args + result payload volume, chars. Tokens are NOT metered per tool
+    /// by any agent (usage is per API turn), so views show this as a marked
+    /// ~chars/4 estimate of the context the tool's calls consumed.
+    pub chars: u64,
+}
+
+impl ToolTally {
+    /// The marked estimate: ~4 chars per token over the measured payloads.
+    pub fn est_tokens(&self) -> u64 {
+        self.chars / 4
+    }
 }
 
 pub struct Status {
@@ -66,7 +77,7 @@ pub fn status() -> Result<Status> {
     let local_actor = crate::identity::actor();
     let mut by_repo = tally(&docs, true);
     let mut by_user = tally(&docs, false);
-    let mut tools: std::collections::HashMap<String, (std::collections::BTreeSet<String>, u64, u64)> =
+    let mut tools: std::collections::HashMap<String, (std::collections::BTreeSet<String>, u64, u64, u64)> =
         std::collections::HashMap::new();
     let mut models: std::collections::HashMap<String, crate::units::ModelUsage> = std::collections::HashMap::new();
     for s in &sess {
@@ -74,11 +85,12 @@ pub fn status() -> Result<Status> {
         let who = if s.author.is_empty() { local_actor.as_str() } else { s.author.as_str() };
         fold_spend(&mut by_user, who, s.tok_out, s.tools as u64);
         let agent = crate::units::agent_label(&s.source).to_string();
-        for (name, calls, errs) in &s.tools_by_name {
+        for (name, calls, errs, chars) in &s.tools_by_name {
             let e = tools.entry(name.clone()).or_default();
             e.0.insert(agent.clone());
             e.1 += *calls as u64;
             e.2 += *errs as u64;
+            e.3 += chars;
         }
         for mu in &s.by_model {
             let m = models.entry(mu.model.clone()).or_default();
@@ -92,11 +104,12 @@ pub fn status() -> Result<Status> {
     }
     let mut by_tool: Vec<ToolTally> = tools
         .into_iter()
-        .map(|(name, (agents, calls, errs))| ToolTally {
+        .map(|(name, (agents, calls, errs, chars))| ToolTally {
             name,
             agent: agents.into_iter().collect::<Vec<_>>().join("+"),
             calls,
             errs,
+            chars,
         })
         .collect();
     by_tool.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.name.cmp(&b.name)));
@@ -281,9 +294,16 @@ pub fn status_md(s: &Status) -> String {
         }
     }
     if !s.by_tool.is_empty() {
-        o.push_str("\n\ntools (agent · calls · errors):\n");
+        o.push_str("\n\ntools (agent · calls · errors · ~tok):\n");
         for t in s.by_tool.iter().take(16) {
-            o.push_str(&format!("  {:<24} {:<8} {:>6} {:>6}\n", t.name, t.agent, t.calls, t.errs));
+            o.push_str(&format!(
+                "  {:<24} {:<8} {:>6} {:>6} {:>8}\n",
+                t.name,
+                t.agent,
+                t.calls,
+                t.errs,
+                format!("~{}", fmt_tokens(t.est_tokens())),
+            ));
         }
     }
     o
@@ -399,7 +419,7 @@ pub fn tools_line(s: &crate::units::Session) -> Option<String> {
     if s.tools_by_name.is_empty() {
         return None;
     }
-    let shown: Vec<String> = s.tools_by_name.iter().take(6).map(|(n, c, _)| format!("{n}×{c}")).collect();
+    let shown: Vec<String> = s.tools_by_name.iter().take(6).map(|(n, c, _, _)| format!("{n}×{c}")).collect();
     let mut o = format!("tools: {}", shown.join(" · "));
     if s.tools_by_name.len() > 6 {
         o.push_str(&format!(" (+{} more)", s.tools_by_name.len() - 6));
@@ -528,7 +548,7 @@ mod tests {
     fn tools_line_caps_and_counts_errors() {
         assert_eq!(tools_line(&session()), None);
         let mut s = session();
-        s.tools_by_name = (0..8).map(|i| (format!("T{i}"), 8 - i, 0)).collect();
+        s.tools_by_name = (0..8).map(|i| (format!("T{i}"), 8 - i, 0, 100)).collect();
         s.tool_err = 2;
         let line = tools_line(&s).unwrap();
         assert!(line.starts_with("tools: T0×8"));
