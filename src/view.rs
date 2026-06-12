@@ -8,12 +8,16 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 /// A per-dimension tally — one repo, or one account: how many docs mention it,
-/// how many of those are GitHub objects, and how many distinct agent sessions.
+/// how many of those are GitHub objects, how many distinct agent sessions, and
+/// the sessions' token/tool spend (out tokens as the headline; the full class
+/// split lives in the session detail and the stats panel).
 pub struct Tally {
     pub name: String,
     pub docs: usize,
     pub github: usize,
     pub sessions: usize,
+    pub tok_out: u64,
+    pub tools: u64,
 }
 
 pub struct Status {
@@ -23,6 +27,8 @@ pub struct Status {
     pub by_kind: Vec<(String, usize)>,
     pub by_repo: Vec<Tally>,
     pub by_user: Vec<Tally>,
+    /// Fleet-wide tool mix: (name, calls, attributed errors), calls desc.
+    pub by_tool: Vec<(String, u64, u64)>,
     pub newest_ts: String,
     pub last_indexed: Option<String>,
     pub last_tracked: Option<String>,
@@ -42,19 +48,55 @@ pub fn status() -> Result<Status> {
         .map(|d| d.meta.session_id.as_str())
         .collect::<HashSet<_>>()
         .len();
+    // Segment the sessions' token/tool spend onto the repo and account rows,
+    // and tally the fleet-wide tool mix — sessions carry repo, author, and
+    // the per-name tool counts already.
+    let sess = crate::units::sessions().unwrap_or_default();
+    let local_actor = crate::identity::actor();
+    let mut by_repo = tally(&docs, true);
+    let mut by_user = tally(&docs, false);
+    let mut tools: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    for s in &sess {
+        fold_spend(&mut by_repo, &s.repo, s.tok_out, s.tools as u64);
+        let who = if s.author.is_empty() { local_actor.as_str() } else { s.author.as_str() };
+        fold_spend(&mut by_user, who, s.tok_out, s.tools as u64);
+        for (name, calls, errs) in &s.tools_by_name {
+            let e = tools.entry(name.clone()).or_default();
+            e.0 += *calls as u64;
+            e.1 += *errs as u64;
+        }
+    }
+    let mut by_tool: Vec<(String, u64, u64)> = tools.into_iter().map(|(n, (c, e))| (n, c, e)).collect();
+    by_tool.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     Ok(Status {
         docs: docs.len(),
         github,
         sessions,
         by_kind: counts(docs.iter().map(|d| d.meta.kind.clone())),
-        by_repo: tally(&docs, true),
-        by_user: tally(&docs, false),
+        by_repo,
+        by_user,
+        by_tool,
         newest_ts: docs.iter().map(|d| d.meta.ts.as_str()).max().unwrap_or("").split('T').next().unwrap_or("").to_string(),
         last_indexed: readmodel::last_updated().map(fmt_time),
         last_tracked: mtime_str(".synty/cursors.json"),
         autostart: crate::track::autostart_enabled(),
         stale: stale_note().is_some(),
     })
+}
+
+/// Add a session's token/tool spend to its facet row, creating the row when
+/// the facet has no docs yet (an all-session repo or account still counts).
+fn fold_spend(rows: &mut Vec<Tally>, name: &str, tok_out: u64, tools: u64) {
+    if name.is_empty() {
+        return;
+    }
+    match rows.iter_mut().find(|t| t.name == name) {
+        Some(t) => {
+            t.tok_out += tok_out;
+            t.tools += tools;
+        }
+        None => rows.push(Tally { name: name.into(), docs: 0, github: 0, sessions: 0, tok_out, tools }),
+    }
 }
 
 /// A warning when tracked events are newer than the index — surfaces stale
@@ -174,13 +216,27 @@ pub fn status_md(s: &Status) -> String {
         }
     }
     let block = |o: &mut String, label: &str, rows: &[Tally]| {
-        o.push_str(&format!("\n\n{label} (sessions · github · docs):\n"));
+        o.push_str(&format!("\n\n{label} (sessions · github · docs · tok-out · tools):\n"));
         for f in rows.iter().take(12) {
-            o.push_str(&format!("  {:<24} {:>4} {:>5} {:>6}\n", f.name, f.sessions, f.github, f.docs));
+            o.push_str(&format!(
+                "  {:<24} {:>4} {:>5} {:>6} {:>8} {:>6}\n",
+                f.name,
+                f.sessions,
+                f.github,
+                f.docs,
+                fmt_tokens(f.tok_out),
+                fmt_tokens(f.tools),
+            ));
         }
     };
     block(&mut o, "repos", &s.by_repo);
     block(&mut o, "accounts", &s.by_user);
+    if !s.by_tool.is_empty() {
+        o.push_str("\n\ntools (calls · errors):\n");
+        for (name, calls, errs) in s.by_tool.iter().take(16) {
+            o.push_str(&format!("  {:<24} {:>6} {:>6}\n", name, calls, errs));
+        }
+    }
     o
 }
 
@@ -294,7 +350,7 @@ pub fn tools_line(s: &crate::units::Session) -> Option<String> {
     if s.tools_by_name.is_empty() {
         return None;
     }
-    let shown: Vec<String> = s.tools_by_name.iter().take(6).map(|(n, c)| format!("{n}×{c}")).collect();
+    let shown: Vec<String> = s.tools_by_name.iter().take(6).map(|(n, c, _)| format!("{n}×{c}")).collect();
     let mut o = format!("tools: {}", shown.join(" · "));
     if s.tools_by_name.len() > 6 {
         o.push_str(&format!(" (+{} more)", s.tools_by_name.len() - 6));
@@ -335,7 +391,7 @@ fn tally(docs: &[Doc], by_repo: bool) -> Vec<Tally> {
     }
     let mut v: Vec<Tally> = m
         .into_iter()
-        .map(|(name, (docs, github, s))| Tally { name: name.to_string(), docs, github, sessions: s.len() })
+        .map(|(name, (docs, github, s))| Tally { name: name.to_string(), docs, github, sessions: s.len(), tok_out: 0, tools: 0 })
         .collect();
     v.sort_by(|a, b| b.docs.cmp(&a.docs).then(a.name.cmp(&b.name)));
     v
@@ -421,7 +477,7 @@ mod tests {
     fn tools_line_caps_and_counts_errors() {
         assert_eq!(tools_line(&session()), None);
         let mut s = session();
-        s.tools_by_name = (0..8).map(|i| (format!("T{i}"), 8 - i)).collect();
+        s.tools_by_name = (0..8).map(|i| (format!("T{i}"), 8 - i, 0)).collect();
         s.tool_err = 2;
         let line = tools_line(&s).unwrap();
         assert!(line.starts_with("tools: T0×8"));

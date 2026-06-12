@@ -36,7 +36,7 @@ pub struct Session {
     pub cache_read: u64,
     pub cache_create: u64,
     pub usage_turns: usize, // deduped API turns (0 for codex's cumulative path)
-    pub tools_by_name: Vec<(String, usize)>, // count desc, then name
+    pub tools_by_name: Vec<(String, usize, usize)>, // (name, calls, attributed errors), calls desc
     pub tool_err: usize,
     pub summary: Option<String>, // abstractive one-liner (local LLM), if cached
     /// The actor the tracker stamped on session_start; empty for sessions
@@ -181,6 +181,8 @@ struct Agg {
     seen_msgs: std::collections::HashSet<String>, // streamed lines repeat usage per msg_id
     tool_counts: HashMap<String, usize>,
     tool_err: usize,
+    tool_pending: HashMap<String, String>, // call id → tool name, for error attribution
+    tool_errs: HashMap<String, usize>, // per-name errors (Claude only: codex results carry no error flag)
     /// Codex reports cumulative (input_total, cached, output) snapshots; the
     /// last one is the session total. Kept raw here, normalized in sessions().
     codex_usage: Option<(u64, u64, u64)>,
@@ -247,11 +249,20 @@ fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut s
             a.tools += 1;
             if let Some(name) = ev["payload"]["name"].as_str().filter(|n| !n.is_empty()) {
                 *a.tool_counts.entry(name.to_string()).or_default() += 1;
+                // Both id schemes: Claude's tool_use_id, codex's call_id.
+                let id = ev["payload"]["tool_use_id"].as_str().or_else(|| ev["payload"]["call_id"].as_str());
+                if let Some(id) = id.filter(|i| !i.is_empty()) {
+                    a.tool_pending.insert(id.to_string(), name.to_string());
+                }
             }
         }
         "tool_result" => {
             if ev["payload"]["is_error"].as_bool().unwrap_or(false) {
                 a.tool_err += 1;
+                let id = ev["payload"]["tool_use_id"].as_str().or_else(|| ev["payload"]["call_id"].as_str());
+                if let Some(name) = id.and_then(|i| a.tool_pending.get(i)).cloned() {
+                    *a.tool_errs.entry(name).or_default() += 1;
+                }
             }
         }
         "attachment_ref" => {
@@ -465,7 +476,11 @@ pub fn sessions() -> Result<Vec<Session>> {
                 Some((input, cached, output)) => (input.saturating_sub(cached), output, cached, 0),
                 None => (a.tok_in, a.tok_out, a.cache_read, a.cache_create),
             };
-            let mut tools_by_name: Vec<(String, usize)> = a.tool_counts.clone().into_iter().collect();
+            let mut tools_by_name: Vec<(String, usize, usize)> = a
+                .tool_counts
+                .iter()
+                .map(|(n, c)| (n.clone(), *c, a.tool_errs.get(n).copied().unwrap_or(0)))
+                .collect();
             tools_by_name.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
             Session {
                 id: id.clone(),
@@ -1086,6 +1101,7 @@ mod tests {
         let a = &aggs_of(&lines)["S"];
         assert_eq!(a.tool_counts["Bash"], 2);
         assert_eq!(a.tool_err, 1);
+        assert_eq!(a.tool_errs["Bash"], 1, "the error is attributed to its tool by id");
         assert_eq!(a.tools, 2);
     }
 
@@ -1127,7 +1143,7 @@ mod tests {
             cache_read: 0,
             cache_create: 0,
             usage_turns: 0,
-            tools_by_name: vec![("Bash".into(), 2)],
+            tools_by_name: vec![("Bash".into(), 2, 0)],
             tool_err: 0,
             summary: None,
             author: String::new(),

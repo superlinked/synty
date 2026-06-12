@@ -168,6 +168,7 @@ impl Bundle {
             by_kind: vec![],
             by_repo: vec![],
             by_user: vec![],
+            by_tool: vec![],
             newest_ts: String::new(),
             last_indexed: None,
             last_tracked: None,
@@ -1221,9 +1222,11 @@ impl App {
                 .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" tokens & tools · 4 weeks ")),
             stats,
         );
-        let [rcol, ucol] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(cols);
+        let [rcol, ucol, tcol] =
+            Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(34), Constraint::Percentage(28)]).areas(cols);
         f.render_widget(facet_table("Repos", &self.status.by_repo), rcol);
         f.render_widget(facet_table("Accounts", &self.status.by_user), ucol);
+        f.render_widget(tools_table(&self.status.by_tool), tcol);
     }
 
     /// The stats panel: one day-strip row per metric over the last four
@@ -1390,12 +1393,47 @@ fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
                 num(t.sessions, theme::SESSION),
                 num(t.github, theme::GITHUB),
                 Cell::from(t.docs.to_string()).style(dim),
+                if t.tok_out == 0 {
+                    Cell::from("·").style(dim)
+                } else {
+                    Cell::from(crate::view::fmt_tokens(t.tok_out)).style(Style::new().fg(theme::FG))
+                },
+                if t.tools == 0 {
+                    Cell::from("·").style(dim)
+                } else {
+                    Cell::from(crate::view::fmt_tokens(t.tools)).style(dim)
+                },
             ])
         })
         .collect();
-    Table::new(body, [Constraint::Min(8), Constraint::Length(5), Constraint::Length(5), Constraint::Length(6)])
-        .header(Row::new(["", "SESS", "GH", "DOCS"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
+    Table::new(body, [Constraint::Min(8), Constraint::Length(5), Constraint::Length(5), Constraint::Length(6), Constraint::Length(7), Constraint::Length(6)])
+        .header(Row::new(["", "SESS", "GH", "DOCS", "TOK", "TOOLS"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
         .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" {title} ({}) ", rows.len())))
+}
+
+/// The fleet-wide tool mix: which tools the sessions actually call, how
+/// often, and how many calls errored (error attribution is per-name where the
+/// source reports it — Claude's tool_result.is_error; codex reports none).
+fn tools_table(rows: &[(String, u64, u64)]) -> Table<'static> {
+    let dim = Style::new().fg(theme::DIM);
+    let body: Vec<Row> = rows
+        .iter()
+        .take(14)
+        .map(|(name, calls, errs)| {
+            Row::new(vec![
+                Cell::from(name.clone()).style(Style::new().fg(theme::FG)),
+                Cell::from(crate::view::fmt_tokens(*calls)).style(Style::new().fg(theme::SESSION)),
+                if *errs == 0 {
+                    Cell::from("·").style(dim)
+                } else {
+                    Cell::from(errs.to_string()).style(Style::new().fg(theme::ACCENT))
+                },
+            ])
+        })
+        .collect();
+    Table::new(body, [Constraint::Min(8), Constraint::Length(6), Constraint::Length(5)])
+        .header(Row::new(["", "CALLS", "ERR"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
+        .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" Tools ({}) ", rows.len())))
 }
 
 /// (primary, secondary) text for a unit row: the one-line summary on top when
@@ -1643,7 +1681,7 @@ mod tests {
             cache_read: 310_000,
             cache_create: 12_000,
             usage_turns: 7,
-            tools_by_name: vec![("Bash".into(), 5), ("Edit".into(), 3)],
+            tools_by_name: vec![("Bash".into(), 5, 1), ("Edit".into(), 3, 0)],
             tool_err: 1,
             summary: Some("Added an OCR adapter to the sie pipeline.".into()),
             author: String::new(),
@@ -1661,7 +1699,7 @@ mod tests {
             sessions: vec![session],
             work,
             topics,
-            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false },
+            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![("Bash".into(), 5, 1), ("Edit".into(), 3, 0)], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false },
             view: View::Topics,
             sel: 0,
             drill_topic: None,
@@ -1952,6 +1990,11 @@ mod tests {
         assert!(text.contains("tokens & tools"), "stats panel missing: {text}");
         assert!(text.contains("tok out") && text.contains("cache r") && text.contains("sessions"), "metric rows missing");
         assert!(text.contains("20.9k"), "window total missing: {text}");
+        // segmentation: repo rows carry token/tool spend, and the fleet-wide
+        // tool mix names the tools with per-name error counts.
+        assert!(text.contains("TOK") && text.contains("TOOLS"), "facet spend columns missing: {text}");
+        assert!(text.contains("18.9k"), "repo token spend missing");
+        assert!(text.contains("Tools (2)") && text.contains("CALLS") && text.contains("Bash"), "tools table missing: {text}");
     }
 
     // The facet bar has a Repos row over an Accounts row, and inverts the active.

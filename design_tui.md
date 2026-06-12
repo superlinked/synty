@@ -111,7 +111,8 @@ search is instant.
   panel tracks the four token classes, tool calls, and active sessions per day
   over the last four Mon-aligned weeks (same strips as the Topics activity
   column, each row shaded against its own peak), above the repo/account
-  breakdowns.
+  breakdowns — which carry TOK/TOOLS spend columns — and a Tools table naming
+  every tool with calls and per-name error counts.
 
 ### Unit detail (the drill target)
 
