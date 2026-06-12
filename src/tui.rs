@@ -1452,10 +1452,11 @@ impl App {
     }
 
     /// How many whole Mon-aligned weeks fit one chart of `width`: braille
-    /// packs two days per column, minus the y-axis gutter.
+    /// packs two days per column, minus the y-axis gutter. Capped at a
+    /// quarter — beyond ~3 months the daily lines compress into noise.
     fn stats_weeks(width: u16) -> usize {
         let avail = (width as usize).saturating_sub(12);
-        (avail * 2 / 7).clamp(4, 26)
+        (avail * 2 / 7).clamp(4, 13)
     }
 
     /// The Status header: totals, freshness, the autostart toggle state, and the
