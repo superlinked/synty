@@ -1269,10 +1269,13 @@ impl App {
         // x-axis visually, so spend (top) reads straight against what it
         // produced (bottom).
         let [agents, output] = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
-        const AGENT_HUES: [Color; 4] = [theme::ACCENT, theme::GITHUB, theme::SAGE, theme::MERGED];
-        const OUTPUT_HUES: [Color; 4] = [theme::GITHUB, theme::MERGED, theme::SAGE, theme::CLOSED];
-        self.draw_series_chart(f, agents, weeks, &self.cache.chart_agent, &AGENT_HUES);
-        self.draw_series_chart(f, output, weeks, &self.cache.chart_output, &OUTPUT_HUES);
+        // One palette, applied positionally to both charts, so the two read
+        // as one visual system. The output chart's axis tops out at 1M —
+        // a blob-migration PR's 3.5M-line day flat-tops instead of crushing
+        // the scale for everything else.
+        const HUES: [Color; 4] = [theme::ACCENT, theme::GITHUB, theme::SAGE, theme::MERGED];
+        self.draw_series_chart(f, agents, weeks, &self.cache.chart_agent, &HUES, None);
+        self.draw_series_chart(f, output, weeks, &self.cache.chart_output, &HUES, Some(6.0));
         let [upper, lower] = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(cols);
         let [rcol, ucol] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(upper);
         f.render_widget(facet_table("Repos", &self.status.by_repo), rcol);
@@ -1376,6 +1379,7 @@ impl App {
         weeks: usize,
         rows: &[(&'static str, HashMap<i32, u64>)],
         hues: &[Color],
+        y_cap: Option<f64>,
     ) {
         let c = &self.cache;
         if c.stats_gmax == 0 || area.height < 3 {
@@ -1383,25 +1387,39 @@ impl App {
         }
         let start = week_start_for(c.stats_gmax, weeks);
         let n_days = (weeks * 7) as i32;
-        // (series points, name); data must outlive the chart.
-        let mut series: Vec<(Vec<(f64, f64)>, String)> = Vec::new();
+        // (points, name, hue, window total); data must outlive the chart.
+        // Hues bind to the series, not the draw order.
+        let mut series: Vec<(Vec<(f64, f64)>, String, Color, u64)> = Vec::new();
         let mut top = 0u64;
-        for (name, map) in rows {
+        for ((name, map), hue) in rows.iter().zip(hues.iter()) {
             let mut pts = Vec::with_capacity(n_days as usize);
+            let mut total = 0u64;
             for d in 0..n_days {
                 let v = map.get(&(start + d)).copied().unwrap_or(0);
+                total += v;
                 top = top.max(v);
                 pts.push((d as f64, if v == 0 { 0.0 } else { (v as f64).log10() }));
             }
-            series.push((pts, name.to_string()));
+            series.push((pts, name.to_string(), *hue, total));
         }
         // Bounds snapped to a multiple of 3 so the evenly-spaced labels land
-        // exactly on 1 / 1k / 1M / 1B.
-        let y_max = (((top.max(10) as f64).log10()).ceil() / 3.0).ceil() * 3.0;
+        // exactly on 1 / 1k / 1M / 1B; an optional cap flat-tops outliers
+        // (clamped points) instead of crushing the scale for everything else.
+        let mut y_max = (((top.max(10) as f64).log10()).ceil() / 3.0).ceil() * 3.0;
+        if let Some(cap) = y_cap {
+            y_max = y_max.min(cap);
+        }
+        for (pts, _, _, _) in &mut series {
+            for p in pts.iter_mut() {
+                p.1 = p.1.min(y_max);
+            }
+        }
+        // Draw the big curves first so the small ones layer on top and stay
+        // visible where they overlap.
+        series.sort_by(|a, b| b.3.cmp(&a.3));
         let datasets: Vec<Dataset> = series
             .iter()
-            .zip(hues.iter())
-            .map(|((pts, name), color)| {
+            .map(|(pts, name, color, _)| {
                 Dataset::default()
                     .name(name.clone())
                     .marker(Marker::Braille)
