@@ -331,10 +331,10 @@ impl ViewCache {
             ("sessions", fold_stat(|s| s.sessions)),
         ];
         let chart_output: Vec<(&'static str, HashMap<i32, u64>)> = vec![
-            ("prs", fold_kind(Kind::Pr)),
-            ("issues", fold_kind(Kind::Issue)),
             ("loc+", fold_loc(false)),
             ("loc-", fold_loc(true)),
+            ("prs", fold_kind(Kind::Pr)),
+            ("issues", fold_kind(Kind::Issue)),
         ];
 
         Self {
