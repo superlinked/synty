@@ -1252,20 +1252,23 @@ impl App {
     /// sessions per repo and per account.
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let [head, stats, cols] =
-            Layout::vertical([Constraint::Length(6), Constraint::Length(17), Constraint::Min(0)]).areas(area);
+            Layout::vertical([Constraint::Length(6), Constraint::Length(18), Constraint::Min(0)]).areas(area);
         f.render_widget(
             Paragraph::new(self.status_head())
                 .wrap(Wrap { trim: false })
                 .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" synty ")),
             head,
         );
-        let weeks = Self::stats_weeks(stats.width.saturating_sub(2) / 2);
+        let weeks = Self::stats_weeks(stats.width.saturating_sub(2));
         let block = Block::bordered()
             .border_style(Style::new().fg(theme::BORDER))
             .title(format!(" agents · output · {weeks} weeks "));
         let inner = block.inner(stats);
         f.render_widget(block, stats);
-        let [agents, output] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
+        // Stacked, not side-by-side: two narrow full-width charts share the
+        // x-axis visually, so spend (top) reads straight against what it
+        // produced (bottom).
+        let [agents, output] = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
         const AGENT_HUES: [Color; 4] = [theme::ACCENT, theme::GITHUB, theme::SAGE, theme::MERGED];
         const OUTPUT_HUES: [Color; 4] = [theme::GITHUB, theme::MERGED, theme::SAGE, theme::CLOSED];
         self.draw_series_chart(f, agents, weeks, &self.cache.chart_agent, &AGENT_HUES);
