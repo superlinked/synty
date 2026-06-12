@@ -1354,11 +1354,13 @@ impl App {
         }
         let start = week_start_for(c.stats_gmax, weeks);
         let n_days = (weeks * 7) as i32;
+        // Four maximally-separated brand hues — line identity is carried by
+        // color alone, and the muted table palette blended on a dark plot.
         const CLASSES: [(&str, Color); 4] = [
-            ("out", theme::SESSION),
-            ("in", theme::FG),
-            ("cache-r", theme::GITHUB),
-            ("cache-w", theme::DIM),
+            ("out", theme::ACCENT),     // coral — the headline cost
+            ("in", theme::SAGE),        // green
+            ("cache-r", theme::GITHUB), // sky — the big flow
+            ("cache-w", theme::MERGED), // violet
         ];
         // (series points, legend name) per class; data must outlive the chart.
         let mut series: Vec<(Vec<(f64, f64)>, String)> = Vec::new();
