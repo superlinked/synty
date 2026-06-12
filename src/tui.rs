@@ -1521,10 +1521,11 @@ fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
                 Cell::from(t.name.clone()).style(Style::new().fg(theme::FG)),
                 Cell::from(t.agent.clone()).style(dim),
                 Cell::from(crate::view::fmt_tokens(t.calls)).style(Style::new().fg(theme::SESSION)),
+                // plain foreground: accent/red is the selection language here
                 if t.errs == 0 {
                     Cell::from("·").style(dim)
                 } else {
-                    Cell::from(t.errs.to_string()).style(Style::new().fg(theme::ACCENT))
+                    Cell::from(t.errs.to_string()).style(Style::new().fg(theme::FG))
                 },
                 if t.chars == 0 {
                     Cell::from("·").style(dim)
@@ -1534,7 +1535,7 @@ fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
             ])
         })
         .collect();
-    Table::new(body, [Constraint::Min(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(5), Constraint::Length(7)])
+    Table::new(body, [Constraint::Min(8), Constraint::Length(14), Constraint::Length(6), Constraint::Length(5), Constraint::Length(7)])
         .header(Row::new(["", "AGENT", "CALLS", "ERR", "~TOK"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
         .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌")

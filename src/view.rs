@@ -47,7 +47,8 @@ pub struct Status {
     pub by_kind: Vec<(String, usize)>,
     pub by_repo: Vec<Tally>,
     pub by_user: Vec<Tally>,
-    /// Fleet-wide tool mix, calls desc.
+    /// Fleet-wide tool mix, estimated context (~tok) desc — the expensive
+    /// tools first, which is the question the table answers.
     pub by_tool: Vec<ToolTally>,
     /// Fleet-wide per-model token split, out tokens desc.
     pub by_model: Vec<crate::units::ModelUsage>,
@@ -112,7 +113,7 @@ pub fn status() -> Result<Status> {
             chars,
         })
         .collect();
-    by_tool.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.name.cmp(&b.name)));
+    by_tool.sort_by(|a, b| b.chars.cmp(&a.chars).then(b.calls.cmp(&a.calls)).then(a.name.cmp(&b.name)));
     let mut by_model: Vec<crate::units::ModelUsage> = models.into_values().collect();
     by_model.sort_by(|a, b| b.tok_out.cmp(&a.tok_out).then(a.model.cmp(&b.model)));
     Ok(Status {
