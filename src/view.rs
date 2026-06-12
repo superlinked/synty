@@ -265,14 +265,14 @@ pub fn status_md(s: &Status) -> String {
         }
     }
     let block = |o: &mut String, label: &str, rows: &[Tally]| {
-        o.push_str(&format!("\n\n{label} (sessions · github · docs · tok-out · tools):\n"));
+        o.push_str(&format!("\n\n{label} (docs · sessions · github · tok-out · tools):\n"));
         for f in rows.iter().take(12) {
             o.push_str(&format!(
-                "  {:<24} {:>4} {:>5} {:>6} {:>8} {:>6}\n",
+                "  {:<24} {:>6} {:>4} {:>5} {:>8} {:>6}\n",
                 f.name,
+                f.docs,
                 f.sessions,
                 f.github,
-                f.docs,
                 fmt_tokens(f.tok_out),
                 fmt_tokens(f.tools),
             ));
@@ -295,15 +295,15 @@ pub fn status_md(s: &Status) -> String {
         }
     }
     if !s.by_tool.is_empty() {
-        o.push_str("\n\ntools (agent · calls · errors · ~tok):\n");
+        o.push_str("\n\ntools (~tok · calls · errors · agent):\n");
         for t in s.by_tool.iter().take(16) {
             o.push_str(&format!(
-                "  {:<24} {:<8} {:>6} {:>6} {:>8}\n",
+                "  {:<24} {:>8} {:>6} {:>6}  {}\n",
                 t.name,
-                t.agent,
+                format!("~{}", fmt_tokens(t.est_tokens())),
                 t.calls,
                 t.errs,
-                format!("~{}", fmt_tokens(t.est_tokens())),
+                t.agent,
             ));
         }
     }

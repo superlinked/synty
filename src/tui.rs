@@ -1474,6 +1474,8 @@ fn styled_names(names: &[String], active: Option<&str>, base: Color, max: usize)
 
 /// A Status breakdown table: name + sessions/github/docs columns, a dim "·" for
 /// zeros so the meaningful counts stand out. Rows arrive pre-sorted (most docs).
+// Status-table convention: the first numeric column is the sort key — Repos
+// and Accounts sort by DOCS, Tools by ~TOK, Models by OUT.
 fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
     let dim = Style::new().fg(theme::DIM);
     let num = |n: usize, c: Color| {
@@ -1488,9 +1490,9 @@ fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
         .map(|t| {
             Row::new(vec![
                 Cell::from(t.name.clone()).style(Style::new().fg(theme::FG)),
+                Cell::from(t.docs.to_string()).style(dim),
                 num(t.sessions, theme::SESSION),
                 num(t.github, theme::GITHUB),
-                Cell::from(t.docs.to_string()).style(dim),
                 if t.tok_out == 0 {
                     Cell::from("·").style(dim)
                 } else {
@@ -1504,8 +1506,8 @@ fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
             ])
         })
         .collect();
-    Table::new(body, [Constraint::Min(8), Constraint::Length(5), Constraint::Length(5), Constraint::Length(6), Constraint::Length(7), Constraint::Length(6)])
-        .header(Row::new(["", "SESS", "GH", "DOCS", "TOK", "TOOLS"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
+    Table::new(body, [Constraint::Min(8), Constraint::Length(6), Constraint::Length(5), Constraint::Length(5), Constraint::Length(7), Constraint::Length(6)])
+        .header(Row::new(["", "DOCS", "SESS", "GH", "TOK", "TOOLS"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
         .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" {title} ({}) ", rows.len())))
 }
 
@@ -1519,7 +1521,11 @@ fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
         .map(|t| {
             Row::new(vec![
                 Cell::from(t.name.clone()).style(Style::new().fg(theme::FG)),
-                Cell::from(t.agent.clone()).style(dim),
+                if t.chars == 0 {
+                    Cell::from("·").style(dim)
+                } else {
+                    Cell::from(format!("~{}", crate::view::fmt_tokens(t.est_tokens()))).style(Style::new().fg(theme::FG))
+                },
                 Cell::from(crate::view::fmt_tokens(t.calls)).style(Style::new().fg(theme::SESSION)),
                 // plain foreground: accent/red is the selection language here
                 if t.errs == 0 {
@@ -1527,16 +1533,12 @@ fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
                 } else {
                     Cell::from(t.errs.to_string()).style(Style::new().fg(theme::FG))
                 },
-                if t.chars == 0 {
-                    Cell::from("·").style(dim)
-                } else {
-                    Cell::from(format!("~{}", crate::view::fmt_tokens(t.est_tokens()))).style(Style::new().fg(theme::FG))
-                },
+                Cell::from(t.agent.clone()).style(dim),
             ])
         })
         .collect();
-    Table::new(body, [Constraint::Min(8), Constraint::Length(14), Constraint::Length(6), Constraint::Length(5), Constraint::Length(7)])
-        .header(Row::new(["", "AGENT", "CALLS", "ERR", "~TOK"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
+    Table::new(body, [Constraint::Min(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(5), Constraint::Length(14)])
+        .header(Row::new(["", "~TOK", "CALLS", "ERR", "AGENT"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
         .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌")
         .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" Tools ({}) · Enter inspects ", rows.len())))
