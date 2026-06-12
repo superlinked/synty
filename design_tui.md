@@ -111,8 +111,12 @@ search is instant.
   panel tracks the four token classes, tool calls, and active sessions per day
   over the last four Mon-aligned weeks (same strips as the Topics activity
   column, each row shaded against its own peak), above the repo/account
-  breakdowns — which carry TOK/TOOLS spend columns — and a Tools table naming
-  every tool with calls and per-name error counts.
+  breakdowns — which carry TOK/TOOLS spend columns — a Models table splitting
+  the spend per model, and a selectable Tools table (agent · calls · errors);
+  Enter on a tool opens its profile overlay: volume, call→result latency
+  p50/p95, the day strip, argument-key shares with common values for the
+  enum-ish keys, and the most recent invocations. The autostart toggle uses
+  the keycap convention (autostart[a]).
 
 ### Unit detail (the drill target)
 

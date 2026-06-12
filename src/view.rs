@@ -20,6 +20,15 @@ pub struct Tally {
     pub tools: u64,
 }
 
+/// One tool's fleet-wide tally: which agent calls it, how often, how many
+/// calls errored (attributed where the source reports errors).
+pub struct ToolTally {
+    pub name: String,
+    pub agent: String,
+    pub calls: u64,
+    pub errs: u64,
+}
+
 pub struct Status {
     pub docs: usize,
     pub github: usize,
@@ -27,8 +36,10 @@ pub struct Status {
     pub by_kind: Vec<(String, usize)>,
     pub by_repo: Vec<Tally>,
     pub by_user: Vec<Tally>,
-    /// Fleet-wide tool mix: (name, calls, attributed errors), calls desc.
-    pub by_tool: Vec<(String, u64, u64)>,
+    /// Fleet-wide tool mix, calls desc.
+    pub by_tool: Vec<ToolTally>,
+    /// Fleet-wide per-model token split, out tokens desc.
+    pub by_model: Vec<crate::units::ModelUsage>,
     pub newest_ts: String,
     pub last_indexed: Option<String>,
     pub last_tracked: Option<String>,
@@ -55,19 +66,42 @@ pub fn status() -> Result<Status> {
     let local_actor = crate::identity::actor();
     let mut by_repo = tally(&docs, true);
     let mut by_user = tally(&docs, false);
-    let mut tools: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    let mut tools: std::collections::HashMap<String, (std::collections::BTreeSet<String>, u64, u64)> =
+        std::collections::HashMap::new();
+    let mut models: std::collections::HashMap<String, crate::units::ModelUsage> = std::collections::HashMap::new();
     for s in &sess {
         fold_spend(&mut by_repo, &s.repo, s.tok_out, s.tools as u64);
         let who = if s.author.is_empty() { local_actor.as_str() } else { s.author.as_str() };
         fold_spend(&mut by_user, who, s.tok_out, s.tools as u64);
+        let agent = crate::units::agent_label(&s.source).to_string();
         for (name, calls, errs) in &s.tools_by_name {
             let e = tools.entry(name.clone()).or_default();
-            e.0 += *calls as u64;
-            e.1 += *errs as u64;
+            e.0.insert(agent.clone());
+            e.1 += *calls as u64;
+            e.2 += *errs as u64;
+        }
+        for mu in &s.by_model {
+            let m = models.entry(mu.model.clone()).or_default();
+            m.model = mu.model.clone();
+            m.tok_in += mu.tok_in;
+            m.tok_out += mu.tok_out;
+            m.cache_read += mu.cache_read;
+            m.cache_create += mu.cache_create;
+            m.turns += mu.turns;
         }
     }
-    let mut by_tool: Vec<(String, u64, u64)> = tools.into_iter().map(|(n, (c, e))| (n, c, e)).collect();
-    by_tool.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut by_tool: Vec<ToolTally> = tools
+        .into_iter()
+        .map(|(name, (agents, calls, errs))| ToolTally {
+            name,
+            agent: agents.into_iter().collect::<Vec<_>>().join("+"),
+            calls,
+            errs,
+        })
+        .collect();
+    by_tool.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.name.cmp(&b.name)));
+    let mut by_model: Vec<crate::units::ModelUsage> = models.into_values().collect();
+    by_model.sort_by(|a, b| b.tok_out.cmp(&a.tok_out).then(a.model.cmp(&b.model)));
     Ok(Status {
         docs: docs.len(),
         github,
@@ -76,6 +110,7 @@ pub fn status() -> Result<Status> {
         by_repo,
         by_user,
         by_tool,
+        by_model,
         newest_ts: docs.iter().map(|d| d.meta.ts.as_str()).max().unwrap_or("").split('T').next().unwrap_or("").to_string(),
         last_indexed: readmodel::last_updated().map(fmt_time),
         last_tracked: mtime_str(".synty/cursors.json"),
@@ -231,10 +266,24 @@ pub fn status_md(s: &Status) -> String {
     };
     block(&mut o, "repos", &s.by_repo);
     block(&mut o, "accounts", &s.by_user);
+    if !s.by_model.is_empty() {
+        o.push_str("\n\nmodels (out · in · cache-r · cache-w · turns):\n");
+        for m in s.by_model.iter().take(8) {
+            o.push_str(&format!(
+                "  {:<28} {:>7} {:>7} {:>7} {:>7} {:>6}\n",
+                m.model,
+                fmt_tokens(m.tok_out),
+                fmt_tokens(m.tok_in),
+                fmt_tokens(m.cache_read),
+                fmt_tokens(m.cache_create),
+                m.turns,
+            ));
+        }
+    }
     if !s.by_tool.is_empty() {
-        o.push_str("\n\ntools (calls · errors):\n");
-        for (name, calls, errs) in s.by_tool.iter().take(16) {
-            o.push_str(&format!("  {:<24} {:>6} {:>6}\n", name, calls, errs));
+        o.push_str("\n\ntools (agent · calls · errors):\n");
+        for t in s.by_tool.iter().take(16) {
+            o.push_str(&format!("  {:<24} {:<8} {:>6} {:>6}\n", t.name, t.agent, t.calls, t.errs));
         }
     }
     o
@@ -445,6 +494,8 @@ mod tests {
             usage_turns: 0,
             tools_by_name: vec![],
             tool_err: 0,
+            by_model: vec![],
+            source: "claude_code".into(),
             summary: None,
             author: String::new(),
         }

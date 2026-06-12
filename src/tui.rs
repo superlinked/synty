@@ -121,6 +121,7 @@ struct App {
     sel: usize,
     drill_topic: Option<usize>, // Topics: viewing a topic's units (index into visible())
     drill_unit: bool,           // Topics, drilled: the selected unit's detail pane is open
+    tool_drill: Option<units::ToolProfile>, // Status: the inspected tool's profile overlay
     filter: Option<Facet>,      // Topics/Work: show only items touching this repo/person
     query: String,
     results: Vec<i64>, // doc ids
@@ -169,6 +170,7 @@ impl Bundle {
             by_repo: vec![],
             by_user: vec![],
             by_tool: vec![],
+            by_model: vec![],
             newest_ts: String::new(),
             last_indexed: None,
             last_tracked: None,
@@ -405,6 +407,7 @@ impl App {
             sel: 0,
             drill_topic: None,
             drill_unit: false,
+            tool_drill: None,
             filter: None,
             query: String::new(),
             results: vec![],
@@ -558,7 +561,7 @@ impl App {
             },
             View::Work => self.visible_work().len(),
             View::Search => self.results.len(),
-            View::Status => 0,
+            View::Status => self.status.by_tool.len(),
         }
     }
 
@@ -688,7 +691,8 @@ impl App {
         }
         match code {
             KeyCode::Char('q') => {
-                if self.drill_unit {
+                if self.tool_drill.take().is_some() {
+                } else if self.drill_unit {
                     self.drill_unit = false;
                 } else if let Some(ti) = self.drill_topic.take() {
                     self.sel = ti; // back to the topic we drilled
@@ -701,7 +705,13 @@ impl App {
             KeyCode::Char('g') => self.sel = 0,
             KeyCode::Char('G') => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.view == View::Topics {
+                if self.view == View::Status {
+                    if self.tool_drill.is_none() {
+                        if let Some(t) = self.status.by_tool.get(self.sel) {
+                            self.tool_drill = Some(units::tool_profile(&t.name));
+                        }
+                    }
+                } else if self.view == View::Topics {
                     if self.drill_topic.is_none() {
                         if !self.visible().is_empty() {
                             self.drill_topic = Some(self.sel);
@@ -715,7 +725,8 @@ impl App {
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.drill_unit {
+                if self.tool_drill.take().is_some() {
+                } else if self.drill_unit {
                     self.drill_unit = false;
                 } else if let Some(ti) = self.drill_topic.take() {
                     self.sel = ti;
@@ -761,6 +772,7 @@ impl App {
         self.sel = 0;
         self.drill_topic = None;
         self.drill_unit = false;
+        self.tool_drill = None;
     }
     fn move_sel(&mut self, d: i32) {
         let n = self.list_len();
@@ -773,7 +785,8 @@ impl App {
     /// then clear the filter, then clear a search query — and quit only when
     /// nothing is left to reset.
     fn reset(&mut self) {
-        if self.drill_unit {
+        if self.tool_drill.take().is_some() {
+        } else if self.drill_unit {
             self.drill_unit = false;
         } else if let Some(ti) = self.drill_topic.take() {
             self.sel = ti;
@@ -1222,11 +1235,93 @@ impl App {
                 .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" tokens & tools · 4 weeks ")),
             stats,
         );
-        let [rcol, ucol, tcol] =
-            Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(34), Constraint::Percentage(28)]).areas(cols);
+        let [upper, lower] = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(cols);
+        let [rcol, ucol] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(upper);
         f.render_widget(facet_table("Repos", &self.status.by_repo), rcol);
         f.render_widget(facet_table("Accounts", &self.status.by_user), ucol);
-        f.render_widget(tools_table(&self.status.by_tool), tcol);
+        let [tcol, mcol] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(lower);
+        let mut ts = TableState::default();
+        if !self.status.by_tool.is_empty() {
+            ts.select(Some(self.sel.min(self.status.by_tool.len() - 1)));
+        }
+        f.render_stateful_widget(tools_table(&self.status.by_tool), tcol, &mut ts);
+        f.render_widget(models_table(&self.status.by_model), mcol);
+        if let Some(p) = &self.tool_drill {
+            self.draw_tool_overlay(f, area, p);
+        }
+    }
+
+    /// The tool drill-down: everything the envelopes hold about one tool —
+    /// volume, latency, the day strip, argument-key frequencies with common
+    /// values for the enum-ish keys, and the most recent invocations.
+    fn draw_tool_overlay(&self, f: &mut Frame, full: Rect, p: &units::ToolProfile) {
+        let area = if full.width < 100 {
+            full
+        } else {
+            let [_, r] = Layout::horizontal([Constraint::Percentage(20), Constraint::Percentage(80)]).areas(full);
+            r
+        };
+        f.render_widget(Clear, area);
+        let block = Block::bordered()
+            .border_style(Style::new().fg(theme::ACCENT))
+            .title(format!(" {} · {} ", p.name, p.agent));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let dim = Style::new().fg(theme::DIM);
+        let fg = Style::new().fg(theme::FG);
+        let mut lines: Vec<Line> = Vec::new();
+        let mut head = format!(
+            "{} calls · {} errors",
+            crate::view::fmt_tokens(p.calls),
+            p.errs,
+        );
+        if p.timed > 0 {
+            head.push_str(&format!(" · result p50 {}ms · p95 {}ms ({} timed)", p.p50_ms, p.p95_ms, p.timed));
+        }
+        if p.input_p95 > 0 {
+            head.push_str(&format!(" · input p50 {} / p95 {} chars", p.input_p50, p.input_p95));
+        }
+        lines.push(Line::from(Span::styled(head, fg)));
+        lines.push(Line::from(""));
+
+        // The 4-week day strip, same visual language as everywhere else.
+        let by_num: Vec<(i32, u64)> = p.days.iter().filter_map(|(d, n)| Some((day_num(d)?, *n))).collect();
+        if let Some(gmax) = by_num.iter().map(|(d, _)| *d).max() {
+            let start = week_start(gmax);
+            let mut days = [0u64; TL_DAYS];
+            for (d, n) in &by_num {
+                let off = d - start;
+                if (0..TL_DAYS as i32).contains(&off) {
+                    days[off as usize] += n;
+                }
+            }
+            let cap = days.iter().copied().max().unwrap_or(0);
+            lines.push(Line::from(Span::styled(week_header(start, gmax), dim)));
+            lines.push(Line::from(strip_spans(&days, cap)));
+            lines.push(Line::from(""));
+        }
+
+        if !p.arg_keys.is_empty() {
+            lines.push(Line::from(Span::styled("args (share of calls):", dim)));
+            for (key, n) in p.arg_keys.iter().take(10) {
+                let pct = 100 * n / p.calls.max(1);
+                let mut spans = vec![Span::styled(format!("  {key:<22} {n:>6} ({pct:>3}%)"), fg)];
+                if let Some((_, tops)) = p.arg_tops.iter().find(|(k, _)| k == key) {
+                    let vals: Vec<String> = tops.iter().map(|(v, c)| format!("{v}×{c}")).collect();
+                    spans.push(Span::styled(format!("  {}", vals.join(" · ")), dim));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(""));
+        }
+        if !p.samples.is_empty() {
+            lines.push(Line::from(Span::styled("recent:", dim)));
+            for s in &p.samples {
+                lines.push(Line::from(Span::styled(format!("  {s}"), dim)));
+            }
+        }
+        f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
     }
 
     /// The stats panel: one day-strip row per metric over the last four
@@ -1298,13 +1393,12 @@ impl App {
                 },
             ]),
             Line::from(vec![
-                Span::styled("autostart  ", dim),
+                Span::styled("autostart[a]  ", dim),
                 if self.autostart {
                     Span::styled("ON", Style::new().fg(theme::SAGE).add_modifier(Modifier::BOLD))
                 } else {
                     Span::styled("OFF", Style::new().fg(theme::CLOSED).add_modifier(Modifier::BOLD))
                 },
-                Span::styled("  ·  press a to toggle the login-time tracker", dim),
             ]),
             kinds,
         ])
@@ -1321,7 +1415,8 @@ impl App {
             _ if self.drill_unit => "↑↓ units · Esc/h close · q quit",
             _ if self.drill_topic.is_some() => "↑↓ units · Enter detail · Esc/h back · q quit",
             View::Topics => "↑↓ move · Enter drill · Esc reset · Tab cycle · q quit",
-            View::Status => "a autostart · Tab cycle · q quit",
+            _ if self.tool_drill.is_some() => "Esc/h close · q quit",
+            View::Status => "↑↓ tools · Enter inspect · a autostart · Tab cycle · q quit",
             View::Work => "↑↓ move · Esc reset · Tab cycle · q quit",
         };
         format!("  {keys}")
@@ -1414,26 +1509,60 @@ fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
 /// The fleet-wide tool mix: which tools the sessions actually call, how
 /// often, and how many calls errored (error attribution is per-name where the
 /// source reports it — Claude's tool_result.is_error; codex reports none).
-fn tools_table(rows: &[(String, u64, u64)]) -> Table<'static> {
+fn tools_table(rows: &[crate::view::ToolTally]) -> Table<'static> {
     let dim = Style::new().fg(theme::DIM);
     let body: Vec<Row> = rows
         .iter()
-        .take(14)
-        .map(|(name, calls, errs)| {
+        .map(|t| {
             Row::new(vec![
-                Cell::from(name.clone()).style(Style::new().fg(theme::FG)),
-                Cell::from(crate::view::fmt_tokens(*calls)).style(Style::new().fg(theme::SESSION)),
-                if *errs == 0 {
+                Cell::from(t.name.clone()).style(Style::new().fg(theme::FG)),
+                Cell::from(t.agent.clone()).style(dim),
+                Cell::from(crate::view::fmt_tokens(t.calls)).style(Style::new().fg(theme::SESSION)),
+                if t.errs == 0 {
                     Cell::from("·").style(dim)
                 } else {
-                    Cell::from(errs.to_string()).style(Style::new().fg(theme::ACCENT))
+                    Cell::from(t.errs.to_string()).style(Style::new().fg(theme::ACCENT))
                 },
             ])
         })
         .collect();
-    Table::new(body, [Constraint::Min(8), Constraint::Length(6), Constraint::Length(5)])
-        .header(Row::new(["", "CALLS", "ERR"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
-        .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" Tools ({}) ", rows.len())))
+    Table::new(body, [Constraint::Min(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(5)])
+        .header(Row::new(["", "AGENT", "CALLS", "ERR"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
+        .row_highlight_style(Style::new().bg(theme::HILITE).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌")
+        .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" Tools ({}) · Enter inspects ", rows.len())))
+}
+
+/// The fleet's token spend per model — the four classes plus deduped turns.
+/// Codex sessions report no model, so their share rides under "codex".
+fn models_table(rows: &[units::ModelUsage]) -> Table<'static> {
+    let dim = Style::new().fg(theme::DIM);
+    let tok = |n: u64| {
+        if n == 0 {
+            Cell::from("·").style(dim)
+        } else {
+            Cell::from(crate::view::fmt_tokens(n)).style(Style::new().fg(theme::FG))
+        }
+    };
+    let body: Vec<Row> = rows
+        .iter()
+        .map(|m| {
+            Row::new(vec![
+                Cell::from(m.model.clone()).style(Style::new().fg(theme::FG)),
+                tok(m.tok_out),
+                tok(m.tok_in),
+                tok(m.cache_read),
+                tok(m.cache_create),
+                if m.turns == 0 { Cell::from("·").style(dim) } else { Cell::from(m.turns.to_string()).style(dim) },
+            ])
+        })
+        .collect();
+    Table::new(
+        body,
+        [Constraint::Min(12), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(6)],
+    )
+    .header(Row::new(["", "OUT", "IN", "CACHE-R", "CACHE-W", "TURNS"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
+    .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" Models ({}) ", rows.len())))
 }
 
 /// (primary, secondary) text for a unit row: the one-line summary on top when
@@ -1683,6 +1812,8 @@ mod tests {
             usage_turns: 7,
             tools_by_name: vec![("Bash".into(), 5, 1), ("Edit".into(), 3, 0)],
             tool_err: 1,
+            by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }],
+            source: "claude_code".into(),
             summary: Some("Added an OCR adapter to the sie pipeline.".into()),
             author: String::new(),
         };
@@ -1699,11 +1830,12 @@ mod tests {
             sessions: vec![session],
             work,
             topics,
-            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![("Bash".into(), 5, 1), ("Edit".into(), 3, 0)], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false },
+            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false },
             view: View::Topics,
             sel: 0,
             drill_topic: None,
             drill_unit: false,
+            tool_drill: None,
             filter: None,
             query: String::new(),
             results: vec![],
@@ -1990,11 +2122,50 @@ mod tests {
         assert!(text.contains("tokens & tools"), "stats panel missing: {text}");
         assert!(text.contains("tok out") && text.contains("cache r") && text.contains("sessions"), "metric rows missing");
         assert!(text.contains("20.9k"), "window total missing: {text}");
-        // segmentation: repo rows carry token/tool spend, and the fleet-wide
-        // tool mix names the tools with per-name error counts.
+        // segmentation: repo rows carry token/tool spend, the fleet-wide tool
+        // mix names tools with their agent, and models get their own table.
         assert!(text.contains("TOK") && text.contains("TOOLS"), "facet spend columns missing: {text}");
         assert!(text.contains("18.9k"), "repo token spend missing");
         assert!(text.contains("Tools (2)") && text.contains("CALLS") && text.contains("Bash"), "tools table missing: {text}");
+        assert!(text.contains("AGENT") && text.contains("claude"), "tools agent column missing: {text}");
+        assert!(text.contains("Models (1)") && text.contains("claude-fable-5") && text.contains("CACHE-R"), "models table missing: {text}");
+        // the toggle uses the keycap convention, not an explanation sentence.
+        assert!(text.contains("autostart[a]"), "autostart keycap hint missing: {text}");
+        assert!(!text.contains("press a to toggle"), "explanation sentence should be gone");
+    }
+
+    // Enter on a Status tool opens its profile overlay — argument-key shares,
+    // common values, latency — and Esc peels it like every other drill.
+    #[test]
+    fn tool_drill_overlay_renders_profile() {
+        let mut term = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        let mut a = app();
+        a.view = View::Status;
+        a.tool_drill = Some(units::ToolProfile {
+            name: "Bash".into(),
+            agent: "claude".into(),
+            calls: 3665,
+            errs: 106,
+            days: [("2026-05-31".to_string(), 12u64)].into_iter().collect(),
+            arg_keys: vec![("command".into(), 3665), ("run_in_background".into(), 3665), ("timeout".into(), 420)],
+            arg_tops: vec![("run_in_background".into(), vec![("false".into(), 3600), ("true".into(), 65)])],
+            p50_ms: 740,
+            p95_ms: 12_400,
+            timed: 3600,
+            input_p50: 180,
+            input_p95: 900,
+            samples: vec![r#"{"command":"cargo test"}"#.into()],
+        });
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Bash · claude"), "overlay title missing: {text}");
+        assert!(text.contains("3.7k calls") && text.contains("106 errors"), "volume line missing: {text}");
+        assert!(text.contains("p50 740ms"), "latency missing");
+        assert!(text.contains("args (share of calls):") && text.contains("command"), "args section missing");
+        assert!(text.contains("false×3600"), "common values missing");
+        assert!(text.contains("cargo test"), "recent sample missing");
+        a.on_key(KeyCode::Esc);
+        assert!(a.tool_drill.is_none(), "Esc closes the overlay");
     }
 
     // The facet bar has a Repos row over an Accounts row, and inverts the active.

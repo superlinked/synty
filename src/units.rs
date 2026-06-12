@@ -38,6 +38,8 @@ pub struct Session {
     pub usage_turns: usize, // deduped API turns (0 for codex's cumulative path)
     pub tools_by_name: Vec<(String, usize, usize)>, // (name, calls, attributed errors), calls desc
     pub tool_err: usize,
+    pub by_model: Vec<ModelUsage>, // per-model split of the same totals, tok_out desc
+    pub source: String, // envelope source: claude_code | codex_cli | cowork
     pub summary: Option<String>, // abstractive one-liner (local LLM), if cached
     /// The actor the tracker stamped on session_start; empty for sessions
     /// tracked before stamping (callers fall back to the local actor).
@@ -50,6 +52,28 @@ impl Session {
     /// measurement, and cowork (plus pre-capture envelopes) record none.
     pub fn has_usage(&self) -> bool {
         self.usage_turns > 0 || self.tok_in + self.tok_out + self.cache_read + self.cache_create > 0
+    }
+}
+
+/// One model's share of a session's (or the fleet's) token usage. Codex
+/// reports no model on its cumulative snapshots, so its share carries the
+/// agent name instead.
+#[derive(Clone, Default)]
+pub struct ModelUsage {
+    pub model: String,
+    pub tok_in: u64,
+    pub tok_out: u64,
+    pub cache_read: u64,
+    pub cache_create: u64,
+    pub turns: usize,
+}
+
+/// Short agent label from an envelope source ("claude_code" → "claude").
+pub fn agent_label(source: &str) -> &str {
+    match source {
+        "claude_code" => "claude",
+        "codex_cli" => "codex",
+        s => s.split('_').next().unwrap_or(s),
     }
 }
 
@@ -183,6 +207,8 @@ struct Agg {
     tool_err: usize,
     tool_pending: HashMap<String, String>, // call id → tool name, for error attribution
     tool_errs: HashMap<String, usize>, // per-name errors (Claude only: codex results carry no error flag)
+    source: String, // envelope source, first seen wins (a session has one tailer)
+    model_usage: HashMap<String, ModelUsage>, // per-model split, same msg_id dedup
     /// Codex reports cumulative (input_total, cached, output) snapshots; the
     /// last one is the session total. Kept raw here, normalized in sessions().
     codex_usage: Option<(u64, u64, u64)>,
@@ -204,6 +230,11 @@ fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut s
         return;
     }
     let a = aggs.entry(sid.to_string()).or_default();
+    if a.source.is_empty() {
+        if let Some(src) = ev["source"].as_str().filter(|s| !s.is_empty()) {
+            a.source = src.to_string();
+        }
+    }
     let ts = ev["ts"].as_str().unwrap_or("");
     if !ts.is_empty() {
         if a.first.is_empty() || ts < a.first.as_str() {
@@ -290,6 +321,14 @@ fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut s
                         a.cache_read += n("cache_read");
                         a.cache_create += n("cache_create");
                         a.usage_turns += 1;
+                        let model = p["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("?");
+                        let mu = a.model_usage.entry(model.to_string()).or_default();
+                        mu.model = model.to_string();
+                        mu.tok_in += n("in");
+                        mu.tok_out += n("out");
+                        mu.cache_read += n("cache_read");
+                        mu.cache_create += n("cache_create");
+                        mu.turns += 1;
                     }
                 }
                 // Codex: token_count snapshots are CUMULATIVE; one rollout
@@ -431,6 +470,187 @@ pub fn day_stats() -> HashMap<String, DayStat> {
     f.finish()
 }
 
+/// Everything gleanable about one tool across the corpus: call/error volume,
+/// per-day usage, which argument keys appear — and the common values of the
+/// low-cardinality ones — input sizes, and call→result latency where both
+/// sides carry timestamps. Computed on demand for the Status drill-down.
+pub struct ToolProfile {
+    pub name: String,
+    pub agent: String, // "claude" / "codex" / … / "a+b" when mixed
+    pub calls: u64,
+    pub errs: u64,
+    pub days: HashMap<String, u64>,
+    pub arg_keys: Vec<(String, u64)>, // key → calls carrying it, desc
+    pub arg_tops: Vec<(String, Vec<(String, u64)>)>, // low-cardinality keys → top values
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub timed: usize, // calls with a paired, timestamped result
+    pub input_p50: usize, // serialized input size, chars
+    pub input_p95: usize,
+    pub samples: Vec<String>, // the most recent invocations, excerpted
+}
+
+/// Beyond this many distinct values a key is free-form (paths, commands), not
+/// an enum — its value breakdown would be noise.
+const ARG_TOP_MAX: usize = 8;
+
+#[derive(Default)]
+struct ToolFold {
+    target: String,
+    seen: std::collections::HashSet<u64>,
+    agents: std::collections::BTreeSet<String>,
+    calls: u64,
+    errs: u64,
+    days: HashMap<String, u64>,
+    key_counts: HashMap<String, u64>,
+    val_counts: HashMap<String, HashMap<String, u64>>,
+    sizes: Vec<usize>,
+    pending_ts: HashMap<String, i64>, // call id → call ts (ms)
+    durs: Vec<u64>,
+    samples: std::collections::VecDeque<String>,
+}
+
+fn ts_ms(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts).ok().map(|d| d.timestamp_millis())
+}
+
+impl ToolFold {
+    fn fold(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(line) else { return };
+        if !crate::event::first_sighting(&mut self.seen, ev["event_id"].as_str().unwrap_or("")) {
+            return;
+        }
+        let p = &ev["payload"];
+        let id = p["tool_use_id"].as_str().or_else(|| p["call_id"].as_str()).unwrap_or("");
+        match ev["kind"].as_str().unwrap_or("") {
+            "tool_call" if p["name"].as_str() == Some(self.target.as_str()) => {
+                self.calls += 1;
+                if let Some(src) = ev["source"].as_str().filter(|s| !s.is_empty()) {
+                    self.agents.insert(agent_label(src).to_string());
+                }
+                if let Some(day) = ev["ts"].as_str().unwrap_or("").split('T').next().filter(|d| d.len() == 10) {
+                    *self.days.entry(day.to_string()).or_default() += 1;
+                }
+                // The arguments, whichever shape the agent logs: Claude's
+                // input object, codex's JSON-encoded arguments string, or a
+                // web_search action object.
+                let parsed; // keeps the codex parse alive past the borrow
+                let input = if p["input"].is_object() {
+                    &p["input"]
+                } else if let Some(s) = p["arguments"].as_str() {
+                    parsed = serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+                    &parsed
+                } else {
+                    &p["action"]
+                };
+                if let Some(obj) = input.as_object() {
+                    for (k, v) in obj {
+                        *self.key_counts.entry(k.clone()).or_default() += 1;
+                        // Scalars only, and only short ones — long strings are
+                        // free-form content, not categorizable values.
+                        let val = match v {
+                            Value::Bool(b) => Some(b.to_string()),
+                            Value::Number(n) => Some(n.to_string()),
+                            Value::String(s) if s.chars().count() <= 32 => Some(s.clone()),
+                            _ => None,
+                        };
+                        if let Some(val) = val {
+                            let vals = self.val_counts.entry(k.clone()).or_default();
+                            if vals.len() < 64 || vals.contains_key(&val) {
+                                *vals.entry(val).or_default() += 1;
+                            }
+                        }
+                    }
+                    let ser = serde_json::to_string(obj).unwrap_or_default();
+                    self.sizes.push(ser.chars().count());
+                    self.samples.push_back(crate::excerpt(&ser, 110));
+                    if self.samples.len() > 3 {
+                        self.samples.pop_front();
+                    }
+                }
+                if !id.is_empty() {
+                    if let Some(ms) = ts_ms(ev["ts"].as_str().unwrap_or("")) {
+                        self.pending_ts.insert(id.to_string(), ms);
+                    }
+                }
+            }
+            "tool_result" if !id.is_empty() => {
+                if let Some(call_ms) = self.pending_ts.remove(id) {
+                    if let Some(ms) = ts_ms(ev["ts"].as_str().unwrap_or("")) {
+                        self.durs.push(ms.saturating_sub(call_ms).max(0) as u64);
+                    }
+                    if p["is_error"].as_bool().unwrap_or(false) {
+                        self.errs += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(mut self) -> ToolProfile {
+        // Nearest-rank percentile: ceil(p·n)-1, clamped.
+        fn pctl(sorted: &[u64], p: f64) -> u64 {
+            if sorted.is_empty() {
+                return 0;
+            }
+            let rank = (sorted.len() as f64 * p).ceil() as usize;
+            sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+        }
+        let mut arg_keys: Vec<(String, u64)> = self.key_counts.into_iter().collect();
+        arg_keys.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut arg_tops: Vec<(String, Vec<(String, u64)>)> = Vec::new();
+        for (key, _) in &arg_keys {
+            if let Some(vals) = self.val_counts.get(key) {
+                // Enum-ish = few distinct values AND values that repeat; when
+                // every value is unique the key is free-form however few
+                // there are.
+                let repeats = vals.values().sum::<u64>() > vals.len() as u64;
+                if !vals.is_empty() && vals.len() <= ARG_TOP_MAX && repeats {
+                    let mut top: Vec<(String, u64)> = vals.clone().into_iter().collect();
+                    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    top.truncate(3);
+                    arg_tops.push((key.clone(), top));
+                }
+            }
+        }
+        self.durs.sort_unstable();
+        let mut sizes: Vec<u64> = self.sizes.iter().map(|&s| s as u64).collect();
+        sizes.sort_unstable();
+        ToolProfile {
+            name: self.target,
+            agent: self.agents.into_iter().collect::<Vec<_>>().join("+"),
+            calls: self.calls,
+            errs: self.errs,
+            days: self.days,
+            arg_keys,
+            arg_tops,
+            p50_ms: pctl(&self.durs, 0.5),
+            p95_ms: pctl(&self.durs, 0.95),
+            timed: self.durs.len(),
+            input_p50: pctl(&sizes, 0.5) as usize,
+            input_p95: pctl(&sizes, 0.95) as usize,
+            samples: self.samples.into_iter().collect(),
+        }
+    }
+}
+
+/// Profile one tool's use across every tracked session, on demand.
+pub fn tool_profile(name: &str) -> ToolProfile {
+    let mut f = ToolFold { target: name.to_string(), ..Default::default() };
+    for path in jsonl_files(Path::new(LOCAL_DIR)) {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            for line in data.lines() {
+                f.fold(line);
+            }
+        }
+    }
+    f.finish()
+}
+
 /// Aggregate the raw envelopes under corpus/local into per-session tallies.
 fn aggregate() -> HashMap<String, Agg> {
     // The org's repos (from the last back-fill) — fold worktree dirs onto them.
@@ -476,6 +696,13 @@ pub fn sessions() -> Result<Vec<Session>> {
                 Some((input, cached, output)) => (input.saturating_sub(cached), output, cached, 0),
                 None => (a.tok_in, a.tok_out, a.cache_read, a.cache_create),
             };
+            // Per-model split: codex snapshots name no model, so its share is
+            // labeled by the agent; claude splits by the per-turn model field.
+            let mut by_model: Vec<ModelUsage> = match a.codex_usage {
+                Some(_) => vec![ModelUsage { model: "codex".into(), tok_in, tok_out, cache_read, cache_create, turns: 0 }],
+                None => a.model_usage.values().cloned().collect(),
+            };
+            by_model.sort_by(|x, y| y.tok_out.cmp(&x.tok_out).then(x.model.cmp(&y.model)));
             let mut tools_by_name: Vec<(String, usize, usize)> = a
                 .tool_counts
                 .iter()
@@ -501,6 +728,8 @@ pub fn sessions() -> Result<Vec<Session>> {
                 usage_turns: a.usage_turns,
                 tools_by_name,
                 tool_err: a.tool_err,
+                by_model,
+                source: a.source.clone(),
                 topic: topic_of.get(id).map(|t| t.cluster),
                 struggle: scores[i],
                 summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
@@ -1120,6 +1349,45 @@ mod tests {
         // normalization itself is covered by the builder mapping above.
     }
 
+    // A tool's profile gleans everything the envelopes hold: per-key argument
+    // frequencies, common values for enum-ish keys, call→result latency from
+    // the paired timestamps, error attribution, days, and the agent label —
+    // across both id schemes (Claude tool_use_id, codex call_id shapes).
+    #[test]
+    fn tool_profile_collects_args_durations_errors() {
+        let lines = [
+            r#"{"event_id":"e1","session_id":"S","source":"claude_code","ts":"2026-06-12T01:00:00Z","kind":"tool_call","payload":{"tool_use_id":"t1","name":"Bash","input":{"command":"ls -la","timeout":5,"run_in_background":false}}}"#,
+            r#"{"event_id":"e2","session_id":"S","source":"claude_code","ts":"2026-06-12T01:00:01.500Z","kind":"tool_result","payload":{"tool_use_id":"t1","is_error":true}}"#,
+            r#"{"event_id":"e3","session_id":"S","source":"claude_code","ts":"2026-06-12T02:00:00Z","kind":"tool_call","payload":{"tool_use_id":"t2","name":"Bash","input":{"command":"git status","run_in_background":false}}}"#,
+            r#"{"event_id":"e4","session_id":"S","source":"claude_code","ts":"2026-06-12T02:00:00.500Z","kind":"tool_result","payload":{"tool_use_id":"t2","is_error":false}}"#,
+            r#"{"event_id":"e5","session_id":"C","source":"codex_cli","ts":"2026-06-12T03:00:00Z","kind":"tool_call","payload":{"call_id":"c1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}"#,
+        ]
+        .join("\n");
+        let mut f = ToolFold { target: "Bash".to_string(), ..Default::default() };
+        for line in lines.lines() {
+            f.fold(line);
+        }
+        let p = f.finish();
+        assert_eq!((p.calls, p.errs, p.timed), (2, 1, 2));
+        assert_eq!(p.agent, "claude");
+        assert_eq!(p.arg_keys[0], ("command".to_string(), 2));
+        let rib = p.arg_tops.iter().find(|(k, _)| k == "run_in_background").expect("low-cardinality key profiled");
+        assert_eq!(rib.1[0], ("false".to_string(), 2));
+        assert!(!p.arg_tops.iter().any(|(k, _)| k == "command"), "free-form keys get no value breakdown");
+        assert_eq!(p.p50_ms, 500, "median of 1500ms and 500ms pairings");
+        assert_eq!(p.p95_ms, 1500);
+        assert_eq!(p.days["2026-06-12"], 2);
+        assert_eq!(p.samples.len(), 2);
+        // The codex-shaped arguments string parses for its own tool.
+        let mut f = ToolFold { target: "exec_command".to_string(), ..Default::default() };
+        for line in lines.lines() {
+            f.fold(line);
+        }
+        let p = f.finish();
+        assert_eq!(p.arg_keys[0], ("cmd".to_string(), 1));
+        assert_eq!(p.agent, "codex");
+    }
+
     // A session with prompts but no usage records must read as unmeasured —
     // the coverage denominator, and the no-fake-zero display rule.
     #[test]
@@ -1145,6 +1413,8 @@ mod tests {
             usage_turns: 0,
             tools_by_name: vec![("Bash".into(), 2, 0)],
             tool_err: 0,
+            by_model: vec![],
+            source: "cowork".into(),
             summary: None,
             author: String::new(),
         };
