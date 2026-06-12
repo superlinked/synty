@@ -283,7 +283,12 @@ impl ViewCache {
         // rendering stays deterministic (no wall clock).
         let by_num: Vec<(i32, units::DayStat)> =
             day_stats.iter().filter_map(|(d, s)| Some((day_num(d)?, *s))).collect();
-        let stats_gmax = by_num.iter().map(|(d, _)| *d).max().unwrap_or(0);
+        let stats_gmax = by_num
+            .iter()
+            .map(|(d, _)| *d)
+            .chain(work.iter().filter_map(|u| day_num(&u.when)))
+            .max()
+            .unwrap_or(0);
         let metric: Vec<(&'static str, fn(&units::DayStat) -> u64)> = vec![
             ("tok out", |s| s.tok_out),
             ("tok in", |s| s.tok_in),
@@ -292,7 +297,7 @@ impl ViewCache {
             ("tools", |s| s.tools),
             ("sessions", |s| s.sessions),
         ];
-        let stats_rows = metric
+        let mut stats_rows: Vec<(&'static str, HashMap<i32, u64>)> = metric
             .into_iter()
             .map(|(label, get)| {
                 let mut days: HashMap<i32, u64> = HashMap::new();
@@ -302,6 +307,17 @@ impl ViewCache {
                 (label, days)
             })
             .collect();
+        // The GitHub artifacts ride the same chart — the work units already
+        // carry their kind and day.
+        for (label, kind) in [("prs", Kind::Pr), ("issues", Kind::Issue)] {
+            let mut days: HashMap<i32, u64> = HashMap::new();
+            for u in work.iter().filter(|u| u.kind == kind) {
+                if let Some(d) = day_num(&u.when) {
+                    *days.entry(d).or_default() += 1;
+                }
+            }
+            stats_rows.push((label, days));
+        }
 
         Self {
             repo_facets: facet(true),
@@ -1217,7 +1233,7 @@ impl App {
     /// sessions per repo and per account.
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let [head, stats, cols] =
-            Layout::vertical([Constraint::Length(6), Constraint::Length(9), Constraint::Min(0)]).areas(area);
+            Layout::vertical([Constraint::Length(6), Constraint::Length(11), Constraint::Min(0)]).areas(area);
         f.render_widget(
             Paragraph::new(self.status_head())
                 .wrap(Wrap { trim: false })
@@ -2169,6 +2185,7 @@ mod tests {
         assert!(text.contains("tok out") && text.contains("cache r") && text.contains("sessions"), "metric rows missing");
         assert!(text.contains("20.9k"), "window total missing: {text}");
         assert!(text.contains("█") && text.contains("▁"), "height bars missing (18.9k peak vs 2k day): {text}");
+        assert!(text.contains("prs") && text.contains("issues"), "artifact rows missing: {text}");
         // segmentation: repo rows carry token/tool spend, the fleet-wide tool
         // mix names tools with their agent, and models get their own table.
         assert!(text.contains("TOK") && text.contains("TOOLS"), "facet spend columns missing: {text}");

@@ -108,8 +108,8 @@ search is instant.
 - **Search** (job A) — query → results as units → drill to detail → messages.
 - **Status** (job E) — tracker/index health: docs by source/kind/repo, newest
   item, last indexed, last tracked, per-source freshness; a tokens & tools
-  bar chart tracks the four token classes, tool calls, and active sessions per
-  day — full width, over as many Mon-aligned weeks as fit, day bars
+  bar chart tracks the four token classes, tool calls, active sessions, and the
+  GitHub artifacts (PRs, issues) per day — full width, over as many Mon-aligned weeks as fit, day bars
   height-scaled (▁..█) against each row's own peak — above the repo/account
   breakdowns — which carry TOK/TOOLS spend columns — a Models table splitting
   the spend per model, and a selectable Tools table (agent · calls · errors);
