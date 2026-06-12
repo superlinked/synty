@@ -44,21 +44,33 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     }
 
     // ingest keeps docs.jsonl prefix-stable: existing docs hold their
-    // positions and new work appends at the tail even when it arrives late
-    // (see ingest::stable_order). When the previous build is a strict prefix,
-    // clone it (CoW) and append only the tail. Anything else (recency-cap
-    // drop, edited history, a build pulled from another machine) → full
-    // rebuild into a fresh directory.
+    // positions, removals leave gaps, and new work appends at the tail (see
+    // ingest::stable_order). So the previous build reconciles incrementally:
+    // clone it (CoW), DELETE the docs that left the corpus (next-plaid
+    // rewrites only their chunks and renumbers in order, which keeps index
+    // ids aligned with docs.jsonl positions), and append the tail. Only a
+    // genuinely foreign corpus (a build pulled from another machine, or churn
+    // past RECONCILE_MAX) pays the full k-means + re-quantization rebuild.
     let dir = readmodel::build_dir(&build);
     let dir_str = dir.to_string_lossy().into_owned();
     let start = match (&prev, &prev_hashes) {
-        (Some(cur), Some(p))
-            if p.len() < hashes.len()
-                && p[..] == hashes[..p.len()]
-                && MmapIndex::load(&cur.dir().to_string_lossy()).is_ok() =>
-        {
-            readmodel::clone_build(&cur.dir(), &dir)?;
-            p.len()
+        (Some(cur), Some(p)) if MmapIndex::load(&cur.dir().to_string_lossy()).is_ok() => {
+            match reconcile(p, &hashes) {
+                Some((deletions, survivors)) => {
+                    readmodel::clone_build(&cur.dir(), &dir)?;
+                    if !deletions.is_empty() {
+                        let mut idx = MmapIndex::load(&dir_str).context("load cloned build for patch")?;
+                        let n = idx.delete(&deletions).context("patch out departed docs")?;
+                        eprintln!("index: patched out {n} departed doc(s)");
+                    }
+                    survivors
+                }
+                None => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    std::fs::create_dir_all(&dir)?;
+                    0
+                }
+            }
         }
         _ => {
             let _ = std::fs::remove_dir_all(&dir);
@@ -104,19 +116,26 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     let embeddings: Vec<Array2<f32>> =
         embeddings.into_iter().map(|o| o.expect("every doc filled")).collect();
 
-    if start > 0 {
-        eprintln!("index: appending {n_new} new docs ({start} already indexed)");
-    }
-    crate::progress::phase("indexing", 0, 1);
     let t1 = Instant::now();
-    let (idx, _ids) = MmapIndex::update_or_create_with_metadata(
-        &embeddings,
-        &dir_str,
-        &IndexConfig::default(),
-        &UpdateConfig::default(),
-        Some(&metas[start..]),
-    )
-    .context("build next-plaid index")?;
+    let idx = if n_new == 0 && start > 0 {
+        // Pure patch: docs only departed, nothing to append — the cloned and
+        // patched build is already complete.
+        MmapIndex::load(&dir_str).context("load patched build")?
+    } else {
+        if start > 0 {
+            eprintln!("index: appending {n_new} new docs ({start} already indexed)");
+        }
+        crate::progress::phase("indexing", 0, 1);
+        let (idx, _ids) = MmapIndex::update_or_create_with_metadata(
+            &embeddings,
+            &dir_str,
+            &IndexConfig::default(),
+            &UpdateConfig::default(),
+            Some(&metas[start..]),
+        )
+        .context("build next-plaid index")?;
+        idx
+    };
 
     // Complete the build dir: the manifest, the docs snapshot readers render
     // from (ids match this index, not a later corpus), and the previous
@@ -148,6 +167,34 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     Ok(())
 }
 
+/// More than 1/PATCH_FRAC of the previous index departing → full rebuild:
+/// chunk-rewriting most of an index is slower and messier than replanning it.
+const PATCH_FRAC: usize = 5;
+
+/// Two-pointer diff between the previous build's doc hashes and the current
+/// corpus. `ingest::stable_order` only removes docs or appends at the tail —
+/// never reorders — so the survivors of `prev` appear as the head of `new`,
+/// in order. Returns (prev positions to delete, survivor count == where the
+/// append tail starts in `new`); a strict prefix yields no deletions, and
+/// churn past the PATCH_FRAC guard yields None (a foreign or heavily
+/// rewritten corpus — rebuild). An in-place edit, which stable_order never
+/// produces, still degrades safely: it reads as delete-here + append-at-tail.
+fn reconcile(prev: &[u64], new: &[u64]) -> Option<(Vec<i64>, usize)> {
+    let mut deletions = Vec::new();
+    let mut j = 0usize;
+    for (i, h) in prev.iter().enumerate() {
+        if j < new.len() && new[j] == *h {
+            j += 1;
+        } else {
+            deletions.push(i as i64);
+        }
+    }
+    if deletions.len() * PATCH_FRAC > prev.len().max(1) {
+        return None;
+    }
+    Some((deletions, j))
+}
+
 /// The doc content hashes (in order) a build was built from.
 fn load_manifest(dir: &Path) -> Option<Vec<u64>> {
     let raw = std::fs::read_to_string(dir.join("doc_hashes.json")).ok()?;
@@ -168,12 +215,42 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::fnv1a;
+    use super::{fnv1a, reconcile};
 
     #[test]
     fn fnv1a_is_stable_and_distinguishing() {
         assert_eq!(fnv1a(b"generation isolation"), fnv1a(b"generation isolation"));
         assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"));
         assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
+    }
+
+    // The reconcile sees every corpus change stable_order can produce as an
+    // incremental patch: appends, departures, and the move-to-tail shape of
+    // an edit — never paying a full re-quantization for them.
+    #[test]
+    fn reconcile_patches_appends_and_departures() {
+        // Strict prefix: nothing to delete, append from the survivor count.
+        assert_eq!(reconcile(&[1, 2, 3], &[1, 2, 3, 4]), Some((vec![], 3)));
+        // One departure mid-list plus a new tail.
+        assert_eq!(reconcile(&[1, 2, 3, 4, 5], &[1, 2, 4, 5, 6]), Some((vec![2], 4)));
+        // Pure departure, nothing appended (the "6 docs vanished" case).
+        assert_eq!(reconcile(&[1, 2, 3, 4, 5], &[1, 2, 4, 5]), Some((vec![2], 4)));
+        // An edit as stable_order emits it: old version departs, new at tail.
+        assert_eq!(reconcile(&[1, 2, 3, 4, 5], &[1, 3, 4, 5, 9]), Some((vec![1], 4)));
+        // Duplicate hashes match as a multiset, in order.
+        assert_eq!(reconcile(&[7, 7, 8, 1, 2, 3], &[7, 8, 1, 2, 3]), Some((vec![1], 5)));
+    }
+
+    // Churn past 1/PATCH_FRAC of the index means chunk-rewriting most of it —
+    // a full rebuild is cheaper and cleaner, so the reconcile abstains.
+    #[test]
+    fn reconcile_abstains_on_heavy_churn() {
+        let prev: Vec<u64> = (0..100).collect();
+        let mut new: Vec<u64> = (30..100).collect(); // 30 departures of 100
+        new.push(1000);
+        assert_eq!(reconcile(&prev, &new), None);
+        // ...but 10 departures of 100 is a patch.
+        let new: Vec<u64> = (10..100).collect();
+        assert_eq!(reconcile(&prev, &new), Some(((0..10).collect(), 90)));
     }
 }

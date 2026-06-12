@@ -293,11 +293,11 @@ fn input_manifest<'a>(files: impl Iterator<Item = &'a PathBuf>) -> String {
 /// Keep the most recent docs (ISO8601 ts sorts lexicographically), ordered
 /// oldest-first with sequential ids. The order is then made stable against the
 /// previous output by `stable_order` — recency only decides what is KEPT.
-/// Crossing the cap cuts 10% deeper than it has to: a head-drop breaks the
-/// index's prefix and forces a FULL re-quantization, so dropping to exactly
-/// `cap` would pay that full rebuild on every single build once the corpus
-/// rides the cap — the hysteresis amortizes it to one rebuild per ~cap/10
-/// docs of new work. Returns (kept, dropped_count).
+/// Crossing the cap cuts 10% deeper than it has to: head-drops are patched
+/// out of the index incrementally, but dropping to exactly `cap` would patch
+/// on every single build once the corpus rides the cap — the hysteresis
+/// amortizes that churn to once per ~cap/10 docs of new work.
+/// Returns (kept, dropped_count).
 pub fn cap_by_recency(mut docs: Vec<Doc>, cap: usize) -> (Vec<Doc>, usize) {
     docs.sort_by(|a, b| b.meta.ts.cmp(&a.meta.ts));
     let keep = if docs.len() > cap { cap - cap / 10 } else { docs.len() };
@@ -337,11 +337,10 @@ fn stable_order(docs: Vec<Doc>, prev_path: &str) -> Vec<Doc> {
         match by_hash.get_mut(&crate::index::fnv1a(p.text.as_bytes())).and_then(|q| q.pop_front()) {
             Some(i) => out.push(slots[i].take().expect("each slot consumed once")),
             None => {
-                // A previously-indexed doc left the corpus — the gap breaks
-                // the index's prefix and the next `index` pays a FULL
-                // re-quantization. Say which docs did it, so a recurring
-                // shrink (edited bodies, vanished sources) is diagnosable
-                // instead of a mystery load spike.
+                // A previously-indexed doc left the corpus — the next `index`
+                // patches it out of the cloned build (a full rebuild only if
+                // the churn is heavy). Say which docs did it, so a recurring
+                // shrink (edited bodies, vanished sources) stays diagnosable.
                 missed += 1;
                 if sample.is_empty() {
                     sample = crate::excerpt(&p.text, 60);
@@ -350,7 +349,7 @@ fn stable_order(docs: Vec<Doc>, prev_path: &str) -> Vec<Doc> {
         }
     }
     if missed > 0 {
-        eprintln!("ingest: {missed} previously-indexed doc(s) left the corpus → next index is a full rebuild (e.g. {sample:?})");
+        eprintln!("ingest: {missed} previously-indexed doc(s) left the corpus → the next index patches them out (e.g. {sample:?})");
     }
     for s in &mut slots {
         if let Some(d) = s.take() {

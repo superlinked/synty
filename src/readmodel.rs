@@ -1,8 +1,9 @@
 // The versioned read-model. Builds are immutable directories under
 // `index/builds/<build>/`; a tiny pointer file (`index/current.json`,
 // written atomically, LAST) names the build readers should open. Nothing ever
-// mutates a directory a reader may have mmapped — an incremental append CLONES
-// the previous build (CoW where the filesystem allows) and repoints, and a
+// mutates a directory a reader may have mmapped — an incremental update
+// (append or patch) CLONES the previous build (CoW where the filesystem
+// allows), mutates only the clone, and repoints; and a
 // torn build can never become current because the pointer only moves after the
 // new directory is complete. `rev` versions the derived artifacts (clusters)
 // added to a build after indexing: `unit_clusters.<rev>.json` files are
