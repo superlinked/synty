@@ -889,14 +889,14 @@ impl App {
         }
         // footer: contextual keys (left) · mode · freshness · autostart (right),
         // glyph-first, matching the freshness cell ("✓ fresh"). The mode cell is
-        // the local→bucket ramp: "● local" until a bucket is set, "✓ activated"
-        // once it is and autostart is on (a real fleet member).
+        // the local→bucket ramp, keyed off the bucket alone: "◐ local" (accent,
+        // a work-in-progress trial) until a bucket is set, then "✓ <bucket>"
+        // (sage, a fleet member). Autostart is its own cell, not a second gate.
         let auto = if self.autostart { " ✓ autostart " } else { " ✗ autostart " };
-        let activated = self.status.bucket.is_some() && self.autostart;
-        let mode = match (&self.status.bucket, activated) {
-            (Some(_), true) => " ✓ activated ",
-            (Some(_), false) => " ● bucket ",
-            (None, _) => " ● local ",
+        let activated = self.status.bucket.is_some();
+        let mode = match &self.status.bucket {
+            Some(b) => format!(" ✓ {} ", crate::view::bucket_short(b)),
+            None => " ◐ local ".to_string(),
         };
         let fresh = format!(" {} ", self.fresh_status());
         let [fkeys, fmode, ffresh, fauto] = Layout::horizontal([
@@ -908,7 +908,7 @@ impl App {
         .areas(footer);
         f.render_widget(Line::from(self.footer()).fg(theme::DIM), fkeys);
         f.render_widget(
-            Line::from(mode).fg(if activated { theme::SAGE } else { theme::DIM }).right_aligned(),
+            Line::from(mode).fg(if activated { theme::SAGE } else { theme::ACCENT }).right_aligned(),
             fmode,
         );
         let fresh_color = if self.freshen.is_some() || self.reload_pending {

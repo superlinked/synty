@@ -758,15 +758,24 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
     o
 }
 
-/// The local→bucket activation state — the rollout ramp made legible. A
-/// local-only machine is invisible to the fleet (it pushes no events); setting
-/// a bucket + autostart is exactly the moment it becomes a tracked member.
-pub fn activation_line(bucket: Option<&str>, autostart: bool) -> String {
-    match (bucket, autostart) {
-        (Some(b), true) => format!("mode: bucket {b} · activated ✓"),
-        (Some(b), false) => format!("mode: bucket {b} · autostart off — run `synty join {b}` to activate"),
-        (None, _) => "mode: local (trial) — `synty join <bucket>` to join your team".to_string(),
+/// The local→bucket activation state — the rollout ramp made legible. The bucket
+/// is the *only* thing that moves it: a local-only machine is invisible to the
+/// fleet (it pushes no events), and setting a bucket is exactly the moment it
+/// becomes a tracked member. Autostart (tracking at login) is on by default and
+/// reported separately — it's not a second gate, so it stays out of this line.
+pub fn activation_line(bucket: Option<&str>) -> String {
+    match bucket {
+        Some(b) => format!("✓ on the team — {b}"),
+        None => "◐ local — `synty join <bucket>` to join your team".to_string(),
     }
+}
+
+/// A bucket URI trimmed to a glanceable name for the footer: scheme dropped, last
+/// path segment kept (`gs://acme/team-x` → `team-x`, `/srv/synty-bucket` →
+/// `synty-bucket`). The full URI still shows on the status page.
+pub fn bucket_short(uri: &str) -> &str {
+    let no_scheme = uri.split_once("://").map(|(_, rest)| rest).unwrap_or(uri);
+    no_scheme.trim_end_matches('/').rsplit('/').next().unwrap_or(no_scheme)
 }
 
 pub fn status_md(s: &Status) -> String {
@@ -774,7 +783,7 @@ pub fn status_md(s: &Status) -> String {
     if s.stale {
         o.push_str("⚠ index is stale — tracked events are newer; run `synty up` or `synty build`\n\n");
     }
-    o.push_str(&activation_line(s.bucket.as_deref(), s.autostart));
+    o.push_str(&activation_line(s.bucket.as_deref()));
     o.push('\n');
     o.push_str(&format!(
         "{} docs · {} GitHub · {} sessions · autostart {}\nnewest: {}\nlast indexed: {} · last tracked: {}\n\nkinds: ",
@@ -1627,30 +1636,32 @@ mod tests {
         assert_eq!((alice.github, alice.sessions), (1, 0));
     }
 
-    // The local→bucket ramp, the three states a person passes through. Pure:
-    // the rendered status line is what tells them where they stand.
+    // The local→bucket ramp: the bucket is the only thing that moves the badge.
+    // Pure — the rendered line is what tells a person where they stand.
     #[test]
-    fn activation_local_trial_invites_to_join() {
-        let line = activation_line(None, false);
-        assert!(line.contains("local (trial)"), "no bucket → local trial: {line}");
+    fn activation_local_invites_to_join() {
+        let line = activation_line(None);
+        assert!(line.contains("local"), "no bucket → local: {line}");
         assert!(line.contains("synty join"), "invites joining a team: {line}");
-        // Autostart alone (no bucket) is still local — you can't be a fleet
-        // member without a shared bucket to push to.
-        assert!(activation_line(None, true).contains("local (trial)"));
+        assert!(!line.contains("trial"), "no '(trial)' framing: {line}");
     }
 
     #[test]
-    fn activation_bucket_plus_autostart_is_activated() {
-        let line = activation_line(Some("gs://my-team"), true);
-        assert!(line.contains("activated"), "bucket + autostart = activated: {line}");
+    fn activation_bucket_is_on_the_team() {
+        let line = activation_line(Some("gs://my-team"));
+        assert!(line.contains('✓'), "a bucket alone reads as activated: {line}");
         assert!(line.contains("gs://my-team"), "names the bucket: {line}");
+        // Autostart is reported elsewhere; it never appears in this line and so
+        // can't un-activate a machine that has a bucket.
+        assert!(!line.to_lowercase().contains("autostart"), "autostart stays out of the line: {line}");
     }
 
+    // The footer name is the bucket trimmed to one glanceable segment.
     #[test]
-    fn activation_bucket_without_autostart_nudges_autostart() {
-        let line = activation_line(Some("gs://my-team"), false);
-        assert!(!line.contains("activated ✓"), "not yet activated without autostart: {line}");
-        assert!(line.contains("autostart off"), "flags the missing piece: {line}");
-        assert!(line.contains("synty join gs://my-team"), "tells them the exact fix: {line}");
+    fn bucket_short_drops_scheme_and_path() {
+        assert_eq!(bucket_short("gs://acme-synty"), "acme-synty");
+        assert_eq!(bucket_short("s3://acme/team-x"), "team-x");
+        assert_eq!(bucket_short("/srv/synty-bucket/"), "synty-bucket");
+        assert_eq!(bucket_short("local-dir"), "local-dir");
     }
 }

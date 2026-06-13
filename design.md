@@ -179,10 +179,13 @@ there is one path, not two). Omit the bucket to trial synty against local
 sessions (invisible to the fleet — it pushes no events); re-run with a bucket
 and that same `join` is the switch onto the team (config gains the bucket; the
 next build's event sync does the rest — no migration). A machine is **activated**
-— a real fleet member — exactly when a bucket is set *and* autostart is on; that
-state shows on `status` and the TUI footer (`● local` → `✓ activated`), so the
-ramp is legible. The install one-liner carries the bucket and drops into the
-viewer, so a paste goes from nothing to tracking.
+— a real fleet member — exactly when a bucket is set; the bucket is the only
+thing that moves the badge. Autostart (the login-time tracker) is turned on by
+`join`/install and is on by default thereafter, reported in its own indicator —
+not a second activation gate. The state shows on `status` and the TUI footer
+(`◐ local`, accent → `✓ <bucket>`, sage), so the ramp is legible. The install
+one-liner carries the bucket and drops into the viewer, so a paste goes from
+nothing to tracking.
 
 ## Privacy (team tier)
 

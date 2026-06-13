@@ -64,9 +64,10 @@ any list to one repo or account with `r`/`a`, refresh on demand with `u` (the
 footer shows build progress and staleness). The Stats tab charts what the
 agents consume against what the work produces and breaks the spend down per
 repo, account, tool, and model; the Status tab shows tracker health, the fleet
-roster (who runs synty where, who runs agents untracked), whether you're running
-**local (trial)** or **activated** on a team bucket, and toggles login-time
-tracking. The CLI has the same surface for agents and scripts:
+roster (who runs synty where, who runs agents untracked), whether you're still
+**local** (an accent-colored `◐`, a trial) or **on a team bucket** (a `✓` with
+the bucket name), and toggles login-time tracking. The CLI has the same surface
+for agents and scripts:
 
 ```sh
 cargo run --release -- related          # prior work related to what you're doing now (from this repo's git)
@@ -158,8 +159,8 @@ The binary is internally hosted (`$SYNTY_BINARY_URL`), not a public package or
 Homebrew tap — distribution is team-first while the rollout proceeds. The
 configured bucket is the default everywhere; `--bucket` overrides. Cloud buckets
 need `--features s3` / `gcs`. The TUI footer shows where things stand —
-activation (`● local` → `✓ activated`) and freshness (`⟳ encoding 120/470` ·
-`⚠ stale` · `✓ fresh`).
+activation (`◐ local` → `✓ <bucket>`, keyed off the bucket alone) and freshness
+(`⟳ encoding 120/470` · `⚠ stale` · `✓ fresh`).
 
 Caveat: every fleet member has raw bucket access and can read everyone's
 sessions. Fine for high-trust teams; the mediated-frontend tier (publication
