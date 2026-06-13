@@ -2,9 +2,9 @@
 //  - the fixed, corpus-grounded query set (some with metadata filters), top-5
 //    per query to evals/runs.md + stdout for human scoring;
 //  - derived gold pairs: every session whose tracker recorded the PR it
-//    produced is a free relevance judgment — querying with the session's ask
-//    must retrieve that PR. Scored automatically (hit@5), grows with the
-//    corpus instead of being frozen to one snapshot.
+//    produced is a free relevance judgment — querying with the session's
+//    summary (what the work was) must retrieve that PR. Scored automatically
+//    (hit@5), grows with the corpus instead of being frozen to one snapshot.
 
 use crate::{encode::Encoder, load_docs, readmodel, search, units};
 use anyhow::{anyhow, Result};
@@ -21,6 +21,11 @@ struct Probe {
     query: String,
     #[serde(default)]
     filter: Option<String>,
+    /// Optional gold: a `gh:repo#number` the top-5 must contain. When set, the
+    /// probe is auto-scored (hit@5) — the trustworthy retrieval metric, since
+    /// the probes are well-formed queries (unlike the noisy session→PR pairs).
+    #[serde(default)]
+    expect: Option<String>,
 }
 
 pub fn run(model_id: &str) -> Result<()> {
@@ -36,13 +41,32 @@ pub fn run(model_id: &str) -> Result<()> {
         .map_err(|e| anyhow!("load index: {e}"))?;
     let mut enc = Encoder::load(model_id)?;
     let mut out = String::from("# retrieval probe runs\n\n");
+    let (mut probe_scored, mut probe_hits, mut probe_misses) = (0usize, 0usize, Vec::new());
     for p in &probes {
         let filt = p.filter.as_deref();
         let qe = enc.encode_query(&p.query)?;
         let subset = search::subset_for(filt)?;
         let params = SearchParameters { top_k: 5, ..Default::default() };
         let r = idx.search(&qe, &params, subset.as_deref()).map_err(|e| anyhow!("search: {e}"))?;
+        if let Some(expect) = &p.expect {
+            probe_scored += 1;
+            let hit = r.passage_ids.iter().any(|id| {
+                docs.get(*id as usize).is_some_and(|d| units::gh_key(&d.meta.repo, d.meta.number.unwrap_or(0)) == *expect)
+            });
+            if hit {
+                probe_hits += 1;
+            } else {
+                probe_misses.push((p.query.clone(), expect.clone()));
+            }
+        }
         out.push_str(&search::render(&docs, &p.query, filt, &r));
+        out.push('\n');
+    }
+    if probe_scored > 0 {
+        out.push_str(&format!("## scored probes: {probe_hits}/{probe_scored} hit@5\n"));
+        for (q, key) in &probe_misses {
+            out.push_str(&format!("- MISS {key} ← “{}”\n", crate::excerpt(q, 80)));
+        }
         out.push('\n');
     }
 
@@ -75,10 +99,13 @@ pub fn run(model_id: &str) -> Result<()> {
     std::fs::write("evals/runs.md", &out)?;
     print!("{out}");
     let mut m = crate::metrics::Run::new("eval");
-    m.set("probes", probes.len()).set("derived_pairs", pairs.len()).set("derived_hits", hits).set(
-        "derived_hit_rate",
-        if pairs.is_empty() { 1.0 } else { hits as f64 / pairs.len() as f64 },
-    );
+    m.set("probes", probes.len())
+        .set("probe_scored", probe_scored)
+        .set("probe_hits", probe_hits)
+        .set("probe_hit_rate", if probe_scored == 0 { 1.0 } else { probe_hits as f64 / probe_scored as f64 })
+        .set("derived_pairs", pairs.len())
+        .set("derived_hits", hits)
+        .set("derived_hit_rate", if pairs.is_empty() { 1.0 } else { hits as f64 / pairs.len() as f64 });
     m.emit();
     eprintln!("wrote evals/runs.md ({} probes, {} derived pairs)", probes.len(), pairs.len());
     Ok(())
@@ -189,14 +216,26 @@ pub fn run_names(bucket: &str) -> Result<()> {
     Ok(())
 }
 
-/// (query, gold gh: key) pairs from sessions that produced a PR: the query is
-/// the session's opening ask — the user's own words, the realistic probe.
+/// (query, gold gh: key) pairs from sessions that produced a PR — a free
+/// relevance judgment: a query describing the work should retrieve its PR.
+///
+/// Query with the session SUMMARY (what the work was), NOT the opening ask. The
+/// ask is overwhelmingly a "load context" opener — "check out this repo", "get
+/// context on this branch", "lets merge and test" — with no semantic signal
+/// about the PR, so it makes a near-meaningless probe (it was the bulk of the
+/// old ~28% hit-rate, a weak-gold artifact, not a retrieval gap). Fall back to
+/// the ask only when a session has no summary.
 fn derived_pairs() -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for s in units::sessions()? {
         let Some(key) = s.linked_pr.as_deref().and_then(units::linked_pr_key) else { continue };
-        if s.ask.len() >= 12 {
-            out.push((s.ask.clone(), key));
+        let query = s
+            .summary
+            .clone()
+            .filter(|q| q.len() >= 12)
+            .or_else(|| (s.ask.len() >= 12).then(|| s.ask.clone()));
+        if let Some(q) = query {
+            out.push((q, key));
         }
     }
     Ok(out)

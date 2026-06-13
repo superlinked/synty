@@ -79,3 +79,30 @@ the primary gates. The 26-topic fallback rate is acceptable — those fallbacks
 are good summary headings, not soup (names_kw_last_resort=0). This is the eval
 doing its job: it caught a regression that the proxy metrics (fallback down,
 dupes 0) alone would have green-lit.
+
+## Retrieval quality — investigated; it's good, the metric was the problem
+
+The `derived_hit_rate` (session→PR pairs) read 0.278 and I'd flagged it as a
+retrieval failure. Reading the misses showed the gold is the problem, not
+retrieval: the session "ask" is a conversational opener ("check out this repo",
+"lets merge and test", "get context on this branch") with no semantic signal
+about the PR — unmatchable by design.
+
+Switched the derived query from the opening ask to the session SUMMARY (what the
+work was): 0.278 → 0.333. Still low, because the 0.6B summaries are sometimes
+abstractive ("The engine owns every superlative; the cloud owns only the toil."
+→ a landing-page PR) and a session's linked PR is loosely coupled to its summary
+(a Florence-2 bug summary linked to a different PR). So `derived_hit_rate` is a
+noisy floor, not a retrieval-quality verdict.
+
+The trustworthy signal is the hand-written probes — but they were NOT auto-scored
+(rendered top-5 for human reading only). Worse, a stray retrieved doc ("Retrieval
+is excellent — 12/12…", an indexed assistant_message from THIS conversation that
+the tracker captured) had been mis-read as if it were the eval's own verdict.
+
+Fix: probes now carry an optional `expect` (`gh:repo#number`) and are auto-scored
+(`probe_hit_rate`). On the 10 PR-targeted probes: **10/10 hit@5 (probe_hit_rate
+1.0)** — retrieval is strong, now measured rather than eyeballed or imagined.
+`derived_hit_rate` stays as a loose secondary floor. Note: the tracker indexing
+its own meta-conversation (this session) pollutes results slightly — expected,
+but worth knowing.

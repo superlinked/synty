@@ -26,9 +26,14 @@ to keep a history.
 
 ## Gold-file schemas
 
-`queries.json` — retrieval probes (optional `filter` is a `col=value` metadata WHERE):
+`queries.json` — retrieval probes. `filter` (optional) is a `col=value` metadata
+WHERE; `expect` (optional) is a `gh:repo#number` the top-5 must contain, which
+makes the probe **auto-scored** (`probe_hit_rate` in `[metrics eval]`) — the
+trustworthy retrieval signal. (The `derived_hit_rate` over session→PR pairs is
+a noisy floor: session summaries are abstractive and only loosely coupled to
+the one PR a session linked.)
 ```json
-[{"query": "rate limiting middleware", "filter": "repo=sie-web"}, {"query": "…"}]
+[{"query": "VLM cache clears on uncovered paths", "filter": "kind=pull_request", "expect": "gh:sie-internal#1143"}]
 ```
 
 `names.json` — one row per topic, emitted by `eval --names`; add an optional
