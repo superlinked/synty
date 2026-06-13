@@ -72,6 +72,23 @@ impl Server {
             "synty_topics" => topics_text(a),
             "synty_recent" => recent_text(a),
             "synty_status" => view::status().map(|s| view::status_md(&s)),
+            "synty_stats" => view::stats(a["weeks"].as_u64().unwrap_or(4) as usize).map(|s| view::stats_md(&s)),
+            "synty_tool" => {
+                let name = a["name"].as_str().unwrap_or("");
+                if name.is_empty() {
+                    Err(anyhow::anyhow!("name is required (tool names appear in synty_status output)"))
+                } else {
+                    view::tool_report(name)
+                }
+            }
+            "synty_show" => {
+                let id = a["id"].as_str().unwrap_or("");
+                if id.is_empty() {
+                    Err(anyhow::anyhow!("id is required — ids appear inline in synty_search/synty_recent/synty_topics output"))
+                } else {
+                    view::show_report(id)
+                }
+            }
             other => return Err(format!("unknown tool: {other}")),
         };
         Ok(match out {
@@ -138,7 +155,7 @@ fn tool_defs() -> Value {
     json!([
         {
             "name": "synty_search",
-            "description": "Semantic search over this machine's coding-agent sessions and GitHub activity (PRs, issues, prompts). Use before starting work to find prior attempts, decisions, and related PRs.",
+            "description": "Semantic search over this machine's coding-agent sessions and GitHub activity (PRs, issues, prompts). Use before starting work to find prior attempts, decisions, and related PRs. Ids in the output ([a1b2c3d4], repo#123) feed synty_show.",
             "inputSchema": obj(json!({
                 "query": {"type": "string", "description": "What to look for, in natural language"},
                 "k": {"type": "integer", "description": "Number of results (default 5)"},
@@ -147,14 +164,14 @@ fn tool_defs() -> Value {
         },
         {
             "name": "synty_topics",
-            "description": "Emergent topics of recent work (clustered sessions, PRs, issues) with summaries and members.",
+            "description": "Emergent topics of recent work (clustered sessions, PRs, issues) with summaries and members. Topic keys and member ids in the output feed synty_show.",
             "inputSchema": obj(json!({
                 "query": {"type": "string", "description": "Optional substring to filter topics"}
             }), json!([])),
         },
         {
             "name": "synty_recent",
-            "description": "Recent work units (sessions, PRs, issues), newest first.",
+            "description": "Recent work units (sessions, PRs, issues), newest first. Ids in the output feed synty_show.",
             "inputSchema": obj(json!({
                 "repo": {"type": "string", "description": "Optional repo name to filter"},
                 "limit": {"type": "integer", "description": "Max units (default 20)"}
@@ -162,8 +179,29 @@ fn tool_defs() -> Value {
         },
         {
             "name": "synty_status",
-            "description": "What synty holds and how fresh it is: doc counts, repos, accounts, index freshness.",
+            "description": "Health: doc counts, repos, accounts, index freshness, and the fleet roster (machines, liveness, install rate, who runs agents untracked).",
             "inputSchema": obj(json!({}), json!([])),
+        },
+        {
+            "name": "synty_stats",
+            "description": "Usage and output over time: tokens, cache, tool calls, sessions, merged LOC, PRs, issues per Mon-aligned week, anchored to the most recent day with data.",
+            "inputSchema": obj(json!({
+                "weeks": {"type": "integer", "description": "Trailing weeks (default 4)"}
+            }), json!([])),
+        },
+        {
+            "name": "synty_tool",
+            "description": "Fleet-wide profile of one tool: call/error volume, latency p50/p95, argument mix, recent invocations. Tool names appear in synty_status output.",
+            "inputSchema": obj(json!({
+                "name": {"type": "string", "description": "The tool name as the agent calls it (e.g. Bash, Edit, Read)"}
+            }), json!(["name"])),
+        },
+        {
+            "name": "synty_show",
+            "description": "Detail for one id, as printed inline by synty_search/synty_recent/synty_topics: a session id (full or ≥4-char prefix), a PR/issue ref (repo#123 or gh:repo#123), or a topic key.",
+            "inputSchema": obj(json!({
+                "id": {"type": "string", "description": "The id to resolve"}
+            }), json!(["id"])),
         }
     ])
 }
@@ -196,15 +234,42 @@ mod tests {
         assert!(srv().handle(&req).is_none());
     }
 
-    // tools/list exposes the four read surfaces with schemas.
+    // tools/list exposes the full read surface with schemas.
     #[test]
     fn tools_list_has_the_read_surfaces() {
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let resp = srv().handle(&req).expect("response");
         let names: Vec<&str> =
             resp["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["synty_search", "synty_topics", "synty_recent", "synty_status"]);
+        assert_eq!(
+            names,
+            ["synty_search", "synty_topics", "synty_recent", "synty_status", "synty_stats", "synty_tool", "synty_show"]
+        );
         assert_eq!(resp["result"]["tools"][0]["inputSchema"]["required"][0], "query");
+    }
+
+    // The drill tools declare their required argument, and calling without it
+    // is an isError result (not a crash, not a silent empty answer) — before
+    // any IO happens.
+    #[test]
+    fn new_tools_declare_and_enforce_required_args() {
+        let req = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list"});
+        let resp = srv().handle(&req).expect("response");
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let required = |n: &str| {
+            tools.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n} missing"))["inputSchema"]["required"][0]
+                .clone()
+        };
+        assert_eq!(required("synty_tool"), "name");
+        assert_eq!(required("synty_show"), "id");
+        for (tool, hint) in [("synty_tool", "name is required"), ("synty_show", "id is required")] {
+            let resp = srv()
+                .handle(&json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                    "params": {"name": tool, "arguments": {}}}))
+                .unwrap();
+            assert_eq!(resp["result"]["isError"], true, "{tool}");
+            assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains(hint), "{tool}");
+        }
     }
 
     // Unknown methods and unknown tools are JSON-RPC errors, not crashes.

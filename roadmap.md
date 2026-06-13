@@ -58,4 +58,4 @@ from the CLI and MCP.
 - Tracker binary version stamped into `session_start` (upgrade-rate monitoring); `setup` nudges GitHub-login pinning so actors join to GitHub authors.
 
 ## Future work (after the milestones)
-- ~~MCP server exposing agent tools over stdio~~ — done (`synty mcp`: synty_search / synty_topics / synty_recent / synty_status).
+- ~~MCP server exposing agent tools over stdio~~ — done (`synty mcp` serves the CLI's read surface as tools).

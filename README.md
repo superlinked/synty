@@ -81,7 +81,9 @@ for topics) that feed `synty show <id>`. Every read command takes `--json`
 for scripts; the output is one versioned envelope,
 `{"v": 1, "kind": "…", "data": …}` — check `v` once, dispatch on `kind`. For
 coding agents there's an MCP server — add it to the agent's MCP config and it
-gets `synty_search` / `synty_topics` / `synty_recent` / `synty_status` as tools:
+gets the same read surface as tools (`synty_search`, `synty_topics`,
+`synty_recent`, `synty_status`, `synty_stats`, `synty_tool`, `synty_show`; ids
+in any tool's output feed `synty_show`):
 
 ```sh
 cargo run --release -- mcp              # MCP over stdio

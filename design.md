@@ -144,9 +144,10 @@ runs on CI or a server without a developer machine.
   charts + spend tables), and status (self-health + fleet roster), with
   browse/drill (topic → members → full document), reusing the CLI's
   view-models. *Built.*
-- **MCP server:** `synty mcp` serves `synty_search / synty_topics /
-  synty_recent / synty_status` as agent tools over stdio (hand-rolled JSON-RPC,
-  no new deps), so a coding agent consults past work mid-session. *Built.*
+- **MCP server:** `synty mcp` serves the CLI's read surface as agent tools
+  over stdio (hand-rolled JSON-RPC, no new deps) — search, topics, recent,
+  status, stats, tool, show — so a coding agent consults past work
+  mid-session and drills by the ids the tools print. *Built.*
 - **JSON output:** `--json` on every read command, one versioned envelope
   (`{"v": 1, "kind": …, "data": …}`) so scripts check the format once. *Built.*
 - **Team web frontend (optional):** the same view models served over HTTP for a
