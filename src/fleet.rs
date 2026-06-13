@@ -268,7 +268,13 @@ impl Acc {
         }
     }
 
-    pub(crate) fn finish(self, docs: &[Doc], quiet_days: u64, members: Option<&HashSet<String>>) -> Roster {
+    pub(crate) fn finish(
+        self,
+        docs: &[Doc],
+        quiet_days: u64,
+        members: Option<&HashSet<String>>,
+        ignore: &HashSet<String>,
+    ) -> Roster {
         let quiet_cutoff = rfc3339(self.now_ms - quiet_days as i64 * DAY_MS);
         let win_cutoff = self.win_cutoff;
 
@@ -307,7 +313,20 @@ impl Acc {
                 continue;
             }
             let login = d.meta.author.to_lowercase();
-            if is_bot(&login) || members.is_some_and(|m| !m.contains(&login)) {
+            // Precedence: an explicit ignore wins; then org membership is
+            // AUTHORITATIVE when known — a member is a person, full stop, so
+            // the is_bot login heuristic never runs and can't override the
+            // org's own answer (a service-account member is dropped only via
+            // the ignore list). The heuristic is the fallback ONLY when there
+            // is no member list (a personal account / no org-read token).
+            if ignore.contains(&login) {
+                continue;
+            }
+            let excluded = match members {
+                Some(m) => !m.contains(&login),
+                None => is_bot(&login),
+            };
+            if excluded {
                 continue;
             }
             let e = gh.entry(login).or_default();
@@ -353,8 +372,10 @@ pub fn roster(docs: &[Doc], local: &std::path::Path) -> Roster {
             }
         }
     }
-    let quiet_days = crate::config::load().fleet_quiet_days.unwrap_or(QUIET_DAYS_DEFAULT);
-    acc.finish(docs, quiet_days, org_members().as_ref())
+    let cfg = crate::config::load();
+    let quiet_days = cfg.fleet_quiet_days.unwrap_or(QUIET_DAYS_DEFAULT);
+    let ignore: HashSet<String> = cfg.fleet_ignore.iter().map(|l| l.to_lowercase()).collect();
+    acc.finish(docs, quiet_days, org_members().as_ref(), &ignore)
 }
 
 /// `edge-<machine>-<sourceid>` → (machine, sourceid). Streams that predate
@@ -466,7 +487,7 @@ mod tests {
         let mut acc = Acc::new(now_ms());
         acc.fold(&line("e1", "edge-mac-1-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", ""));
         acc.fold(&line("e2", "edge-ci-7-codex", "2026-05-24T08:00:00Z", "user_prompt", "codex_cli", "", ""));
-        let r = acc.finish(&[], 7, None);
+        let r = acc.finish(&[], 7, None, &HashSet::new());
         assert_eq!(r.machines.len(), 2);
         assert_eq!(r.machines[0].machine, "mac-1");
         assert!(!r.machines[0].quiet);
@@ -481,7 +502,7 @@ mod tests {
         let mut acc = Acc::new(now_ms());
         acc.fold(&line("e1", "edge-mac-1234-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", ""));
         acc.fold(&line("e2", "edge-mac-1234-codex", "2026-06-11T08:00:00Z", "user_prompt", "codex_cli", "", ""));
-        let r = acc.finish(&[], 7, None);
+        let r = acc.finish(&[], 7, None, &HashSet::new());
         assert_eq!(r.machines.len(), 1);
         assert_eq!(r.machines[0].machine, "mac-1234");
         assert_eq!(r.machines[0].sources, ["claude", "codex"]);
@@ -499,7 +520,7 @@ mod tests {
             gh_doc("alice", "2026-06-10T00:00:00Z", None),
             gh_doc("bob", "2026-06-11T00:00:00Z", None),
         ];
-        let r = acc.finish(&docs, 7, None);
+        let r = acc.finish(&docs, 7, None, &HashSet::new());
         assert_eq!(r.actors_tracked, ["Alice"]);
         assert_eq!(r.gh_active, 2);
         assert_eq!(r.install_rate_pct, 50, "the join is case-insensitive");
@@ -517,7 +538,7 @@ mod tests {
             gh_doc("carol", "2026-06-11T00:00:00Z", None),
             gh_doc("bob", "2026-06-11T00:00:00Z", Some("claude")),
         ];
-        let r = acc.finish(&docs, 7, None);
+        let r = acc.finish(&docs, 7, None, &HashSet::new());
         let listed: Vec<(&str, Option<&str>)> =
             r.untracked.iter().map(|u| (u.login.as_str(), u.agent.as_deref())).collect();
         assert_eq!(listed, [("bob", Some("claude")), ("carol", None)], "attributed first, then alphabetical");
@@ -536,7 +557,7 @@ mod tests {
             gh_doc("github-actions", "2026-06-11T00:00:00Z", None),
             gh_doc("devin-ai-integration[bot]", "2026-06-11T00:00:00Z", Some("devin")),
         ];
-        let r = acc.finish(&docs, 7, None);
+        let r = acc.finish(&docs, 7, None, &HashSet::new());
         assert_eq!(r.gh_active, 1, "only the human counts");
         let logins: Vec<&str> = r.untracked.iter().map(|u| u.login.as_str()).collect();
         assert_eq!(logins, ["alice"]);
@@ -552,14 +573,38 @@ mod tests {
             gh_doc("drive-by", "2026-06-11T00:00:00Z", None), // external contributor
         ];
         // Unscoped: both active, both uncovered.
-        let r = Acc::new(now_ms()).finish(&docs, 7, None);
+        let r = Acc::new(now_ms()).finish(&docs, 7, None, &HashSet::new());
         assert_eq!(r.gh_active, 2);
         // Scoped to members: only alice. Case-insensitive on the login.
         let members: HashSet<String> = ["alice".to_string()].into_iter().collect();
-        let r = Acc::new(now_ms()).finish(&docs, 7, Some(&members));
+        let r = Acc::new(now_ms()).finish(&docs, 7, Some(&members), &HashSet::new());
         assert_eq!(r.gh_active, 1, "the external PR author is not a core user");
         let logins: Vec<&str> = r.untracked.iter().map(|u| u.login.as_str()).collect();
         assert_eq!(logins, ["alice"]);
+    }
+
+    // The ignore list drops a login even when it's a member (a service/release
+    // account that's a real org member) — the right way to hide it: data, not
+    // a name in is_bot. And org membership is authoritative: the is_bot login
+    // heuristic does NOT run when members are known, so a member who happens to
+    // have "bot" in their name is never dropped by the heuristic.
+    #[test]
+    fn ignore_list_and_membership_authority() {
+        let docs = vec![
+            gh_doc("alice", "2026-06-11T00:00:00Z", None),
+            gh_doc("releasebot", "2026-06-11T00:00:00Z", None), // a member, "bot" in the name
+        ];
+        let members: HashSet<String> = ["alice".to_string(), "releasebot".to_string()].into_iter().collect();
+        // Without an ignore, membership is authoritative — releasebot is a
+        // member, so the is_bot heuristic does not strip it.
+        let r = Acc::new(now_ms()).finish(&docs, 7, Some(&members), &HashSet::new());
+        let logins: Vec<&str> = r.untracked.iter().map(|u| u.login.as_str()).collect();
+        assert_eq!(logins, ["alice", "releasebot"], "membership wins over the is_bot name heuristic");
+        // The explicit ignore list is how you drop a service-account member.
+        let ignore: HashSet<String> = ["releasebot".to_string()].into_iter().collect();
+        let r = Acc::new(now_ms()).finish(&docs, 7, Some(&members), &ignore);
+        let logins: Vec<&str> = r.untracked.iter().map(|u| u.login.as_str()).collect();
+        assert_eq!(logins, ["alice"], "ignore list drops the service account");
     }
 
     // An author whose last activity predates the window is not "active" —
@@ -567,7 +612,7 @@ mod tests {
     #[test]
     fn old_github_activity_does_not_count_as_active() {
         let acc = Acc::new(now_ms());
-        let r = acc.finish(&[gh_doc("zoe", "2026-05-04T00:00:00Z", None)], 7, None);
+        let r = acc.finish(&[gh_doc("zoe", "2026-05-04T00:00:00Z", None)], 7, None, &HashSet::new());
         assert_eq!(r.gh_active, 0);
         assert!(r.untracked.is_empty());
         assert_eq!(r.install_rate_pct, 0);
@@ -581,7 +626,7 @@ mod tests {
         let l = line("same-id", "edge-m1-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", "");
         acc.fold(&l);
         acc.fold(&l);
-        let r = acc.finish(&[], 7, None);
+        let r = acc.finish(&[], 7, None, &HashSet::new());
         assert_eq!(r.machines[0].events, 1);
     }
 
@@ -593,7 +638,7 @@ mod tests {
         acc.fold(&line("e1", "edge-m1-claudecode", "2026-06-01T08:00:00Z", "session_start", "claude_code", "a", "0.1.0"));
         acc.fold(&line("e2", "edge-m1-claudecode", "2026-06-12T08:00:00Z", "session_start", "claude_code", "a", "0.2.0"));
         acc.fold(&line("e3", "edge-old-claudecode", "2026-06-12T09:00:00Z", "session_start", "claude_code", "a", ""));
-        let r = acc.finish(&[], 7, None);
+        let r = acc.finish(&[], 7, None, &HashSet::new());
         let m1 = r.machines.iter().find(|m| m.machine == "m1").unwrap();
         let old = r.machines.iter().find(|m| m.machine == "old").unwrap();
         assert_eq!(m1.version, "0.2.0");

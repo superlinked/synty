@@ -38,6 +38,12 @@ pub struct Config {
     /// on the fleet roster (default 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_quiet_days: Option<u64>,
+    /// GitHub logins to drop from the fleet roster even when they're org
+    /// members — service/release accounts (e.g. a release bot that's a real
+    /// member) that no one should be "told to install synty". Data, not a
+    /// name baked into code: edit it per org.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fleet_ignore: Vec<String>,
 }
 
 /// Bucket precedence: explicit flag > config > the local default.
