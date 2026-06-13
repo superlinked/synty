@@ -136,6 +136,133 @@ pub fn status() -> Result<Status> {
     })
 }
 
+/// One Mon-aligned week of activity (`start` is the Monday, YYYY-MM-DD).
+pub struct WeekRow {
+    pub start: String,
+    pub row: crate::units::DayRow,
+}
+
+/// `synty stats`: a fixed window of whole weeks anchored to the most recent
+/// day WITH data (never the wall clock — same rule as the TUI charts), the
+/// window total, and the raw day series for --json.
+pub struct StatsView {
+    pub anchor: String,
+    pub weeks: Vec<WeekRow>,
+    pub total: crate::units::DayRow,
+    /// Ascending (day, row) pairs inside the window — day resolution lives
+    /// in the JSON; the Markdown stays weekly.
+    pub days: Vec<(String, crate::units::DayRow)>,
+}
+
+pub fn stats(weeks: usize) -> Result<StatsView> {
+    let units = crate::units::units()?;
+    Ok(stats_view(crate::units::activity_by_day(&units), weeks))
+}
+
+fn stats_view(activity: std::collections::HashMap<String, crate::units::DayRow>, weeks: usize) -> StatsView {
+    use crate::units::{day_num, week_start_for, DayRow};
+    let weeks = weeks.max(1);
+    let Some(anchor) = activity.keys().max().cloned() else {
+        return StatsView { anchor: String::new(), weeks: vec![], total: DayRow::default(), days: vec![] };
+    };
+    let Some(gmax) = day_num(&anchor) else {
+        return StatsView { anchor: String::new(), weeks: vec![], total: DayRow::default(), days: vec![] };
+    };
+    let start = week_start_for(gmax, weeks);
+    let mut buckets = vec![DayRow::default(); weeks];
+    let mut total = DayRow::default();
+    let mut days: Vec<(String, DayRow)> = Vec::new();
+    for (d, r) in &activity {
+        let Some(n) = day_num(d) else { continue };
+        if n < start {
+            continue;
+        }
+        buckets[(((n - start) / 7) as usize).min(weeks - 1)].add(r);
+        total.add(r);
+        days.push((d.clone(), *r));
+    }
+    days.sort_by(|a, b| a.0.cmp(&b.0));
+    let week_rows = buckets
+        .into_iter()
+        .enumerate()
+        .map(|(w, row)| WeekRow { start: day_str(start + 7 * w as i32), row })
+        .collect();
+    StatsView { anchor, weeks: week_rows, total, days }
+}
+
+/// YYYY-MM-DD for a num_days_from_ce (the inverse of units::day_num).
+fn day_str(n: i32) -> String {
+    chrono::NaiveDate::from_num_days_from_ce_opt(n).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default()
+}
+
+pub fn stats_md(s: &StatsView) -> String {
+    if s.weeks.is_empty() {
+        return "# stats\n\n_(no data yet — `synty up` tracks and indexes this machine)_\n".to_string();
+    }
+    let mut o = format!("# stats — {} weeks to {}\n", s.weeks.len(), s.anchor);
+    // Two tables, mirroring the TUI's stacked charts: what the agents
+    // consumed, then what the work produced.
+    o.push_str("\nagents (wk of · tok-in · tok-out · cache-r · cache-w · tools · sessions):\n");
+    let agents = |o: &mut String, label: &str, r: &crate::units::DayRow| {
+        o.push_str(&format!(
+            "  {:<10} {:>8} {:>8} {:>8} {:>8} {:>6} {:>8}\n",
+            label,
+            fmt_tokens(r.tok_in),
+            fmt_tokens(r.tok_out),
+            fmt_tokens(r.cache_read),
+            fmt_tokens(r.cache_create),
+            fmt_tokens(r.tools),
+            r.sessions,
+        ));
+    };
+    for w in &s.weeks {
+        agents(&mut o, &w.start, &w.row);
+    }
+    agents(&mut o, "total", &s.total);
+    o.push_str("\noutput (wk of · loc+ · loc- · prs · issues):\n");
+    let output = |o: &mut String, label: &str, r: &crate::units::DayRow| {
+        o.push_str(&format!(
+            "  {:<10} {:>8} {:>8} {:>5} {:>6}\n",
+            label,
+            fmt_tokens(r.loc_add),
+            fmt_tokens(r.loc_del),
+            r.prs,
+            r.issues,
+        ));
+    };
+    for w in &s.weeks {
+        output(&mut o, &w.start, &w.row);
+    }
+    output(&mut o, "total", &s.total);
+    o
+}
+
+fn day_row_json(r: &crate::units::DayRow) -> serde_json::Value {
+    serde_json::json!({
+        "tok_in": r.tok_in, "tok_out": r.tok_out,
+        "cache_read": r.cache_read, "cache_create": r.cache_create,
+        "tools": r.tools, "sessions": r.sessions,
+        "loc_add": r.loc_add, "loc_del": r.loc_del,
+        "prs": r.prs, "issues": r.issues,
+    })
+}
+
+pub fn stats_json(s: &StatsView) -> String {
+    envelope(
+        "stats",
+        serde_json::json!({
+            "anchor": s.anchor,
+            "weeks": s.weeks.iter().map(|w| {
+                let mut v = day_row_json(&w.row);
+                v["start"] = serde_json::json!(w.start);
+                v
+            }).collect::<Vec<_>>(),
+            "total": day_row_json(&s.total),
+            "days": s.days.iter().map(|(d, r)| (d.clone(), day_row_json(r))).collect::<serde_json::Map<_, _>>(),
+        }),
+    )
+}
+
 /// The fleet section of `status`: every machine with its liveness, who it
 /// attributes to, and the install-rate join — empty string when no streams
 /// have ever been seen (a fresh viewer before its first build).
@@ -663,6 +790,65 @@ mod tests {
         assert!(md.contains("ci-runner-7") && md.contains("QUIET"), "{md}");
         assert!(md.contains("runs agents, untracked: bob (claude)"), "{md}");
         assert!(fleet_md(&Default::default()).is_empty(), "no streams yet → no section");
+    }
+
+    fn activity_fixture() -> std::collections::HashMap<String, crate::units::DayRow> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "2026-06-12".to_string(), // a Friday — the anchor
+            crate::units::DayRow { tok_in: 46_100, tok_out: 12_300, cache_read: 1_200_000, cache_create: 96_000, tools: 412, sessions: 9, loc_add: 4_100, loc_del: 1_200, prs: 6, issues: 3 },
+        );
+        m.insert(
+            "2026-05-26".to_string(), // a Tuesday two weeks earlier
+            crate::units::DayRow { tok_out: 2_000, tools: 3, sessions: 1, prs: 1, ..Default::default() },
+        );
+        m.insert(
+            "2026-04-01".to_string(), // far outside any 3-week window
+            crate::units::DayRow { tok_out: 999_999, ..Default::default() },
+        );
+        m
+    }
+
+    // Weeks are whole Mon–Sun buckets ending with the week of the newest day
+    // that HAS data; days outside the window don't leak into the totals.
+    #[test]
+    fn stats_weeks_are_monday_aligned_and_anchored_to_data() {
+        let s = stats_view(activity_fixture(), 3);
+        assert_eq!(s.anchor, "2026-06-12");
+        let starts: Vec<&str> = s.weeks.iter().map(|w| w.start.as_str()).collect();
+        assert_eq!(starts, ["2026-05-25", "2026-06-01", "2026-06-08"], "Mondays, oldest first");
+        assert_eq!(s.weeks[0].row.prs, 1, "the Tuesday lands in its own week");
+        assert_eq!(s.weeks[2].row.sessions, 9, "the anchor day lands in the last week");
+        assert_eq!(s.total.tok_out, 14_300, "out-of-window days are excluded from the total");
+        assert_eq!(s.days.len(), 2, "the day series carries only the window");
+        assert!(s.days[0].0 < s.days[1].0, "days ascend");
+        assert!(stats_view(Default::default(), 4).weeks.is_empty(), "no data → empty view");
+    }
+
+    // The Markdown mirrors the TUI's two charts: an agents table over an
+    // output table, weekly rows plus a total, numbers humanized.
+    #[test]
+    fn stats_md_renders_agents_and_output_tables() {
+        let s = stats_view(activity_fixture(), 3);
+        let md = stats_md(&s);
+        assert!(md.contains("# stats — 3 weeks to 2026-06-12"), "{md}");
+        assert!(md.contains("agents (wk of · tok-in · tok-out · cache-r · cache-w · tools · sessions):"), "{md}");
+        assert!(md.contains("output (wk of · loc+ · loc- · prs · issues):"), "{md}");
+        assert!(md.contains("46.1k") && md.contains("1.2M"), "humanized numbers: {md}");
+        assert_eq!(md.matches("total").count(), 2, "each table closes with a total row: {md}");
+        assert!(stats_md(&stats_view(Default::default(), 4)).contains("no data yet"), "empty corpus stays friendly");
+    }
+
+    // --json is the day-resolution surface: an enveloped, day-keyed series.
+    #[test]
+    fn stats_json_is_day_keyed_under_envelope() {
+        let s = stats_view(activity_fixture(), 3);
+        let v: serde_json::Value = serde_json::from_str(&stats_json(&s)).unwrap();
+        assert_eq!((v["v"].as_i64(), v["kind"].as_str()), (Some(1), Some("stats")));
+        assert_eq!(v["data"]["anchor"], "2026-06-12");
+        assert_eq!(v["data"]["days"]["2026-06-12"]["tok_in"], 46_100);
+        assert_eq!(v["data"]["weeks"][0]["start"], "2026-05-25");
+        assert_eq!(v["data"]["total"]["prs"], 7);
     }
 
     // Every --json output arrives in the same versioned envelope, so a script

@@ -69,7 +69,8 @@ login-time tracking. The CLI has the same surface for agents and scripts:
 ```sh
 cargo run --release -- topic            # emergent topics (or `topic auth` to filter)
 cargo run --release -- recent           # latest PRs, issues, and prompts
-cargo run --release -- status           # what's indexed and how fresh it is
+cargo run --release -- status           # health: what's indexed, freshness, the fleet roster
+cargo run --release -- stats            # usage: tokens/tools/sessions vs LOC/PRs/issues per week
 ```
 
 Every read command takes `--json` for scripts; the output is one versioned

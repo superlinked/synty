@@ -511,6 +511,22 @@ pub struct DayRow {
     pub issues: u64,
 }
 
+impl DayRow {
+    /// Accumulate another day into this row (week buckets, window totals).
+    pub fn add(&mut self, o: &DayRow) {
+        self.tok_in += o.tok_in;
+        self.tok_out += o.tok_out;
+        self.cache_read += o.cache_read;
+        self.cache_create += o.cache_create;
+        self.tools += o.tools;
+        self.sessions += o.sessions;
+        self.loc_add += o.loc_add;
+        self.loc_del += o.loc_del;
+        self.prs += o.prs;
+        self.issues += o.issues;
+    }
+}
+
 /// day (YYYY-MM-DD) → combined activity: usage from the raw envelopes, LOC±
 /// from merged PRs, PR/issue counts from the given unit list.
 pub fn activity_by_day(units: &[Unit]) -> HashMap<String, DayRow> {

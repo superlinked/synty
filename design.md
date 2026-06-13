@@ -135,8 +135,9 @@ runs on CI or a server without a developer machine.
 
 ## Surfaces
 
-- **CLI → stdout (agents):** `search`, `topic`, `recent`, `status` print Markdown
-  an agent reads over the shell — no server, no auth, no network. *Built.*
+- **CLI → stdout (agents):** `search`, `topic`, `recent`, `status`, `stats`
+  print Markdown an agent reads over the shell — no server, no auth, no
+  network. *Built.*
 - **TUI (humans):** `synty tui` — tabs for topics, work, search, stats (usage
   charts + spend tables), and status (self-health + fleet roster), with
   browse/drill (topic → members → full document), reusing the CLI's

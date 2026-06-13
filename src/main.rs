@@ -203,6 +203,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Usage and output over time: tokens, cache, tool calls, sessions,
+    /// merged LOC±, PRs, issues — weekly tables here, a day-keyed series
+    /// with --json
+    Stats {
+        /// Trailing Mon-aligned weeks, anchored to the most recent day with data
+        #[arg(long, default_value_t = 4)]
+        weeks: usize,
+        /// Print as JSON (for scripts and agents)
+        #[arg(long)]
+        json: bool,
+    },
     /// First-run onboarding: connect GitHub, pick an org to back-fill, enable autostart
     Setup,
     /// Interactive terminal UI: status + browse/drill over topics, recent, search.
@@ -388,6 +399,14 @@ fn main() -> Result<()> {
                 println!("{}", view::status_json(&s));
             } else {
                 print!("{}", view::status_md(&s));
+            }
+        }
+        Cmd::Stats { weeks, json } => {
+            let s = view::stats(weeks)?;
+            if json {
+                println!("{}", view::stats_json(&s));
+            } else {
+                print!("{}", view::stats_md(&s));
             }
         }
         Cmd::Setup => setup::run()?,
