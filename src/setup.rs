@@ -27,7 +27,12 @@ pub fn run() -> Result<()> {
 
     if !accounts.is_empty() {
         cfg.github_login = Some(accounts[0].clone());
-        println!("Signed in as {}.\n", accounts[0]);
+        // The pin is what joins this machine's sessions to a GitHub author on
+        // the fleet roster — say so, so the attribution is no surprise.
+        println!(
+            "Signed in as {}. Sessions tracked on this machine will be attributed\nto {} — the same identity as your PRs.\n",
+            accounts[0], accounts[0]
+        );
 
         // 2. Which org/account to back-fill from.
         println!("Back-fill PRs & issues from which account?");
@@ -50,6 +55,22 @@ pub fn run() -> Result<()> {
             }
             Ok(_) => println!("\n(no active repos found in {})\n", accounts[idx]),
             Err(e) => println!("\n(couldn't preview repos: {e})\n"),
+        }
+    }
+
+    // Without a token there's no auto-pin, but the actor join (fleet roster,
+    // per-account stats) still needs a GitHub login — offer a manual pin and
+    // show what the machine would fall back to otherwise.
+    if accounts.is_empty() {
+        let derived = crate::identity::actor();
+        println!("Sessions on this machine currently attribute to `{derived}` (git email / $USER fallback).");
+        let login = prompt("GitHub login to attribute this machine's sessions to [blank = keep fallback]: ");
+        let login = login.trim();
+        if !login.is_empty() {
+            cfg.github_login = Some(login.to_string());
+            println!("Pinned — sessions will attribute to {login}.\n");
+        } else {
+            println!();
         }
     }
 
