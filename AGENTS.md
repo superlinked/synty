@@ -34,7 +34,8 @@ Rust binary.
 - Pipeline: `ingest` → `index` (encode docs + build) → `summarize` (one-line
   summary per unit) → `cluster [--resolution]` (group units by their summary
   embedding) → `summarize` again (reduce each topic from its members) /
-  `search` / `eval` — or `build`, which runs the whole chain in order. `cluster`
+  `search` / `related` / `eval` — or `build`, which runs the whole chain in
+  order. `cluster`
   consumes unit summaries; the topic pass of `summarize` consumes the clusters.
   Builds are immutable dirs under `index/builds/<build>/` behind the
   `index/current.json` pointer; clusters are additive revs inside the build.

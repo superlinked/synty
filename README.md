@@ -64,17 +64,24 @@ any list to one repo or account with `r`/`a`, refresh on demand with `u` (the
 footer shows build progress and staleness). The Stats tab charts what the
 agents consume against what the work produces and breaks the spend down per
 repo, account, tool, and model; the Status tab shows tracker health, the fleet
-roster (who runs synty where, who runs agents untracked), and toggles
-login-time tracking. The CLI has the same surface for agents and scripts:
+roster (who runs synty where, who runs agents untracked), whether you're running
+**local (trial)** or **activated** on a team bucket, and toggles login-time
+tracking. The CLI has the same surface for agents and scripts:
 
 ```sh
+cargo run --release -- related          # prior work related to what you're doing now (from this repo's git)
 cargo run --release -- topic            # emergent topics (or `topic auth` to filter)
 cargo run --release -- recent           # latest PRs, issues, and prompts
-cargo run --release -- status           # health: what's indexed, freshness, the fleet roster
+cargo run --release -- status           # health: what's indexed, freshness, activation, the fleet roster
 cargo run --release -- stats            # usage: tokens/tools/sessions vs LOC/PRs/issues per week
 cargo run --release -- tool Bash        # one tool's profile: volume, latency, argument mix
 cargo run --release -- show a1b2c3d4    # drill into a session, PR/issue (repo#123), or topic key
 ```
+
+`related` is the zero-effort entry point: with no query, it reads this repo's
+recent commits and changed files, builds a query from them, and surfaces prior
+sessions and PRs across every repo synty has seen — run it before starting a
+task to build on past work.
 
 Output is built to be drilled: `search`, `recent`, and `topic` print stable
 ids inline (`[a1b2c3d4]` for sessions, `repo#123` for PRs/issues, `[72a778f8]`
@@ -82,9 +89,10 @@ for topics) that feed `synty show <id>`. Every read command takes `--json`
 for scripts; the output is one versioned envelope,
 `{"v": 1, "kind": "…", "data": …}` — check `v` once, dispatch on `kind`. For
 coding agents there's an MCP server — add it to the agent's MCP config and it
-gets the same read surface as tools (`synty_search`, `synty_topics`,
-`synty_recent`, `synty_status`, `synty_stats`, `synty_tool`, `synty_show`; ids
-in any tool's output feed `synty_show`):
+gets the same read surface as tools (`synty_search`, `synty_related`,
+`synty_topics`, `synty_recent`, `synty_status`, `synty_stats`, `synty_tool`,
+`synty_show`; `synty_related` takes the agent's repo path and needs no query;
+ids in any tool's output feed `synty_show`):
 
 ```sh
 cargo run --release -- mcp              # MCP over stdio
@@ -140,12 +148,18 @@ Three roles, one binary:
   accumulate; the next viewer pays an incremental catch-up.
 
 ```sh
-SYNTY_BUCKET=s3://my-team ./install.sh   # per machine, or baked into VM images
+# One paste per machine (or baked into VM images): installs the binary, runs
+# `synty join <bucket>` (identity + login-time tracker + first build), and opens
+# the viewer. Omit the bucket for a local trial; re-run with one to activate.
+curl -fsSL <internal-url>/install.sh | sh -s -- s3://my-team
 ```
 
-The configured bucket is the default everywhere; `--bucket` overrides. Cloud
-buckets need `--features s3` / `gcs`. The TUI footer shows where things stand:
-`⟳ encoding 120/470` · `⚠ stale` · `✓ fresh`.
+The binary is internally hosted (`$SYNTY_BINARY_URL`), not a public package or
+Homebrew tap — distribution is team-first while the rollout proceeds. The
+configured bucket is the default everywhere; `--bucket` overrides. Cloud buckets
+need `--features s3` / `gcs`. The TUI footer shows where things stand —
+activation (`● local` → `✓ activated`) and freshness (`⟳ encoding 120/470` ·
+`⚠ stale` · `✓ fresh`).
 
 Caveat: every fleet member has raw bucket access and can read everyone's
 sessions. Fine for high-trust teams; the mediated-frontend tier (publication

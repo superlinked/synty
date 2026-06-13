@@ -142,19 +142,22 @@ runs on CI or a server without a developer machine.
 
 ## Surfaces
 
-- **CLI → stdout (agents):** `search`, `topic`, `recent`, `status`, `stats`,
-  `tool`, `show` print Markdown an agent reads over the shell — no server, no
-  auth, no network. Stable ids ride inline (sessions `[id8]`, PRs `repo#N`,
-  topics `[key8]`), and `show <id>` drills into any of them — list views and
-  detail views close the loop without JSON. *Built.*
+- **CLI → stdout (agents):** `search`, `related`, `topic`, `recent`, `status`,
+  `stats`, `tool`, `show` print Markdown an agent reads over the shell — no
+  server, no auth, no network. `related` takes no query: it derives one from the
+  repo's recent commits + changed files and searches cross-repo, so an agent can
+  pull prior work on its current task for free. Stable ids ride inline (sessions
+  `[id8]`, PRs `repo#N`, topics `[key8]`), and `show <id>` drills into any of
+  them — list views and detail views close the loop without JSON. *Built.*
 - **TUI (humans):** `synty tui` — tabs for topics, work, search, stats (usage
   charts + spend tables), and status (self-health + fleet roster), with
   browse/drill (topic → members → full document), reusing the CLI's
   view-models. *Built.*
 - **MCP server:** `synty mcp` serves the CLI's read surface as agent tools
-  over stdio (hand-rolled JSON-RPC, no new deps) — search, topics, recent,
-  status, stats, tool, show — so a coding agent consults past work
-  mid-session and drills by the ids the tools print. *Built.*
+  over stdio (hand-rolled JSON-RPC, no new deps) — search, related, topics,
+  recent, status, stats, tool, show — so a coding agent consults past work
+  mid-session and drills by the ids the tools print (`synty_related` takes the
+  agent's repo path and needs no query). *Built.*
 - **JSON output:** `--json` on every read command, one versioned envelope
   (`{"v": 1, "kind": …, "data": …}`) so scripts check the format once. *Built.*
 - **Team web frontend (optional):** the same view models served over HTTP for a
@@ -168,6 +171,18 @@ runs on CI or a server without a developer machine.
 - **Team / company:** a shared bucket plus **one frontend** that mediates reads.
   The frontend is where the privacy guardrails live, because read rules cannot
   be enforced on a client with raw bucket access.
+
+**Onboarding & the local→bucket ramp.** One command does it: `synty join
+[bucket]` pins the GitHub identity, enables the login-time tracker, and runs the
+first build (it subsumes the old interactive `setup` — synty isn't released, so
+there is one path, not two). Omit the bucket to trial synty against local
+sessions (invisible to the fleet — it pushes no events); re-run with a bucket
+and that same `join` is the switch onto the team (config gains the bucket; the
+next build's event sync does the rest — no migration). A machine is **activated**
+— a real fleet member — exactly when a bucket is set *and* autostart is on; that
+state shows on `status` and the TUI footer (`● local` → `✓ activated`), so the
+ramp is legible. The install one-liner carries the bucket and drops into the
+viewer, so a paste goes from nothing to tracking.
 
 ## Privacy (team tier)
 
