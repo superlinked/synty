@@ -1,12 +1,13 @@
-// `synty join [bucket]` — one-command onboarding. Idempotent and
-// non-interactive: point a machine at the team bucket (or run local with no
-// arg), pin its GitHub identity so sessions attribute to the same login as the
-// person's PRs, turn on the login-time tracker, and run the first build — so a
-// single command goes from nothing to "tracking + a viewer". Re-running with a
-// bucket is the local→bucket switch (the build's event sync does the rest).
+// `synty init [bucket]` — one-command onboarding. Idempotent and
+// non-interactive: initialize synty on this machine — point it at the team
+// bucket (or run local with no arg), pin its GitHub identity so sessions
+// attribute to the same login as the person's PRs, turn on the login-time
+// tracker, and run the first build — so a single command goes from nothing to
+// "tracking + a viewer". Re-running with a bucket is the local→bucket switch
+// (the build's event sync does the rest).
 //
-// This replaces the old interactive `setup`: synty isn't released yet, so there
-// is one onboarding path, not two.
+// This is the single onboarding path: synty isn't released yet, so there is one
+// command, not the old interactive `setup` plus something else.
 
 use crate::{config, github, identity, track, up};
 use anyhow::Result;
@@ -31,18 +32,18 @@ pub fn run(bucket: Option<String>, machine: &str, no_build: bool) -> Result<()> 
             if cfg.org.is_none() {
                 cfg.org = Some(accounts[0].clone());
             }
-            eprintln!("join: signed in as {} — sessions attribute to this login", accounts[0]);
+            eprintln!("init: signed in as {} — sessions attribute to this login", accounts[0]);
         }
         _ => eprintln!(
-            "join: no GitHub token — sessions attribute to your git identity; set GITHUB_TOKEN (or `gh auth login`) to link your PRs"
+            "init: no GitHub token — sessions attribute to your git identity; set GITHUB_TOKEN (or `gh auth login`) to link your PRs"
         ),
     }
     config::save(&cfg)?;
 
     // 3. Track at login.
     match track::autostart_set(true) {
-        Ok(()) => eprintln!("join: login-time tracker enabled"),
-        Err(e) => eprintln!("join: autostart unavailable ({e}) — run `synty up` to track in the foreground"),
+        Ok(()) => eprintln!("init: login-time tracker enabled"),
+        Err(e) => eprintln!("init: autostart unavailable ({e}) — run `synty up` to track in the foreground"),
     }
 
     // 4. First build: track → ingest → index → summarize → cluster, so the
@@ -53,9 +54,9 @@ pub fn run(bucket: Option<String>, machine: &str, no_build: bool) -> Result<()> 
 
     // 5. Tell the user where they stand on the local→bucket ramp.
     match &cfg.bucket {
-        Some(b) => eprintln!("\njoin: activated — tracking → {b}. Open the viewer: synty tui"),
+        Some(b) => eprintln!("\ninit: activated — tracking → {b}. Open the viewer: synty tui"),
         None => eprintln!(
-            "\njoin: tracking locally. When you're ready to join your team, run `synty join <bucket>`. Open the viewer: synty tui"
+            "\ninit: tracking locally. When you're ready to join your team, run `synty init <bucket>`. Open the viewer: synty tui"
         ),
     }
     Ok(())

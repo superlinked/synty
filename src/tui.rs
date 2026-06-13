@@ -478,7 +478,7 @@ impl App {
         match Freshen::spawn(&self.bucket) {
             Ok(f) => {
                 self.freshen = Some(f);
-                self.freshen_note = Some("⟳ freshening".into());
+                self.freshen_note = Some("◐ freshening".into());
             }
             Err(e) => self.freshen_note = Some(format!("freshen failed: {e}")),
         }
@@ -496,7 +496,7 @@ impl App {
             if let Some(ok) = done {
                 self.freshen = None;
                 if ok {
-                    self.freshen_note = Some("⟳ reloading".into());
+                    self.freshen_note = Some("◐ reloading".into());
                     let tx = self.btx.clone();
                     std::thread::spawn(move || {
                         let _ = tx.send(Bundle::load());
@@ -2127,7 +2127,7 @@ mod tests {
             term.backend().buffer().content().iter().map(|c| c.symbol()).collect()
         };
         let mut a = app();
-        a.freshen_note = Some("⟳ encoding 120/470".into());
+        a.freshen_note = Some("◐ encoding 120/470".into());
         assert!(text(&a, &mut term).contains("encoding 120/470"), "running phase missing");
         a.freshen_note = None;
         a.status.stale = true;

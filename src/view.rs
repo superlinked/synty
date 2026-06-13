@@ -766,7 +766,7 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
 pub fn activation_line(bucket: Option<&str>) -> String {
     match bucket {
         Some(b) => format!("✓ on the team — {b}"),
-        None => "◐ local — `synty join <bucket>` to join your team".to_string(),
+        None => "◐ local — `synty init <bucket>` to join your team".to_string(),
     }
 }
 
@@ -1642,7 +1642,7 @@ mod tests {
     fn activation_local_invites_to_join() {
         let line = activation_line(None);
         assert!(line.contains("local"), "no bucket → local: {line}");
-        assert!(line.contains("synty join"), "invites joining a team: {line}");
+        assert!(line.contains("synty init"), "invites joining a team via init: {line}");
         assert!(!line.contains("trial"), "no '(trial)' framing: {line}");
     }
 

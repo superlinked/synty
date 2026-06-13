@@ -22,7 +22,7 @@ mod mcp;
 mod metrics;
 mod progress;
 mod readmodel;
-mod join;
+mod init;
 mod related;
 mod store;
 mod sync;
@@ -247,10 +247,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Onboard this machine in one step: set the bucket (omit for a local trial),
-    /// pin the GitHub identity, enable the login-time tracker, and run the first
-    /// build. Idempotent — re-run with a bucket to switch a local trial onto the team.
-    Join {
+    /// Initialize synty on this machine in one step: set the bucket (omit for a
+    /// local trial), pin the GitHub identity, enable the login-time tracker, and
+    /// run the first build. Idempotent — re-run with a bucket to switch a local
+    /// trial onto the team.
+    Init {
         /// Team bucket (s3://… / gs://… / path). Omit for a local-only trial.
         bucket: Option<String>,
         /// Machine id used in this machine's stream names
@@ -363,7 +364,7 @@ enum Cmd {
     },
     /// Pull GitHub PRs/issues via GraphQL (token-based, no `gh` needed)
     Github {
-        /// Repository owner / org (default: the org pinned by `synty join`)
+        /// Repository owner / org (default: the org pinned by `synty init`)
         #[arg(long)]
         owner: Option<String>,
         /// Comma-separated repo names (default: the org's most-active set)
@@ -483,7 +484,7 @@ fn main() -> Result<()> {
                 print!("{}", view::show_report(&id)?);
             }
         }
-        Cmd::Join { bucket, machine, no_build } => join::run(bucket, &machine, no_build)?,
+        Cmd::Init { bucket, machine, no_build } => init::run(bucket, &machine, no_build)?,
         Cmd::Tui { bucket } => tui::run(model_id(), config::resolve_bucket(bucket))?,
         Cmd::Mcp => mcp::run(model_id())?,
         Cmd::Summarize { sessions, topics, bucket, cached, dump, sample } => {
@@ -537,7 +538,7 @@ fn main() -> Result<()> {
         Cmd::Github { owner, repos, since_days, out, bucket } => {
             let owner = owner
                 .or_else(|| config::load().org)
-                .ok_or_else(|| anyhow::anyhow!("no GitHub org: run `synty join` or pass --owner"))?;
+                .ok_or_else(|| anyhow::anyhow!("no GitHub org: run `synty init` or pass --owner"))?;
             github::run(&owner, repos, since_days, &out)?;
             let n = sync::push_github(&config::resolve_bucket(bucket), &out)?;
             if n > 0 {
@@ -553,16 +554,17 @@ mod tests {
     use super::{excerpt, first_line, Cli, Cmd};
     use clap::Parser;
 
-    // `synty join` is the single onboarding command: the bucket is an optional
-    // positional (omit = local trial), and the old `setup` is gone entirely.
+    // `synty init` is the single onboarding command: the bucket is an optional
+    // positional (omit = local trial), and the old `setup`/`join` names are gone.
     #[test]
-    fn join_parses_optional_bucket_and_setup_is_removed() {
-        let local = Cli::try_parse_from(["synty", "join"]).expect("bare join parses");
-        assert!(matches!(local.cmd, Cmd::Join { bucket: None, no_build: false, .. }));
-        let team = Cli::try_parse_from(["synty", "join", "gs://team", "--no-build"]).expect("join w/ bucket");
-        assert!(matches!(team.cmd, Cmd::Join { bucket: Some(b), no_build: true, .. } if b == "gs://team"));
-        // `setup` no longer exists — one onboarding path, no confusion.
+    fn init_parses_optional_bucket_and_old_names_are_removed() {
+        let local = Cli::try_parse_from(["synty", "init"]).expect("bare init parses");
+        assert!(matches!(local.cmd, Cmd::Init { bucket: None, no_build: false, .. }));
+        let team = Cli::try_parse_from(["synty", "init", "gs://team", "--no-build"]).expect("init w/ bucket");
+        assert!(matches!(team.cmd, Cmd::Init { bucket: Some(b), no_build: true, .. } if b == "gs://team"));
+        // The earlier names no longer exist — one onboarding path, no confusion.
         assert!(Cli::try_parse_from(["synty", "setup"]).is_err());
+        assert!(Cli::try_parse_from(["synty", "join"]).is_err());
     }
 
     #[test]

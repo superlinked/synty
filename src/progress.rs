@@ -19,13 +19,13 @@ pub fn parse(line: &str) -> Option<(String, usize, usize)> {
     Some((name.to_string(), done.trim().parse().ok()?, total.trim().parse().ok()?))
 }
 
-/// Human form for the TUI footer: "⟳ encode 120/470" (or "⟳ encode" when the
-/// step has no meaningful count).
+/// Human form for the TUI footer: "◐ encode 120/470" (or "◐ encode" when the
+/// step has no meaningful count). ◐ is synty's one work-in-progress glyph.
 pub fn describe(name: &str, done: usize, total: usize) -> String {
     if total <= 1 {
-        format!("⟳ {name}")
+        format!("◐ {name}")
     } else {
-        format!("⟳ {name} {done}/{total}")
+        format!("◐ {name} {done}/{total}")
     }
 }
 
@@ -39,7 +39,7 @@ mod tests {
         assert_eq!(parse("@phase summarize units 3/40"), Some(("summarize units".into(), 3, 40)));
         assert_eq!(parse("encoded 12/40"), None, "prose is not protocol");
         assert_eq!(parse("@phase broken"), None);
-        assert_eq!(describe("encode", 120, 470), "⟳ encode 120/470");
-        assert_eq!(describe("cluster", 0, 1), "⟳ cluster");
+        assert_eq!(describe("encode", 120, 470), "◐ encode 120/470");
+        assert_eq!(describe("cluster", 0, 1), "◐ cluster");
     }
 }

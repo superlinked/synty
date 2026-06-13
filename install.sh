@@ -4,10 +4,10 @@
 #   curl -fsSL <internal-url>/install.sh | sh                      # local trial
 #   curl -fsSL <internal-url>/install.sh | sh -s -- gs://my-team   # join the team
 #
-# It puts the binary on PATH, runs `synty join [bucket]` (pins your GitHub
+# It puts the binary on PATH, runs `synty init [bucket]` (pins your GitHub
 # identity, enables the login-time tracker, runs the first build), then opens
 # the viewer. Omit the bucket to try synty against your local sessions first;
-# re-paste with a bucket later and that same `join` switches you onto the team.
+# re-paste with a bucket later and that same `init` switches you onto the team.
 # Idempotent — safe to bake into dev-VM / sandbox images.
 #
 # Binary source, in order: $SYNTY_BINARY_URL (downloaded), $SYNTY_BINARY (a
@@ -48,9 +48,9 @@ mkdir -p "$SYNTY_HOME"
 # 4. One step: config + GitHub identity + login-time tracker + first build.
 #    With a bucket it's the local→bucket switch; without, a local trial.
 if [ -n "$BUCKET" ]; then
-  "$DEST/synty" join "$BUCKET"
+  "$DEST/synty" init "$BUCKET"
 else
-  "$DEST/synty" join
+  "$DEST/synty" init
 fi
 
 # 5. Drop into the viewer when there's a terminal to drive it. Under `curl | sh`

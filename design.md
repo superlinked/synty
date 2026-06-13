@@ -172,16 +172,17 @@ runs on CI or a server without a developer machine.
   The frontend is where the privacy guardrails live, because read rules cannot
   be enforced on a client with raw bucket access.
 
-**Onboarding & the local→bucket ramp.** One command does it: `synty join
+**Onboarding & the local→bucket ramp.** One command does it: `synty init
 [bucket]` pins the GitHub identity, enables the login-time tracker, and runs the
-first build (it subsumes the old interactive `setup` — synty isn't released, so
-there is one path, not two). Omit the bucket to trial synty against local
-sessions (invisible to the fleet — it pushes no events); re-run with a bucket
-and that same `join` is the switch onto the team (config gains the bucket; the
-next build's event sync does the rest — no migration). A machine is **activated**
-— a real fleet member — exactly when a bucket is set; the bucket is the only
-thing that moves the badge. Autostart (the login-time tracker) is turned on by
-`join`/install and is on by default thereafter, reported in its own indicator —
+first build (the single onboarding path — synty isn't released, so there's one
+command, not the old interactive `setup` plus more). Omit the bucket to trial
+synty against local sessions (invisible to the fleet — it pushes no events);
+re-run with a bucket and that same `init` is the switch onto the team (config
+gains the bucket; the next build's event sync does the rest — no migration). A
+machine is **activated** — a real fleet member — exactly when a bucket is set;
+the bucket is the only thing that moves the badge. Autostart (the login-time
+tracker) is turned on by `init`/install and is on by default thereafter,
+reported in its own indicator —
 not a second activation gate. The state shows on `status` and the TUI footer
 (`◐ local`, accent → `✓ <bucket>`, sage), so the ramp is legible. The install
 one-liner carries the bucket and drops into the viewer, so a paste goes from

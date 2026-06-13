@@ -42,7 +42,7 @@ events; whoever opens a viewer contributes the compute.
 - Multi-writer safety: readers dedup envelopes by event_id; session_end ids made deterministic.
 - Versioned read-model: immutable builds behind an atomically swapped pointer, locally (`index/builds/<build>/`, CoW-cloned appends) and in the bucket (content-addressed blobs + per-(build,rev) manifests) — no torn publishes, no mutating a reader's mmap.
 - Write-once shared summaries (first viewer generates for the fleet) + machine-seeded work splitting; a soft TTL lease serializes only the index build; cluster key lineage reads from the published build.
-- Viewer loop: `tui` pulls, renders, freshens via a background `build --no-track` child; hot-reload keeps the user's place; footer shows ⟳ phase / ⚠ stale / ✓ fresh.
+- Viewer loop: `tui` pulls, renders, freshens via a background `build --no-track` child; hot-reload keeps the user's place; footer shows ◐ phase / ⚠ stale / ✓ fresh.
 - Rollout: `install.sh` (binary + ~/.synty home + bucket config + login tracker); `config.bucket` as the default everywhere; `$SYNTY_HOME` resolution.
 - Compatibility: add-only envelopes (`v` field), model-namespaced embedding/summary stores, `format` gate on the read-model pointer (see design.md "Data compatibility").
 - Deferred: Cursor tailer (needs a machine with Cursor data); hosted agents (Claude Code web, Devin) need per-platform log-export exploration.
@@ -55,7 +55,7 @@ from the CLI and MCP.
 - Agent-attribution detection at ingest (`Co-authored-by` trailers, "Generated with" footers, bot author logins): the high-precision "runs agents, untracked" list.
 - TUI: current Status[4] becomes Stats[4] (usage); new Status[5] tab = synty self-health box + fleet roster.
 - Agent interface parity: `stats`, `tool <name>`, `show <unit|session>`, topic members on CLI and MCP; stable ids inline in Markdown; `--json` on every read command behind a versioned envelope.
-- Tracker binary version stamped into `session_start` (upgrade-rate monitoring); `setup` nudges GitHub-login pinning so actors join to GitHub authors.
+- Tracker binary version stamped into `session_start` (upgrade-rate monitoring); `init` pins GitHub-login so actors join to GitHub authors.
 
 ## Future work (after the milestones)
 - ~~MCP server exposing agent tools over stdio~~ — done (`synty mcp` serves the CLI's read surface as tools).
