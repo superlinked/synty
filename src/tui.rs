@@ -191,6 +191,7 @@ impl Bundle {
             last_indexed: None,
             last_tracked: None,
             autostart: false,
+            bucket: None,
             stale: false,
             fleet: Default::default(),
         });
@@ -886,17 +887,30 @@ impl App {
             View::Topics => self.draw_topics(f, body),
             View::Work | View::Search => self.draw_master_detail(f, body),
         }
-        // footer: contextual keys (left) · freshness (middle) · autostart (right)
-        // glyph-first, matching the freshness cell ("✓ fresh").
+        // footer: contextual keys (left) · mode · freshness · autostart (right),
+        // glyph-first, matching the freshness cell ("✓ fresh"). The mode cell is
+        // the local→bucket ramp: "● local" until a bucket is set, "✓ activated"
+        // once it is and autostart is on (a real fleet member).
         let auto = if self.autostart { " ✓ autostart " } else { " ✗ autostart " };
+        let activated = self.status.bucket.is_some() && self.autostart;
+        let mode = match (&self.status.bucket, activated) {
+            (Some(_), true) => " ✓ activated ",
+            (Some(_), false) => " ● bucket ",
+            (None, _) => " ● local ",
+        };
         let fresh = format!(" {} ", self.fresh_status());
-        let [fkeys, ffresh, fauto] = Layout::horizontal([
+        let [fkeys, fmode, ffresh, fauto] = Layout::horizontal([
             Constraint::Min(0),
+            Constraint::Length(mode.chars().count() as u16),
             Constraint::Length(fresh.chars().count() as u16),
             Constraint::Length(auto.chars().count() as u16),
         ])
         .areas(footer);
         f.render_widget(Line::from(self.footer()).fg(theme::DIM), fkeys);
+        f.render_widget(
+            Line::from(mode).fg(if activated { theme::SAGE } else { theme::DIM }).right_aligned(),
+            fmode,
+        );
         let fresh_color = if self.freshen.is_some() || self.reload_pending {
             theme::ACCENT
         } else if self.status.stale {
@@ -2030,7 +2044,7 @@ mod tests {
             sessions: vec![session],
             work,
             topics,
-            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1, chars: 81_200 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0, chars: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false, fleet: crate::fleet::Roster { machines: vec![crate::fleet::Machine { machine: "mac-3939".into(), sources: vec!["claude".into(), "codex".into()], actors: vec!["svonava".into()], last_ts: "2026-05-31T09:00:00Z".into(), version: "0.1.0".into(), events: 41, quiet: false }, crate::fleet::Machine { machine: "ci-runner-7".into(), sources: vec!["claude".into()], actors: vec![], last_ts: "2026-05-12T09:00:00Z".into(), version: String::new(), events: 0, quiet: true }], actors_tracked: vec!["svonava".into()], gh_active: 2, untracked: vec![crate::fleet::UntrackedAuthor { login: "bob".into(), agent: Some("claude".into()) }], install_rate_pct: 50, quiet_days: 7 } },
+            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1, chars: 81_200 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0, chars: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, bucket: None, stale: false, fleet: crate::fleet::Roster { machines: vec![crate::fleet::Machine { machine: "mac-3939".into(), sources: vec!["claude".into(), "codex".into()], actors: vec!["svonava".into()], last_ts: "2026-05-31T09:00:00Z".into(), version: "0.1.0".into(), events: 41, quiet: false }, crate::fleet::Machine { machine: "ci-runner-7".into(), sources: vec!["claude".into()], actors: vec![], last_ts: "2026-05-12T09:00:00Z".into(), version: String::new(), events: 0, quiet: true }], actors_tracked: vec!["svonava".into()], gh_active: 2, untracked: vec![crate::fleet::UntrackedAuthor { login: "bob".into(), agent: Some("claude".into()) }], install_rate_pct: 50, quiet_days: 7 } },
             view: View::Topics,
             sel: 0,
             nav: Nav::default(),

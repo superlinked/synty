@@ -56,6 +56,10 @@ pub struct Status {
     pub last_indexed: Option<String>,
     pub last_tracked: Option<String>,
     pub autostart: bool,
+    /// The configured team bucket, or None when this machine is local-only (a
+    /// trial). "Activated" — a real fleet member — is `bucket.is_some()` AND
+    /// autostart on.
+    pub bucket: Option<String>,
     /// Tracked events are newer than the index — answers may miss recent work.
     pub stale: bool,
     /// Per-machine liveness and the actor↔GitHub-author join (M8 coverage).
@@ -131,6 +135,7 @@ pub fn status() -> Result<Status> {
         last_indexed: readmodel::last_updated().map(fmt_time),
         last_tracked: mtime_str(".synty/cursors.json"),
         autostart: crate::track::autostart_enabled(),
+        bucket: crate::config::load().bucket,
         stale: stale_note().is_some(),
         fleet: crate::fleet::roster(&docs, std::path::Path::new(crate::units::LOCAL_DIR)),
     })
@@ -753,11 +758,24 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
     o
 }
 
+/// The local→bucket activation state — the rollout ramp made legible. A
+/// local-only machine is invisible to the fleet (it pushes no events); setting
+/// a bucket + autostart is exactly the moment it becomes a tracked member.
+pub fn activation_line(bucket: Option<&str>, autostart: bool) -> String {
+    match (bucket, autostart) {
+        (Some(b), true) => format!("mode: bucket {b} · activated ✓"),
+        (Some(b), false) => format!("mode: bucket {b} · autostart off — run `synty join {b}` to activate"),
+        (None, _) => "mode: local (trial) — `synty join <bucket>` to join your team".to_string(),
+    }
+}
+
 pub fn status_md(s: &Status) -> String {
     let mut o = String::from("# status\n\n");
     if s.stale {
         o.push_str("⚠ index is stale — tracked events are newer; run `synty up` or `synty build`\n\n");
     }
+    o.push_str(&activation_line(s.bucket.as_deref(), s.autostart));
+    o.push('\n');
     o.push_str(&format!(
         "{} docs · {} GitHub · {} sessions · autostart {}\nnewest: {}\nlast indexed: {} · last tracked: {}\n\nkinds: ",
         s.docs,
@@ -1559,6 +1577,7 @@ mod tests {
             last_indexed: None,
             last_tracked: None,
             autostart: false,
+            bucket: None,
             stale: false,
             fleet: Default::default(),
         };
@@ -1606,5 +1625,32 @@ mod tests {
         let by_user = tally(&docs, false);
         let alice = by_user.iter().find(|t| t.name == "alice").unwrap();
         assert_eq!((alice.github, alice.sessions), (1, 0));
+    }
+
+    // The local→bucket ramp, the three states a person passes through. Pure:
+    // the rendered status line is what tells them where they stand.
+    #[test]
+    fn activation_local_trial_invites_to_join() {
+        let line = activation_line(None, false);
+        assert!(line.contains("local (trial)"), "no bucket → local trial: {line}");
+        assert!(line.contains("synty join"), "invites joining a team: {line}");
+        // Autostart alone (no bucket) is still local — you can't be a fleet
+        // member without a shared bucket to push to.
+        assert!(activation_line(None, true).contains("local (trial)"));
+    }
+
+    #[test]
+    fn activation_bucket_plus_autostart_is_activated() {
+        let line = activation_line(Some("gs://my-team"), true);
+        assert!(line.contains("activated"), "bucket + autostart = activated: {line}");
+        assert!(line.contains("gs://my-team"), "names the bucket: {line}");
+    }
+
+    #[test]
+    fn activation_bucket_without_autostart_nudges_autostart() {
+        let line = activation_line(Some("gs://my-team"), false);
+        assert!(!line.contains("activated ✓"), "not yet activated without autostart: {line}");
+        assert!(line.contains("autostart off"), "flags the missing piece: {line}");
+        assert!(line.contains("synty join gs://my-team"), "tells them the exact fix: {line}");
     }
 }
