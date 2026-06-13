@@ -265,7 +265,7 @@ enum Cmd {
         #[arg(long)]
         sample: Option<usize>,
     },
-    /// Run the probe query set and write eval_report.md
+    /// Run the probe query set and write evals/runs.md
     Eval,
     /// Native tracker: parse local agent session files into canonical envelopes
     Track {

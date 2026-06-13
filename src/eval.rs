@@ -1,6 +1,6 @@
 // Retrieval probe harness, two parts:
 //  - the fixed, corpus-grounded query set (some with metadata filters), top-5
-//    per query to eval_runs.md + stdout for human scoring;
+//    per query to evals/runs.md + stdout for human scoring;
 //  - derived gold pairs: every session whose tracker recorded the PR it
 //    produced is a free relevance judgment — querying with the session's ask
 //    must retrieve that PR. Scored automatically (hit@5), grows with the
@@ -11,10 +11,10 @@ use anyhow::{anyhow, Result};
 use next_plaid::{MmapIndex, SearchParameters};
 use serde::Deserialize;
 
-const QUERIES_PATH: &str = "eval_queries.json";
+const QUERIES_PATH: &str = "evals/queries.json";
 
 /// One probe: a query and an optional `col=value` metadata filter. The gold set
-/// is corpus-specific, so it lives in `eval_queries.json` (gitignored), not the
+/// is corpus-specific, so it lives in `evals/queries.json` (gitignored), not the
 /// binary — each corpus brings its own.
 #[derive(Deserialize)]
 struct Probe {
@@ -71,7 +71,8 @@ pub fn run(model_id: &str) -> Result<()> {
         out.push('\n');
     }
 
-    std::fs::write("eval_runs.md", &out)?;
+    std::fs::create_dir_all("evals").ok();
+    std::fs::write("evals/runs.md", &out)?;
     print!("{out}");
     let mut m = crate::metrics::Run::new("eval");
     m.set("probes", probes.len()).set("derived_pairs", pairs.len()).set("derived_hits", hits).set(
@@ -79,7 +80,7 @@ pub fn run(model_id: &str) -> Result<()> {
         if pairs.is_empty() { 1.0 } else { hits as f64 / pairs.len() as f64 },
     );
     m.emit();
-    eprintln!("wrote eval_runs.md ({} probes, {} derived pairs)", probes.len(), pairs.len());
+    eprintln!("wrote evals/runs.md ({} probes, {} derived pairs)", probes.len(), pairs.len());
     Ok(())
 }
 

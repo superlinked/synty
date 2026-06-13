@@ -15,9 +15,14 @@ clusters.json
 unit_clusters.json
 clusters.md
 summary.md
-eval_runs.md
 cluster.err
 runs.log
+# Eval/tuning: gold sets (per-corpus) + rebuildable reports. evals/README.md
+# and evals/tuning.md ARE tracked.
+evals/queries.json
+evals/names.json
+evals/runs.md
+evals/names.md
 
 .synty/
 tmp/
@@ -28,6 +33,4 @@ tmp/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
-# corpus-specific eval gold set (per-machine)
-eval_queries.json
 .*.swp

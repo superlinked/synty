@@ -43,10 +43,10 @@ vote_disagree bridges id_continuity size_{min,med,max} tiny sessions docs
 clusters unclustered` (no silhouette: it structurally prefers coarser clusters
 — the grab-bag failure — so coherence is judged by the anchor eval instead);
 `[metrics summarize]`: `unit_coverage_pct topics_named name_dupes
-names_kw_fallback names_scored name_faithful_pct` (the name fields added with
-I2/I3 — topics sharing an identical name, names that are the keyword fallback
-rather than an accepted LLM title, and the share of LLM names clearing the
-embedding gate).
+names_fallback names_kw_last_resort names_scored name_faithful_pct` (the name
+fields added with I2/I3 — topics sharing an identical name, names that fell
+back from an accepted LLM title (and the tail that dropped all the way to the
+keyword label), and the share of LLM names clearing the embedding gate).
 
 How the I0 research played out:
 
@@ -109,9 +109,9 @@ error-handling PRs and "Update Dependencies" on synty sessions, after generation
   names 5→0, bare repo-slug names 27→0; with the grounded prompt in place the
   gate found a tight distribution (median 0.83, min 0.75 — the unfaithful tail
   was eliminated at the source) and stands as the regression guard.
-- **Guardrail:** the keyword-fallback share stays bounded (not over-rejecting good
-  names) — `names_kw_fallback` tracks it, `name_faithful_pct` the gate's pass
-  share.
+- **Guardrail:** the fallback share stays bounded (not over-rejecting good
+  names) — `names_fallback` tracks it (`names_kw_last_resort` the keyword-soup
+  tail), `name_faithful_pct` the gate's pass share.
 
 ### I3 — Ground the naming prompt · medium · shipped
 Addresses root cause #1 at the source, complementing I2's after-the-fact gate.
