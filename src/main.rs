@@ -14,6 +14,7 @@ mod encode;
 mod eval;
 mod event;
 mod config;
+mod fleet;
 mod github;
 mod identity;
 mod lease;
@@ -77,6 +78,11 @@ pub struct Meta {
     pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// Agent a GitHub doc attributes its work to (Co-authored-by trailer,
+    /// Generated-with footer, or bot author) — evidence agents ran for this
+    /// work even when no tracker saw it. Always None on session docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_attr: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

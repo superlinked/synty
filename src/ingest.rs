@@ -150,21 +150,24 @@ pub fn github_docs(json: &str, kind: &str, repo: &str) -> Result<Vec<Doc>> {
             .as_array()
             .map(|a| a.iter().filter_map(|l| l["name"].as_str().map(String::from)).collect())
             .unwrap_or_default();
+        let author = it["author"]["login"].as_str().unwrap_or("");
         out.push(Doc {
             id: 0,
-            text: trunc(&text, MAX_TEXT),
+            // Detect on the full text — trunc may cut a trailing footer.
             meta: Meta {
                 source: "github".into(),
                 kind: kind.into(),
                 repo: repo.into(),
-                author: it["author"]["login"].as_str().unwrap_or("").into(),
+                author: author.into(),
                 session_id: String::new(),
                 ts: it["createdAt"].as_str().unwrap_or("").into(),
                 number: it["number"].as_i64(),
                 url: it["url"].as_str().map(String::from),
                 state: it["state"].as_str().map(String::from),
                 labels,
+                agent_attr: crate::fleet::detect_agent(&text, author).map(String::from),
             },
+            text: trunc(&text, MAX_TEXT),
         });
     }
     Ok(out)
@@ -252,6 +255,7 @@ pub fn docs_from_events(
                 url: None,
                 state: None,
                 labels: vec![],
+                agent_attr: None,
             },
         });
     }
@@ -287,6 +291,10 @@ fn input_manifest<'a>(files: impl Iterator<Item = &'a PathBuf>) -> String {
     repos.sort();
     out.push_str(&format!("repos={}\n", repos.join(",")));
     out.push_str(&format!("cap={}\n", cfg.max_docs.unwrap_or(CAP)));
+    // Doc-derivation format: bump whenever the derivation itself changes (new
+    // Meta fields, new detectors) so a binary upgrade regenerates docs.jsonl
+    // once even though the input files are unchanged.
+    out.push_str("fmt=2\n");
     out
 }
 
@@ -412,6 +420,16 @@ mod tests {
         assert_eq!(d.meta.author, "alice");
         assert_eq!(d.meta.labels, vec!["P2", "docs"]);
         assert_eq!(d.meta.source, "github");
+        assert_eq!(d.meta.agent_attr, None, "a clean human PR carries no attribution");
+    }
+
+    // A PR whose body credits an agent (trailer or footer) is flagged, so the
+    // fleet roster can spot agent users no tracker has seen.
+    #[test]
+    fn github_doc_carries_agent_attribution() {
+        let json = r#"[{"number":9,"title":"fix race","body":"Serialize the tailer.\n\nCo-authored-by: Claude <noreply@anthropic.com>","author":{"login":"bob"},"createdAt":"2026-06-01T10:00:00Z"}]"#;
+        let docs = github_docs(json, "pull_request", "sie").unwrap();
+        assert_eq!(docs[0].meta.agent_attr.as_deref(), Some("claude"));
     }
 
     // An empty PR (no title/body) carries no signal and should be skipped.
@@ -564,6 +582,7 @@ mod tests {
                 url: None,
                 state: None,
                 labels: vec![],
+                agent_attr: None,
             },
         }
     }
@@ -632,6 +651,7 @@ mod tests {
                 url: None,
                 state: None,
                 labels: vec![],
+                agent_attr: None,
             },
         };
         let (kept, dropped) = cap_by_recency(

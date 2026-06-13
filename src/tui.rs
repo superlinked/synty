@@ -1901,6 +1901,7 @@ mod tests {
                 url: None,
                 state: Some("OPEN".into()),
                 labels: vec![],
+                agent_attr: None,
             },
         }
     }

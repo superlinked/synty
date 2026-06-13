@@ -572,6 +572,7 @@ mod tests {
                 url: None,
                 state: None,
                 labels: vec![],
+                agent_attr: None,
             },
         }
     }
