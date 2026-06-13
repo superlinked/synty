@@ -57,9 +57,11 @@ pub struct Status {
     pub last_tracked: Option<String>,
     pub autostart: bool,
     /// The configured team bucket, or None when this machine is local-only (a
-    /// trial). "Activated" — a real fleet member — is `bucket.is_some()` AND
-    /// autostart on.
+    /// trial). "Activated" — a real fleet member — is exactly `bucket.is_some()`.
     pub bucket: Option<String>,
+    /// A newer synty version published to the bucket, or None (current, or no
+    /// bucket). Drives the passive upgrade nag; never blocks anything.
+    pub upgrade: Option<String>,
     /// Tracked events are newer than the index — answers may miss recent work.
     pub stale: bool,
     /// Per-machine liveness and the actor↔GitHub-author join (M8 coverage).
@@ -122,6 +124,10 @@ pub fn status() -> Result<Status> {
     by_tool.sort_by(|a, b| b.chars.cmp(&a.chars).then(b.calls.cmp(&a.calls)).then(a.name.cmp(&b.name)));
     let mut by_model: Vec<crate::units::ModelUsage> = models.into_values().collect();
     by_model.sort_by(|a, b| b.tok_out.cmp(&a.tok_out).then(a.model.cmp(&b.model)));
+    // Only an activated (bucket-configured) machine checks for a newer binary;
+    // local-trial users pay nothing. Best-effort — `available` swallows errors.
+    let bucket = crate::config::load().bucket;
+    let upgrade = bucket.as_deref().and_then(crate::release::available);
     Ok(Status {
         docs: docs.len(),
         github,
@@ -135,7 +141,8 @@ pub fn status() -> Result<Status> {
         last_indexed: readmodel::last_updated().map(fmt_time),
         last_tracked: mtime_str(".synty/cursors.json"),
         autostart: crate::track::autostart_enabled(),
-        bucket: crate::config::load().bucket,
+        bucket,
+        upgrade,
         stale: stale_note().is_some(),
         fleet: crate::fleet::roster(&docs, std::path::Path::new(crate::units::LOCAL_DIR)),
     })
@@ -770,6 +777,12 @@ pub fn activation_line(bucket: Option<&str>) -> String {
     }
 }
 
+/// The passive upgrade nag, or None when current / no newer build. Pure; the
+/// status page renders this full sentence, the TUI footer a compact `⬆ <v>`.
+pub fn upgrade_line(newer: Option<&str>) -> Option<String> {
+    newer.map(|v| format!("◐ synty {v} available — run `synty upgrade`"))
+}
+
 /// A bucket URI trimmed to a glanceable name for the footer: scheme dropped, last
 /// path segment kept (`gs://acme/team-x` → `team-x`, `/srv/synty-bucket` →
 /// `synty-bucket`). The full URI still shows on the status page.
@@ -785,6 +798,10 @@ pub fn status_md(s: &Status) -> String {
     }
     o.push_str(&activation_line(s.bucket.as_deref()));
     o.push('\n');
+    if let Some(line) = upgrade_line(s.upgrade.as_deref()) {
+        o.push_str(&line);
+        o.push('\n');
+    }
     o.push_str(&format!(
         "{} docs · {} GitHub · {} sessions · autostart {}\nnewest: {}\nlast indexed: {} · last tracked: {}\n\nkinds: ",
         s.docs,
@@ -932,6 +949,8 @@ pub fn status_json(s: &Status) -> String {
         "last_indexed": s.last_indexed,
         "last_tracked": s.last_tracked,
         "autostart": s.autostart,
+        "bucket": s.bucket,
+        "upgrade": s.upgrade,
         "stale": s.stale,
         "fleet": {
             "machines": s.fleet.machines.iter().map(|m| serde_json::json!({
@@ -1587,6 +1606,7 @@ mod tests {
             last_tracked: None,
             autostart: false,
             bucket: None,
+            upgrade: None,
             stale: false,
             fleet: Default::default(),
         };
@@ -1594,6 +1614,10 @@ mod tests {
         assert_eq!((s["v"].as_i64(), s["kind"].as_str()), (Some(1), Some("status")));
         assert_eq!(s["data"]["docs"], 3, "the data keeps the prior object shape");
         assert!(s["data"]["fleet"]["machines"].is_array());
+        // Activation + the upgrade nag are exposed to agents (null here).
+        let data = s["data"].as_object().unwrap();
+        assert!(data.contains_key("bucket"), "activation in json");
+        assert!(data.contains_key("upgrade"), "upgrade availability in json");
     }
 
     fn doc(source: &str, kind: &str, repo: &str, author: &str, sid: &str) -> Doc {
@@ -1654,6 +1678,15 @@ mod tests {
         // Autostart is reported elsewhere; it never appears in this line and so
         // can't un-activate a machine that has a bucket.
         assert!(!line.to_lowercase().contains("autostart"), "autostart stays out of the line: {line}");
+    }
+
+    // The nag appears only when a newer build exists, and names the version +
+    // the exact command to run.
+    #[test]
+    fn upgrade_line_only_when_newer() {
+        assert_eq!(upgrade_line(None), None, "current → no nag");
+        let line = upgrade_line(Some("0.2.0")).expect("a nag");
+        assert!(line.contains("0.2.0") && line.contains("synty upgrade"), "names version + command: {line}");
     }
 
     // The footer name is the bucket trimmed to one glanceable segment.

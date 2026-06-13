@@ -192,6 +192,7 @@ impl Bundle {
             last_tracked: None,
             autostart: false,
             bucket: None,
+            upgrade: None,
             stale: false,
             fleet: Default::default(),
         });
@@ -898,15 +899,19 @@ impl App {
             Some(b) => format!(" ✓ {} ", crate::view::bucket_short(b)),
             None => " ◐ local ".to_string(),
         };
+        // Upgrade nag — empty (zero-width) unless a newer binary is published.
+        let up = self.status.upgrade.as_ref().map(|v| format!(" ⬆ {v} ")).unwrap_or_default();
         let fresh = format!(" {} ", self.fresh_status());
-        let [fkeys, fmode, ffresh, fauto] = Layout::horizontal([
+        let [fkeys, fup, fmode, ffresh, fauto] = Layout::horizontal([
             Constraint::Min(0),
+            Constraint::Length(up.chars().count() as u16),
             Constraint::Length(mode.chars().count() as u16),
             Constraint::Length(fresh.chars().count() as u16),
             Constraint::Length(auto.chars().count() as u16),
         ])
         .areas(footer);
         f.render_widget(Line::from(self.footer()).fg(theme::DIM), fkeys);
+        f.render_widget(Line::from(up).fg(theme::ACCENT).right_aligned(), fup);
         f.render_widget(
             Line::from(mode).fg(if activated { theme::SAGE } else { theme::ACCENT }).right_aligned(),
             fmode,
@@ -2044,7 +2049,7 @@ mod tests {
             sessions: vec![session],
             work,
             topics,
-            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1, chars: 81_200 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0, chars: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, bucket: None, stale: false, fleet: crate::fleet::Roster { machines: vec![crate::fleet::Machine { machine: "mac-3939".into(), sources: vec!["claude".into(), "codex".into()], actors: vec!["svonava".into()], last_ts: "2026-05-31T09:00:00Z".into(), version: "0.1.0".into(), events: 41, quiet: false }, crate::fleet::Machine { machine: "ci-runner-7".into(), sources: vec!["claude".into()], actors: vec![], last_ts: "2026-05-12T09:00:00Z".into(), version: String::new(), events: 0, quiet: true }], actors_tracked: vec!["svonava".into()], gh_active: 2, untracked: vec![crate::fleet::UntrackedAuthor { login: "bob".into(), agent: Some("claude".into()) }], install_rate_pct: 50, quiet_days: 7 } },
+            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1, chars: 81_200 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0, chars: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, bucket: None, upgrade: None, stale: false, fleet: crate::fleet::Roster { machines: vec![crate::fleet::Machine { machine: "mac-3939".into(), sources: vec!["claude".into(), "codex".into()], actors: vec!["svonava".into()], last_ts: "2026-05-31T09:00:00Z".into(), version: "0.1.0".into(), events: 41, quiet: false }, crate::fleet::Machine { machine: "ci-runner-7".into(), sources: vec!["claude".into()], actors: vec![], last_ts: "2026-05-12T09:00:00Z".into(), version: String::new(), events: 0, quiet: true }], actors_tracked: vec!["svonava".into()], gh_active: 2, untracked: vec![crate::fleet::UntrackedAuthor { login: "bob".into(), agent: Some("claude".into()) }], install_rate_pct: 50, quiet_days: 7 } },
             view: View::Topics,
             sel: 0,
             nav: Nav::default(),
