@@ -22,7 +22,7 @@ mod mcp;
 mod metrics;
 mod progress;
 mod readmodel;
-mod setup;
+mod join;
 mod store;
 mod sync;
 mod tail;
@@ -233,8 +233,19 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// First-run onboarding: connect GitHub, pick an org to back-fill, enable autostart
-    Setup,
+    /// Onboard this machine in one step: set the bucket (omit for a local trial),
+    /// pin the GitHub identity, enable the login-time tracker, and run the first
+    /// build. Idempotent — re-run with a bucket to switch a local trial onto the team.
+    Join {
+        /// Team bucket (s3://… / gs://… / path). Omit for a local-only trial.
+        bucket: Option<String>,
+        /// Machine id used in this machine's stream names
+        #[arg(long, default_value = "local")]
+        machine: String,
+        /// Configure + enable tracking but skip the first build
+        #[arg(long)]
+        no_build: bool,
+    },
     /// Interactive terminal UI: status + browse/drill over topics, recent, search.
     /// Pulls the fleet's read-model at startup and freshens in the background.
     Tui {
@@ -338,7 +349,7 @@ enum Cmd {
     },
     /// Pull GitHub PRs/issues via GraphQL (token-based, no `gh` needed)
     Github {
-        /// Repository owner / org (default: the org chosen in `synty setup`)
+        /// Repository owner / org (default: the org pinned by `synty join`)
         #[arg(long)]
         owner: Option<String>,
         /// Comma-separated repo names (default: the org's most-active set)
@@ -455,7 +466,7 @@ fn main() -> Result<()> {
                 print!("{}", view::show_report(&id)?);
             }
         }
-        Cmd::Setup => setup::run()?,
+        Cmd::Join { bucket, machine, no_build } => join::run(bucket, &machine, no_build)?,
         Cmd::Tui { bucket } => tui::run(model_id(), config::resolve_bucket(bucket))?,
         Cmd::Mcp => mcp::run(model_id())?,
         Cmd::Summarize { sessions, topics, bucket, cached, dump, sample } => {
@@ -509,7 +520,7 @@ fn main() -> Result<()> {
         Cmd::Github { owner, repos, since_days, out, bucket } => {
             let owner = owner
                 .or_else(|| config::load().org)
-                .ok_or_else(|| anyhow::anyhow!("no GitHub org: run `synty setup` or pass --owner"))?;
+                .ok_or_else(|| anyhow::anyhow!("no GitHub org: run `synty join` or pass --owner"))?;
             github::run(&owner, repos, since_days, &out)?;
             let n = sync::push_github(&config::resolve_bucket(bucket), &out)?;
             if n > 0 {
@@ -522,7 +533,20 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{excerpt, first_line};
+    use super::{excerpt, first_line, Cli, Cmd};
+    use clap::Parser;
+
+    // `synty join` is the single onboarding command: the bucket is an optional
+    // positional (omit = local trial), and the old `setup` is gone entirely.
+    #[test]
+    fn join_parses_optional_bucket_and_setup_is_removed() {
+        let local = Cli::try_parse_from(["synty", "join"]).expect("bare join parses");
+        assert!(matches!(local.cmd, Cmd::Join { bucket: None, no_build: false, .. }));
+        let team = Cli::try_parse_from(["synty", "join", "gs://team", "--no-build"]).expect("join w/ bucket");
+        assert!(matches!(team.cmd, Cmd::Join { bucket: Some(b), no_build: true, .. } if b == "gs://team"));
+        // `setup` no longer exists — one onboarding path, no confusion.
+        assert!(Cli::try_parse_from(["synty", "setup"]).is_err());
+    }
 
     #[test]
     fn first_line_skips_blanks_and_trims() {

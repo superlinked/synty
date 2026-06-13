@@ -30,23 +30,24 @@ ingests your dev transcripts, that is the whole point.
 ```sh
 cargo build --release
 
-# One-time: connect GitHub, pick the org to track, enable login-time tracking.
-cargo run --release -- setup
+# One command from nothing to tracking + a first build. Omit the bucket for a
+# local-only trial; pass your team bucket to join the fleet (re-run with a
+# bucket later to switch a local trial onto the team).
+cargo run --release -- join            # local trial
+cargo run --release -- join gs://my-team   # or join the fleet
 
-# Solo mode: track, ingest, and index on a loop — your machine is both the
-# tracker (lightweight, model-free) and the builder (downloads the embedding
-# model on first run; `build`/`tui` also fetch the summarizer). In fleet mode
-# machines run only the tracker.
+# Or run the loop yourself: track, ingest, and index every minute — your
+# machine is both the tracker (lightweight, model-free) and the builder
+# (downloads the embedding model on first run; `build`/`tui` also fetch the
+# summarizer). In fleet mode machines run only the tracker.
 cargo run --release -- up
 ```
 
-`setup` verifies your GitHub token, lists the orgs (and your own account) it can
-see, and lets you pick one — its most-recently-active repos are what gets
-back-filled — then offers to start the tracker at login. `up` tails your local Claude Code / Codex / Cowork
-session files, pulls the org's recent PRs/issues, and rebuilds the search index
-every minute. (No GitHub yet? `up` still tracks local sessions; run `setup`
-anytime to add it.) Once you see `indexed N docs`, query it from another
-terminal:
+`join` pins your GitHub identity (so sessions merge with your PRs), enables the
+login-time tracker, and runs the first build — non-interactive and idempotent.
+`up` tails your local Claude Code / Codex / Cowork session files, pulls the
+org's recent PRs/issues, and rebuilds the search index every minute. Once you
+see `indexed N docs`, query it from another terminal:
 
 ```sh
 cargo run --release -- search "rate limiting middleware"
@@ -102,7 +103,7 @@ The individual steps, for scripting (and what `up` loops over):
 
 ```sh
 cargo run --release -- track     # tail agent sessions → canonical event envelopes
-cargo run --release -- github    # pull the org's active PRs/issues (org from `setup`; $GITHUB_TOKEN or gh)
+cargo run --release -- github    # pull the org's active PRs/issues (org from `join`; $GITHUB_TOKEN or gh)
 cargo run --release -- ingest    # turn events + GitHub into searchable documents
 cargo run --release -- index     # encode with ColBERT and build the index
 cargo run --release -- search "<query>" [--filter col=value]
