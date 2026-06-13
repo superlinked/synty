@@ -91,6 +91,18 @@ pub fn run(owner: &str, repos: Option<String>, since_days: u64, out: &str) -> Re
         &serde_json::to_vec(&manifest)?,
     )?;
     eprintln!("github: {tot_pr} PRs + {tot_is} issues across {} repos (window since {cutoff}) → {out}", repos.len());
+
+    // Cache the org's members so the fleet roster scopes its untracked list to
+    // the team, not every external PR author. Best-effort: a user account or a
+    // token without org-read just leaves it unset (roster uses all authors).
+    match org_members(owner) {
+        Ok(m) if !m.is_empty() => {
+            crate::fleet::save_org_members(owner, &m);
+            eprintln!("github: cached {} org members for {owner}", m.len());
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("github: org members unavailable ({e}) — roster will use all active authors"),
+    }
     Ok(())
 }
 
@@ -272,6 +284,43 @@ pub fn accounts() -> Result<Vec<String>> {
     }
     if let Some(nodes) = data["viewer"]["organizations"]["nodes"].as_array() {
         out.extend(nodes.iter().filter_map(|o| o["login"].as_str()).map(str::to_string));
+    }
+    Ok(out)
+}
+
+/// Every member of `org` the token can see — the roster's "core users", so
+/// fleet coverage flags org members who go untracked, not every external
+/// contributor who happened to open a PR. Errors when `org` is a user account
+/// or the token lacks org-read visibility; the caller treats that as "unknown"
+/// and the roster falls back to all active authors.
+pub fn org_members(org: &str) -> Result<Vec<String>> {
+    let token = resolve_token()?;
+    let agent = quick_agent();
+    let q = r#"query($org:String!,$cursor:String){
+  organization(login:$org){
+    membersWithRole(first:100,after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{login}
+    }
+  }
+}"#;
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let data = post(&agent, &token, q, json!({"org": org, "cursor": cursor}))?;
+        let conn = &data["organization"]["membersWithRole"];
+        for n in conn["nodes"].as_array().cloned().unwrap_or_default() {
+            if let Some(l) = n["login"].as_str() {
+                out.push(l.to_string());
+            }
+        }
+        if conn["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
+            break;
+        }
+        cursor = conn["pageInfo"]["endCursor"].as_str().map(String::from);
+        if cursor.is_none() {
+            break;
+        }
     }
     Ok(out)
 }

@@ -126,12 +126,16 @@ runs on CI or a server without a developer machine.
   from data already in the bucket: the roster folds every `edge-<machine>-…`
   stream (liveness from envelope timestamps — file mtimes lie after a pull;
   actor stamps; `tracker_version` for upgrade lag) and joins it against the
-  GitHub authors active in a trailing window. Untracked authors whose PRs name
-  an agent (Co-authored-by trailer, Generated-with footer, bot author — flagged
-  at ingest as `agent_attr`, precision-first) are the actionable "runs agents,
-  unwatched" list; a machine that streamed and went quiet is tracker rot,
-  distinct from never-installed. `ingest` emits a `[metrics coverage]` block
-  (machines, actors, install rate). *Built (M8).*
+  org's **members** active on GitHub in a trailing window — scoped to the team
+  (`synty github` caches `membersWithRole`), not every external contributor who
+  opened one PR; CI/bot accounts filtered out. Everyone active and uncovered is
+  listed (the install gap a lead acts on), with agent-attribution
+  (Co-authored-by trailer, Generated-with footer, bot author — flagged at
+  ingest as `agent_attr`, precision-first) shown as a per-author marker rather
+  than the membership test, since most agent users leave no artifact. A machine
+  that streamed and went quiet is tracker rot, distinct from never-installed.
+  `ingest` emits a `[metrics coverage]` block (machines, actors, install rate).
+  *Built (M8).*
 
 ## Surfaces
 

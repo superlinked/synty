@@ -131,6 +131,47 @@ impl Roster {
     }
 }
 
+const MEMBERS_PATH: &str = ".synty/org_members.json";
+
+/// The org's members, cached by `synty github` so the offline roster can scope
+/// itself to "core users". Tagged with the org so a stale file from a previous
+/// org choice is ignored rather than mis-applied.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct OrgMembers {
+    org: String,
+    members: Vec<String>,
+    fetched: String,
+}
+
+/// Persist the org's member logins (called from the GitHub backfill).
+pub fn save_org_members(org: &str, members: &[String]) {
+    let m = OrgMembers {
+        org: org.to_string(),
+        members: members.to_vec(),
+        fetched: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&m) {
+        let _ = crate::write_atomic(MEMBERS_PATH, &bytes);
+    }
+}
+
+/// The cached org members (lowercased), or None when unknown — never fetched,
+/// empty, or cached for a different org than the one configured. None means the
+/// roster scopes to all active authors, the pre-membership behavior.
+fn org_members() -> Option<HashSet<String>> {
+    let m: OrgMembers = serde_json::from_str(&std::fs::read_to_string(MEMBERS_PATH).ok()?).ok()?;
+    if m.members.is_empty() {
+        return None;
+    }
+    // A members file for a different org than the configured one is stale.
+    if let Some(org) = crate::config::load().org {
+        if !org.eq_ignore_ascii_case(&m.org) {
+            return None;
+        }
+    }
+    Some(m.members.iter().map(|l| l.to_lowercase()).collect())
+}
+
 /// GitHub automation accounts — CI/release bots and the agent bot accounts
 /// themselves — excluded from the human coverage roster and the install-rate
 /// denominator. Heuristic on the login (the cheap signal we already store);
@@ -227,7 +268,7 @@ impl Acc {
         }
     }
 
-    pub(crate) fn finish(self, docs: &[Doc], quiet_days: u64) -> Roster {
+    pub(crate) fn finish(self, docs: &[Doc], quiet_days: u64, members: Option<&HashSet<String>>) -> Roster {
         let quiet_cutoff = rfc3339(self.now_ms - quiet_days as i64 * DAY_MS);
         let win_cutoff = self.win_cutoff;
 
@@ -257,15 +298,16 @@ impl Acc {
         let tracked_lower: BTreeSet<String> = actors_tracked.iter().map(|a| a.to_lowercase()).collect();
 
         // GitHub side of the join: distinct human authors active in the
-        // window (bots excluded), each carrying the first agent attribution
-        // seen on their work (if any).
+        // window (bots excluded), scoped to org members when known — so an
+        // external contributor who opened one PR isn't counted as someone to
+        // track. Each carries the first agent attribution seen on their work.
         let mut gh: BTreeMap<String, Option<String>> = BTreeMap::new();
         for d in docs {
             if d.meta.source != "github" || d.meta.author.is_empty() || d.meta.ts.as_str() < win_cutoff.as_str() {
                 continue;
             }
             let login = d.meta.author.to_lowercase();
-            if is_bot(&login) {
+            if is_bot(&login) || members.is_some_and(|m| !m.contains(&login)) {
                 continue;
             }
             let e = gh.entry(login).or_default();
@@ -312,7 +354,7 @@ pub fn roster(docs: &[Doc], local: &std::path::Path) -> Roster {
         }
     }
     let quiet_days = crate::config::load().fleet_quiet_days.unwrap_or(QUIET_DAYS_DEFAULT);
-    acc.finish(docs, quiet_days)
+    acc.finish(docs, quiet_days, org_members().as_ref())
 }
 
 /// `edge-<machine>-<sourceid>` → (machine, sourceid). Streams that predate
@@ -424,7 +466,7 @@ mod tests {
         let mut acc = Acc::new(now_ms());
         acc.fold(&line("e1", "edge-mac-1-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", ""));
         acc.fold(&line("e2", "edge-ci-7-codex", "2026-05-24T08:00:00Z", "user_prompt", "codex_cli", "", ""));
-        let r = acc.finish(&[], 7);
+        let r = acc.finish(&[], 7, None);
         assert_eq!(r.machines.len(), 2);
         assert_eq!(r.machines[0].machine, "mac-1");
         assert!(!r.machines[0].quiet);
@@ -439,7 +481,7 @@ mod tests {
         let mut acc = Acc::new(now_ms());
         acc.fold(&line("e1", "edge-mac-1234-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", ""));
         acc.fold(&line("e2", "edge-mac-1234-codex", "2026-06-11T08:00:00Z", "user_prompt", "codex_cli", "", ""));
-        let r = acc.finish(&[], 7);
+        let r = acc.finish(&[], 7, None);
         assert_eq!(r.machines.len(), 1);
         assert_eq!(r.machines[0].machine, "mac-1234");
         assert_eq!(r.machines[0].sources, ["claude", "codex"]);
@@ -457,7 +499,7 @@ mod tests {
             gh_doc("alice", "2026-06-10T00:00:00Z", None),
             gh_doc("bob", "2026-06-11T00:00:00Z", None),
         ];
-        let r = acc.finish(&docs, 7);
+        let r = acc.finish(&docs, 7, None);
         assert_eq!(r.actors_tracked, ["Alice"]);
         assert_eq!(r.gh_active, 2);
         assert_eq!(r.install_rate_pct, 50, "the join is case-insensitive");
@@ -475,7 +517,7 @@ mod tests {
             gh_doc("carol", "2026-06-11T00:00:00Z", None),
             gh_doc("bob", "2026-06-11T00:00:00Z", Some("claude")),
         ];
-        let r = acc.finish(&docs, 7);
+        let r = acc.finish(&docs, 7, None);
         let listed: Vec<(&str, Option<&str>)> =
             r.untracked.iter().map(|u| (u.login.as_str(), u.agent.as_deref())).collect();
         assert_eq!(listed, [("bob", Some("claude")), ("carol", None)], "attributed first, then alphabetical");
@@ -494,8 +536,28 @@ mod tests {
             gh_doc("github-actions", "2026-06-11T00:00:00Z", None),
             gh_doc("devin-ai-integration[bot]", "2026-06-11T00:00:00Z", Some("devin")),
         ];
-        let r = acc.finish(&docs, 7);
+        let r = acc.finish(&docs, 7, None);
         assert_eq!(r.gh_active, 1, "only the human counts");
+        let logins: Vec<&str> = r.untracked.iter().map(|u| u.login.as_str()).collect();
+        assert_eq!(logins, ["alice"]);
+    }
+
+    // When the org's members are known, an external contributor who opened a
+    // PR but isn't on the team drops out of the active count and the roster —
+    // we only chase core users. Without a member set, everyone active counts.
+    #[test]
+    fn org_members_scope_the_roster_to_core_users() {
+        let docs = vec![
+            gh_doc("alice", "2026-06-11T00:00:00Z", None),  // member
+            gh_doc("drive-by", "2026-06-11T00:00:00Z", None), // external contributor
+        ];
+        // Unscoped: both active, both uncovered.
+        let r = Acc::new(now_ms()).finish(&docs, 7, None);
+        assert_eq!(r.gh_active, 2);
+        // Scoped to members: only alice. Case-insensitive on the login.
+        let members: HashSet<String> = ["alice".to_string()].into_iter().collect();
+        let r = Acc::new(now_ms()).finish(&docs, 7, Some(&members));
+        assert_eq!(r.gh_active, 1, "the external PR author is not a core user");
         let logins: Vec<&str> = r.untracked.iter().map(|u| u.login.as_str()).collect();
         assert_eq!(logins, ["alice"]);
     }
@@ -505,7 +567,7 @@ mod tests {
     #[test]
     fn old_github_activity_does_not_count_as_active() {
         let acc = Acc::new(now_ms());
-        let r = acc.finish(&[gh_doc("zoe", "2026-05-04T00:00:00Z", None)], 7);
+        let r = acc.finish(&[gh_doc("zoe", "2026-05-04T00:00:00Z", None)], 7, None);
         assert_eq!(r.gh_active, 0);
         assert!(r.untracked.is_empty());
         assert_eq!(r.install_rate_pct, 0);
@@ -519,7 +581,7 @@ mod tests {
         let l = line("same-id", "edge-m1-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", "");
         acc.fold(&l);
         acc.fold(&l);
-        let r = acc.finish(&[], 7);
+        let r = acc.finish(&[], 7, None);
         assert_eq!(r.machines[0].events, 1);
     }
 
@@ -531,7 +593,7 @@ mod tests {
         acc.fold(&line("e1", "edge-m1-claudecode", "2026-06-01T08:00:00Z", "session_start", "claude_code", "a", "0.1.0"));
         acc.fold(&line("e2", "edge-m1-claudecode", "2026-06-12T08:00:00Z", "session_start", "claude_code", "a", "0.2.0"));
         acc.fold(&line("e3", "edge-old-claudecode", "2026-06-12T09:00:00Z", "session_start", "claude_code", "a", ""));
-        let r = acc.finish(&[], 7);
+        let r = acc.finish(&[], 7, None);
         let m1 = r.machines.iter().find(|m| m.machine == "m1").unwrap();
         let old = r.machines.iter().find(|m| m.machine == "old").unwrap();
         assert_eq!(m1.version, "0.2.0");
