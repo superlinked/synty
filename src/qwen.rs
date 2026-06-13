@@ -147,8 +147,14 @@ Items:\n{items}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
 /// the cluster actually uses, so it passes the faithfulness gate instead of
 /// free-associating. (No example *name* is given — the 0.6B parrots those;
 /// terms and items are data.)
+///
+/// The terms are c-TF-IDF compounds kept hyphenated for distinctiveness
+/// (`sie-internal`, `view-transition`), but shown to the model DE-HYPHENATED:
+/// told to "build from the key terms", the 0.6B copies their format, so raw
+/// slugs produced slug names (`Sie-Internal`, `eval-model-enhancing-cluster`).
+/// Spaced terms yield prose titles; grounding still uses the hyphenated form.
 fn prompt_for_topic_name(summary: &str, terms: &[String], examples: &[String]) -> String {
-    let kw = terms.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+    let kw = terms.iter().take(8).map(|t| t.replace('-', " ")).collect::<Vec<_>>().join(", ");
     let mut items = String::new();
     for e in examples {
         items.push_str("- ");
@@ -234,7 +240,11 @@ fn name_grounded(name: &str, terms: &[String]) -> bool {
     }
     let low = name.to_lowercase();
     let words: std::collections::HashSet<&str> = low.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3).collect();
-    terms.iter().any(|t| words.contains(t.as_str()))
+    // A term may be a hyphenated compound (`sie-internal`, `view-transition`) —
+    // match the whole term OR any of its ≥3-char pieces, so a de-slugged name
+    // word (`internal`, `transition`) grounds against it. Without this, the
+    // compound terms we keep for distinctiveness never match a spaced name.
+    terms.iter().any(|t| t.split(|c: char| !c.is_alphanumeric()).filter(|p| p.len() >= 3).any(|p| words.contains(p)))
 }
 
 /// Generic developer vocabulary that must not count as a cluster's term at all —
@@ -314,22 +324,107 @@ fn clean(s: &str) -> String {
     line
 }
 
+/// A hyphen/CamelCase piece is a "word" worth splitting on only when it's ≥2
+/// letters and digit-free — so `msgpack`/`internal` split but version/code
+/// pieces (`2`, `1b`, `vl`) stay attached to their neighbour.
+fn wordlike(s: &str) -> bool {
+    s.chars().filter(|c| c.is_alphabetic()).count() >= 2 && !s.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Append `s` to `out`, inserting a space at CamelCase boundaries: a
+/// lower→upper transition (`oAdapter`→`o Adapter`) and an acronym→word boundary
+/// (`OCRAdapter`→`OCR Adapter`). Original characters and case are preserved.
+fn camel_split_into(out: &mut String, s: &str) {
+    let ch: Vec<char> = s.chars().collect();
+    for i in 0..ch.len() {
+        if i > 0 {
+            let (prev, cur) = (ch[i - 1], ch[i]);
+            let lower_upper = prev.is_lowercase() && cur.is_uppercase();
+            let acronym = prev.is_uppercase() && cur.is_uppercase() && ch.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if lower_upper || acronym {
+                out.push(' ');
+            }
+        }
+        out.push(ch[i]);
+    }
+}
+
+/// Split a slug/CamelCase heading back into words so the model's content
+/// survives the gates instead of falling back. The 0.6B emits branch-name-style
+/// titles (`OcrAdapterCluster`, `msgpack-processing`, `multi-GPU cluster`) even
+/// from spaced terms — its own output habit. Hyphens between two word-pieces
+/// become spaces, CamelCase splits, a trailing "cluster(s)" the model tacks on
+/// is dropped, and version/codes are preserved (`florence-2`, `olmocr-2-1b`).
+fn deslug(line: &str) -> String {
+    let mut out = String::new();
+    for (ti, tok) in line.split_whitespace().enumerate() {
+        if ti > 0 {
+            out.push(' ');
+        }
+        let pieces: Vec<&str> = tok.split('-').collect();
+        for (i, p) in pieces.iter().enumerate() {
+            if i > 0 {
+                out.push(if wordlike(pieces[i - 1]) && wordlike(p) { ' ' } else { '-' });
+            }
+            if p.chars().any(|c| c.is_ascii_digit()) {
+                out.push_str(p); // a code/version piece — leave intact
+            } else {
+                camel_split_into(&mut out, p);
+            }
+        }
+    }
+    let mut words: Vec<&str> = out.split_whitespace().collect();
+    if words.len() > 1 && words.last().is_some_and(|w| w.eq_ignore_ascii_case("cluster") || w.eq_ignore_ascii_case("clusters")) {
+        words.pop();
+    }
+    rejoin_brands(&words).join(" ")
+}
+
+/// CamelCase splitting fragments a multi-part brand ("ColBERT"→"Col BERT",
+/// "SGLang"→"SG Lang"); rejoin any adjacent run whose concatenation is a known
+/// brand so the split doesn't lose (or over-count the words of) a real name.
+fn rejoin_brands(words: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let mut take = 1;
+        for w in (2..=3).rev() {
+            if i + w <= words.len() && BRAND.iter().any(|(k, _)| *k == words[i..i + w].concat().to_lowercase()) {
+                take = w;
+                break;
+            }
+        }
+        out.push(words[i..i + take].concat());
+        i += take;
+    }
+    out
+}
+
 /// Clean a short topic name. The 0.6B titles its summary well but SHOUTS in
 /// all-caps and sometimes snake_cases, so *normalize* (underscores→spaces,
-/// Title Case keeping acronyms) rather than reject. Only genuine non-titles —
-/// comma-lists, whole sentences (>6 words), anything too long to be a heading
-/// (a truncated title is not a title), hyphen-mush compounds, field echoes,
-/// the bare generic word — are rejected, falling back to the keyword label.
+/// de-slugged, Title Case keeping acronyms) rather than reject. Only genuine
+/// non-titles — comma-lists, whole sentences (>6 words), anything too long to be
+/// a heading (a truncated title is not a title), field echoes, the bare generic
+/// word — are rejected, falling back to the summary lead / keyword label.
 fn clean_name(s: &str) -> String {
     let s = s.rsplit("</think>").next().unwrap_or(s).trim().trim_matches('"').trim();
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s).replace('_', " ");
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    let line = line.trim_end_matches(['.', ':', ',']).trim();
+    let raw = line.trim_end_matches(['.', ':', ',']).trim();
+    // Split the model's slug/CamelCase output back into words, so its (usually
+    // correct) content survives the gates instead of falling back to the verbose
+    // summary lead. Even a 4+-part mash ("ad-hoc-magic-assumptions") de-slugs
+    // into a fine name ("Ad Hoc Magic Assumptions") — let word-count and the
+    // downstream faithfulness gates decide, not the hyphen count.
+    let deslugged = deslug(raw);
+    let line = deslugged.as_str();
     let low = line.to_lowercase();
     let echo = ["keyphrase", "items", "title", "repo", "update:", "description"].iter().any(|p| low.starts_with(p));
     let words = line.split_whitespace().count();
-    let mush = line.split_whitespace().any(|w| w.matches('-').count() >= 3);
-    if line.is_empty() || echo || line.contains(',') || !(1..=6).contains(&words) || line.chars().count() > 48 || mush {
+    // A heading, not a sentence: 1–9 content words. Commas are allowed (a short
+    // "A, B, C" list is a legit title); the faithfulness gate, not formatting,
+    // is the real filter.
+    if line.is_empty() || echo || !(1..=9).contains(&words) || line.chars().count() > 64 {
         return String::new();
     }
     let t = title_case(line);
@@ -513,7 +608,7 @@ struct Job {
 /// s5: centrality-ordered examples + the embedding-faithfulness gate; isolates
 /// these names from machines still generating ungated s4 ones.
 const TOPIC_PROMPT_VERSION: &str = "t8";
-const TOPIC_NAME_VERSION: &str = "s13";
+const TOPIC_NAME_VERSION: &str = "s16";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -1224,6 +1319,30 @@ mod tests {
         assert!(!name_grounded("Update Dependencies", &terms)); // generic words, not cluster terms
     }
 
+    // The model emits slug/CamelCase headings even from spaced terms; deslug
+    // splits them back into words so the content survives, while codes stay.
+    #[test]
+    fn deslug_splits_slugs_and_keeps_codes() {
+        assert_eq!(deslug("msgpack-processing"), "msgpack processing");
+        assert_eq!(deslug("OcrAdapterCluster"), "Ocr Adapter"); // CamelCase + trailing "cluster" dropped
+        assert_eq!(deslug("OCRAdapter"), "OCR Adapter"); // acronym→word boundary
+        assert_eq!(deslug("multi-GPU cluster"), "multi GPU");
+        assert_eq!(deslug("florence-2"), "florence-2", "version code preserved");
+        assert_eq!(deslug("olmocr-2-1b"), "olmocr-2-1b", "multi-piece code preserved");
+        assert_eq!(deslug("SIE-Internal"), "SIE Internal");
+        assert_eq!(deslug("SparseColBERT"), "Sparse ColBERT", "brand rejoined after the CamelCase split");
+    }
+
+    // A hyphenated compound term grounds a de-slugged name on any of its pieces —
+    // the fix that lets recovered slug names ("SIE Internal") pass the gate.
+    #[test]
+    fn name_grounded_matches_hyphenated_term_pieces() {
+        let terms = vec!["sie-internal".to_string(), "view-transition".to_string()];
+        assert!(name_grounded("SIE Internal", &terms), "'internal' grounds against 'sie-internal'");
+        assert!(name_grounded("View Transition Fixes", &terms), "'transition' grounds against 'view-transition'");
+        assert!(!name_grounded("Mobile Support", &terms), "shares no piece");
+    }
+
     // A term every cluster shares ("sie") must not outrank a cluster's own
     // vocabulary, even when it tops the raw frequency count — four live topics
     // were all named after the corpus-wide product because of this.
@@ -1422,34 +1541,31 @@ mod tests {
         assert_eq!(percentile(&[], 10), 0.0);
     }
 
-    // Hyphen/slash compounds are cased per component (the acronym list can
-    // never match inside "SIE-INTERNAL" as one token), whole-token codes like
-    // GPT-5.5 stay intact, and brands get their canonical mixed case.
+    // Codes/brands survive de-slugging: a whole-token code (GPT-5.5) stays
+    // intact, an all-caps acronym is kept, and brands get canonical mixed case.
     #[test]
     fn title_case_components_and_brands() {
-        assert_eq!(clean_name("SIE-INTERNAL CLEANUP"), "SIE-Internal Cleanup");
         assert_eq!(clean_name("GPT-5.5 ROLLOUT"), "GPT-5.5 Rollout");
         assert_eq!(clean_name("COLBERT INDEXING"), "ColBERT Indexing");
         assert_eq!(clean_name("QWEN3 NAMING"), "Qwen3 Naming"); // brand beats the code rule
         assert_eq!(clean_name("CTA/GITHUB BUTTON FIXES"), "CTA/GitHub Button Fixes");
         assert_eq!(clean_name("CUDA JIT COMPILATION"), "CUDA JIT Compilation");
-        // Not titles: hyphen-mush compounds and anything too long to display
-        // untruncated (an ellipsis in a heading is worse than the fallback).
-        assert_eq!(clean_name("Mcp-Claud-Eq-Reduction-Generation"), "");
-        assert_eq!(clean_name("Web Deployment Notes Synchronization Prerequisites"), "");
+        // A brand the CamelCase split would otherwise fragment (Col BERT) is rejoined.
+        assert_eq!(clean_name("SparseColBERT"), "Sparse ColBERT");
+        // Rejected only as a non-heading: a run-on past the display width.
+        assert_eq!(clean_name("One Two Three Four Five Six Seven Eight Nine Ten Eleven"), "", ">9 words");
     }
 
-    // A mashed identifier (one token, ≥2 hyphen-joined words) is a slug, not a
-    // title — the 0.6B's branch-name reflex. Reject it (→ summary fallback) so
-    // "Terraform-SIE-Update"/"SIE-Server" stop slipping through and colliding.
-    // A spaced title is never a slug; a version/code piece doesn't count.
+    // The 0.6B's branch-name reflex: it emits slug/CamelCase titles even from
+    // spaced terms. De-slug them into words so the content survives instead of
+    // falling back — even a 4-part mash becomes a fine name; the faithfulness
+    // gates (not the hyphen count) are the real filter. Codes are preserved.
     #[test]
-    fn slug_style_names_are_rejected() {
-        assert_eq!(clean_name("TERRAFORM-SIE-UPDATE"), "", "three-part slug");
-        assert_eq!(clean_name("SIE-SERVER"), "", "two-part slug");
-        assert_eq!(clean_name("MCP-CLAUDE-PROJECT"), "");
-        // Spared: spaced titles, and codes whose hyphen-piece isn't a word.
-        assert_eq!(clean_name("SIE-INTERNAL CLEANUP"), "SIE-Internal Cleanup", "has a space → not a slug");
+    fn slug_style_names_are_split() {
+        assert_eq!(clean_name("TERRAFORM-SIE-UPDATE"), "Terraform SIE Update", "3-part slug → words");
+        assert_eq!(clean_name("SIE-SERVER"), "SIE Server");
+        assert_eq!(clean_name("OcrAdapterCluster"), "OCR Adapter"); // CamelCase + trailing "cluster"
+        assert_eq!(clean_name("ad-hoc-magic-assumptions"), "Ad Hoc Magic Assumptions", "4-part mash recovered");
         assert_eq!(clean_name("GPT-5.5"), "GPT-5.5", "version code, not two words");
         assert_eq!(clean_name("FLORENCE-2"), "Florence-2", "code piece, not a word");
     }
@@ -1490,8 +1606,10 @@ mod tests {
         assert_eq!(clean_name("QUEUE_ROUTING_NATS_HEALTH"), "Queue Routing NATS Health"); // snake → spaces
         assert_eq!(clean_name("CONFIG API IMPLEMENTATION AND EXPANSION"), "Config API Implementation and Expansion");
         assert_eq!(clean_name("VISION IMPROVEMENT CLUSTER"), "Vision Improvement"); // drop generic suffix
-        // Genuine non-titles still fall back to the representative-member label.
-        assert_eq!(clean_name("Sharing experiments, proposing models, and cutting costs."), "");
+        // A short comma list is a legit title now (the faithfulness gate filters,
+        // not the comma); only a run-on past the heading length falls back.
+        assert_eq!(clean_name("Typography, Quickstart, Docker"), "Typography, Quickstart, Docker");
+        assert_eq!(clean_name("This change adds a config API and expands the gitops workflow guide significantly"), "");
         // A bare generic word names nothing → fall back to the summary.
         assert_eq!(clean_name("MAIN"), "");
         assert_eq!(clean_name("Misc"), "");
