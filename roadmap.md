@@ -47,7 +47,7 @@ events; whoever opens a viewer contributes the compute.
 - Compatibility: add-only envelopes (`v` field), model-namespaced embedding/summary stores, `format` gate on the read-model pointer (see design.md "Data compatibility").
 - Deferred: Cursor tailer (needs a machine with Cursor data); hosted agents (Claude Code web, Devin) need per-platform log-export exploration.
 
-## M8 — Fleet coverage & agent surface
+## M8 — Fleet coverage & agent surface · done
 Pre-release work, pulled ahead of M5/M6. Coverage tells an org whether synty
 runs everywhere agents run; the agent surface makes every TUI fact reachable
 from the CLI and MCP.
