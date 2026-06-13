@@ -72,6 +72,7 @@ cargo run --release -- recent           # latest PRs, issues, and prompts
 cargo run --release -- status           # health: what's indexed, freshness, the fleet roster
 cargo run --release -- stats            # usage: tokens/tools/sessions vs LOC/PRs/issues per week
 cargo run --release -- tool Bash        # one tool's profile: volume, latency, argument mix
+cargo run --release -- show a1b2c3d4    # drill into a session, PR/issue (repo#123), or topic key
 ```
 
 Output is built to be drilled: `search`, `recent`, and `topic` print stable

@@ -1185,45 +1185,14 @@ impl App {
     }
 
     fn session_detail(&self, s: &Session) -> String {
-        let mut o = format!(
-            "session {} · {}\n{} → {}\n\neffort {}\n{} prompts · {} assistant · {} thinking · {} tool calls\n",
-            short(&s.id),
-            s.repo,
-            day(&s.started),
-            day(&s.ended),
-            crate::view::meter(s.struggle),
-            s.prompts,
-            s.assistant,
-            s.thinking,
-            s.tools,
-        );
-        for line in [crate::view::usage_line(s), crate::view::tools_line(s)].into_iter().flatten() {
-            o.push_str(&line);
-            o.push('\n');
-        }
-        if let Some(sum) = &s.summary {
-            o.push_str(&format!("summary: {sum}\n"));
-        }
-        if let Some(pr) = &s.linked_pr {
-            o.push_str(&format!("linked PR: {pr}\n"));
-        }
-        if !s.files.is_empty() {
-            o.push_str(&format!("files: {}\n", s.files.iter().take(10).cloned().collect::<Vec<_>>().join(", ")));
-        }
-        o.push_str(&format!("\nask:\n{}\n", s.ask));
-        // a short representative arc: the session's user prompts
+        // One renderer for the session facts — view::session_md is shared
+        // with `synty show`, so the two surfaces can't drift.
         let prompts: Vec<&Doc> = self
             .docs
             .iter()
             .filter(|d| d.meta.session_id == s.id && d.meta.kind == "user_prompt")
             .collect();
-        if prompts.len() > 1 {
-            o.push_str("\nturns:\n");
-            for d in prompts.iter().take(8) {
-                o.push_str(&format!("· {}\n", first_line(&d.text)));
-            }
-        }
-        o
+        crate::view::session_md(s, &prompts)
     }
 
     /// Status view: a totals/freshness/autostart header, the tokens & tools
@@ -1880,10 +1849,6 @@ fn doc_detail(d: &Doc) -> String {
     };
     o.push_str(&d.text);
     o
-}
-
-fn day(ts: &str) -> String {
-    ts.split('T').next().unwrap_or("").to_string()
 }
 
 fn spawn_search(model_id: String) -> (Sender<SearchCmd>, Receiver<SearchMsg>) {

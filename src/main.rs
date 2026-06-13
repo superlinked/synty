@@ -223,6 +223,16 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Detail for one id printed by search/recent/topic: a session
+    /// ([a1b2c3d4] or a full id), a PR/issue (repo#123 or gh:repo#123), or a
+    /// topic key
+    Show {
+        /// The id to resolve (≥4 chars of a session id or topic key, or repo#N)
+        id: String,
+        /// Print as JSON (for scripts and agents)
+        #[arg(long)]
+        json: bool,
+    },
     /// First-run onboarding: connect GitHub, pick an org to back-fill, enable autostart
     Setup,
     /// Interactive terminal UI: status + browse/drill over topics, recent, search.
@@ -428,6 +438,13 @@ fn main() -> Result<()> {
                 println!("{}", view::tool_json(&p));
             } else {
                 print!("{}", view::tool_report(&name)?);
+            }
+        }
+        Cmd::Show { id, json } => {
+            if json {
+                println!("{}", view::show_json_report(&id)?);
+            } else {
+                print!("{}", view::show_report(&id)?);
             }
         }
         Cmd::Setup => setup::run()?,

@@ -366,6 +366,249 @@ fn tool_suggestions(name: &str, names: &[String]) -> Vec<String> {
     out
 }
 
+// ── show: detail for one stable id ────────────────────────────────────────
+
+/// What a printed id resolves to. The Gh arm carries its topic membership
+/// (key8 + title) because only the resolver has the topics in hand.
+pub enum ShowTarget {
+    Session(Box<crate::units::Session>),
+    Gh { doc: Doc, topic: Option<(String, String)> },
+    Topic(crate::units::TopicUnits),
+}
+
+/// Load the corpus once and resolve `id` against it — the shared substrate
+/// for the Markdown and JSON paths.
+fn show_load(id: &str) -> Result<(ShowTarget, Vec<Doc>)> {
+    let docs = load_docs(readmodel::docs_path()).unwrap_or_default();
+    let sessions = crate::units::sessions().unwrap_or_default();
+    let topics = crate::units::topic_units(12).unwrap_or_default();
+    let t = resolve_among(id, sessions, topics, &docs)?;
+    Ok((t, docs))
+}
+
+/// The shared CLI/MCP entry: detail for one id as Markdown, or a miss/
+/// ambiguity error that names its candidates — identical on both surfaces.
+pub fn show_report(id: &str) -> Result<String> {
+    let (t, docs) = show_load(id)?;
+    Ok(match &t {
+        ShowTarget::Session(s) => session_md(s, &session_prompts(&docs, &s.id)),
+        ShowTarget::Gh { doc, topic } => unit_md(doc, topic.as_ref().map(|(k, t)| (k.as_str(), t.as_str()))),
+        ShowTarget::Topic(t) => topic_md(t),
+    })
+}
+
+pub fn show_json_report(id: &str) -> Result<String> {
+    let (t, docs) = show_load(id)?;
+    Ok(match &t {
+        ShowTarget::Session(s) => envelope("session", session_json_obj(s, &session_prompts(&docs, &s.id))),
+        ShowTarget::Gh { doc, topic } => envelope(
+            "unit",
+            serde_json::json!({
+                "kind": doc.meta.kind, "repo": doc.meta.repo, "number": doc.meta.number,
+                "state": doc.meta.state, "url": doc.meta.url, "author": doc.meta.author,
+                "ts": doc.meta.ts, "labels": doc.meta.labels, "agent_attr": doc.meta.agent_attr,
+                "topic": topic.as_ref().map(|(k, t)| serde_json::json!({"key": k, "title": t})),
+                "text": crate::excerpt(&doc.text, 1500),
+            }),
+        ),
+        ShowTarget::Topic(t) => envelope("topic", topic_json_obj(t)),
+    })
+}
+
+/// Resolver rules: `repo#N` (with or without a `gh:` prefix) is a GitHub
+/// ref; anything else needs ≥4 chars and matches session ids ∪ topic keys —
+/// exact first, then unique prefix; ambiguity errors list the candidates so
+/// the next try resolves.
+fn resolve_among(
+    id: &str,
+    mut sessions: Vec<crate::units::Session>,
+    mut topics: Vec<crate::units::TopicUnits>,
+    docs: &[Doc],
+) -> Result<ShowTarget> {
+    let id = id.trim();
+    let id = id.strip_prefix("gh:").unwrap_or(id);
+    if let Some((repo, num)) = id.rsplit_once('#') {
+        let n: i64 = num
+            .parse()
+            .map_err(|_| anyhow::anyhow!("`{id}` looks like a PR/issue ref, but `{num}` is not a number"))?;
+        let doc = docs
+            .iter()
+            .find(|d| {
+                matches!(d.meta.kind.as_str(), "pull_request" | "issue")
+                    && d.meta.repo == repo
+                    && d.meta.number == Some(n)
+            })
+            .cloned();
+        return match doc {
+            Some(doc) => {
+                let topic = topics
+                    .into_iter()
+                    .find(|t| t.units.iter().any(|u| u.doc_id == Some(doc.id)))
+                    .map(|t| (crate::short(&t.cache_key), t.title().to_string()));
+                Ok(ShowTarget::Gh { doc, topic })
+            }
+            None => anyhow::bail!("no PR/issue {repo}#{n} in the corpus — `synty github` pulls the active window"),
+        };
+    }
+    if id.len() < 4 {
+        anyhow::bail!("id `{id}` is too short — use at least 4 characters of an id printed by search/recent/topic");
+    }
+    if let Some(i) = sessions.iter().position(|s| s.id == id) {
+        return Ok(ShowTarget::Session(Box::new(sessions.swap_remove(i))));
+    }
+    if let Some(i) = topics.iter().position(|t| t.cache_key == id) {
+        return Ok(ShowTarget::Topic(topics.swap_remove(i)));
+    }
+    let s_hits: Vec<usize> =
+        (0..sessions.len()).filter(|&i| sessions[i].id.starts_with(id)).collect();
+    let t_hits: Vec<usize> =
+        (0..topics.len()).filter(|&i| topics[i].cache_key.starts_with(id)).collect();
+    match (s_hits.as_slice(), t_hits.as_slice()) {
+        ([i], []) => Ok(ShowTarget::Session(Box::new(sessions.swap_remove(*i)))),
+        ([], [i]) => Ok(ShowTarget::Topic(topics.swap_remove(*i))),
+        ([], []) => anyhow::bail!("nothing matches `{id}` — ids come from synty search/recent/topic output"),
+        _ => {
+            let mut cands: Vec<String> = s_hits
+                .iter()
+                .take(8)
+                .map(|&i| format!("{} session — {}", crate::short(&sessions[i].id), crate::excerpt(&sessions[i].ask, 48)))
+                .collect();
+            cands.extend(
+                t_hits
+                    .iter()
+                    .take(8usize.saturating_sub(cands.len()))
+                    .map(|&i| format!("{} topic — {}", crate::short(&topics[i].cache_key), topics[i].title())),
+            );
+            anyhow::bail!("`{id}` is ambiguous — {} matches:\n  {}", s_hits.len() + t_hits.len(), cands.join("\n  "))
+        }
+    }
+}
+
+fn session_prompts<'a>(docs: &'a [Doc], sid: &str) -> Vec<&'a Doc> {
+    docs.iter().filter(|d| d.meta.session_id == sid && d.meta.kind == "user_prompt").collect()
+}
+
+/// One session's detail — the same facts the TUI's detail pane shows (it
+/// delegates here), plus the full id so prefixes have something to resolve
+/// against.
+pub fn session_md(s: &crate::units::Session, prompts: &[&Doc]) -> String {
+    let day = |ts: &str| ts.split('T').next().unwrap_or("").to_string();
+    let mut o = format!(
+        "session {} · {}\nid: {}\n{} → {}\n\neffort {}\n{} prompts · {} assistant · {} thinking · {} tool calls\n",
+        crate::short(&s.id),
+        s.repo,
+        s.id,
+        day(&s.started),
+        day(&s.ended),
+        meter(s.struggle),
+        s.prompts,
+        s.assistant,
+        s.thinking,
+        s.tools,
+    );
+    for line in [usage_line(s), tools_line(s)].into_iter().flatten() {
+        o.push_str(&line);
+        o.push('\n');
+    }
+    if let Some(sum) = &s.summary {
+        o.push_str(&format!("summary: {sum}\n"));
+    }
+    if let Some(pr) = &s.linked_pr {
+        o.push_str(&format!("linked PR: {pr}\n"));
+    }
+    if !s.files.is_empty() {
+        o.push_str(&format!("files: {}\n", s.files.iter().take(10).cloned().collect::<Vec<_>>().join(", ")));
+    }
+    o.push_str(&format!("\nask:\n{}\n", s.ask));
+    // a short representative arc: the session's user prompts
+    if prompts.len() > 1 {
+        o.push_str("\nturns:\n");
+        for d in prompts.iter().take(8) {
+            o.push_str(&format!("· {}\n", crate::first_line(&d.text)));
+        }
+    }
+    o
+}
+
+fn session_json_obj(s: &crate::units::Session, prompts: &[&Doc]) -> serde_json::Value {
+    serde_json::json!({
+        "id": s.id, "repo": s.repo, "started": s.started, "ended": s.ended,
+        "ask": s.ask, "prompts": s.prompts, "assistant": s.assistant,
+        "thinking": s.thinking, "tools": s.tools, "files": s.files,
+        "linked_pr": s.linked_pr, "struggle": s.struggle,
+        "tok_in": s.tok_in, "tok_out": s.tok_out,
+        "cache_read": s.cache_read, "cache_create": s.cache_create,
+        "tools_by_name": s.tools_by_name,
+        "by_model": s.by_model.iter().map(|m| serde_json::json!({
+            "model": m.model, "tok_in": m.tok_in, "tok_out": m.tok_out,
+            "cache_read": m.cache_read, "cache_create": m.cache_create, "turns": m.turns,
+        })).collect::<Vec<_>>(),
+        "source": s.source, "summary": s.summary, "author": s.author,
+        "turns": prompts.iter().take(8).map(|d| crate::first_line(&d.text)).collect::<Vec<_>>(),
+    })
+}
+
+/// One PR/issue's detail: state, link, author, labels, topic membership, and
+/// a body excerpt.
+pub fn unit_md(d: &Doc, topic: Option<(&str, &str)>) -> String {
+    let m = &d.meta;
+    let nref = m.number.map(|n| format!("{}#{n}", m.repo)).unwrap_or_else(|| m.repo.clone());
+    let mut o = format!("{} {} [{}]\n", m.kind, nref, m.state.as_deref().unwrap_or("—"));
+    if let Some(u) = &m.url {
+        o.push_str(&format!("{u}\n"));
+    }
+    o.push_str(&format!("author: {} · {}", if m.author.is_empty() { "—" } else { &m.author }, m.ts.split('T').next().unwrap_or("—")));
+    if !m.labels.is_empty() {
+        o.push_str(&format!(" · labels: {}", m.labels.join(", ")));
+    }
+    if let Some(a) = &m.agent_attr {
+        o.push_str(&format!(" · agent: {a}"));
+    }
+    o.push('\n');
+    if let Some((key, title)) = topic {
+        o.push_str(&format!("topic: [{key}] {title}\n"));
+    }
+    o.push_str(&format!("\n{}\n", crate::excerpt(&d.text, 1500)));
+    o
+}
+
+/// One topic's detail: the header block `topic` prints, plus the span and
+/// the FULL member list (the list view caps at 6).
+pub fn topic_md(t: &crate::units::TopicUnits) -> String {
+    let (sess, prs, issues) = t.mix;
+    let mut o = format!(
+        "# [{}] {}\nkey: {}\n{} units · last active {} · {sess} sessions / {prs} PRs / {issues} issues\n",
+        crate::short(&t.cache_key),
+        t.title(),
+        t.cache_key,
+        t.units.len(),
+        t.last_active,
+    );
+    if let Some((a, b)) = &t.span {
+        o.push_str(&format!("span: {a} → {b}\n"));
+    }
+    if let Some(s) = &t.summary {
+        o.push_str(&format!("{s}\n"));
+    }
+    if !t.repos.is_empty() {
+        o.push_str(&format!("repos: {}\n", t.repos.iter().take(6).cloned().collect::<Vec<_>>().join(", ")));
+    }
+    if !t.authors.is_empty() {
+        o.push_str(&format!("authors: {}\n", t.authors.iter().take(6).cloned().collect::<Vec<_>>().join(", ")));
+    }
+    o.push('\n');
+    for u in &t.units {
+        let tag = match u.kind {
+            Kind::Session => "session",
+            Kind::Pr => "pr",
+            Kind::Issue => "issue",
+        };
+        let st = if matches!(u.kind, Kind::Session) { format!(" {}", meter(u.struggle)) } else { String::new() };
+        o.push_str(&format!("- `{}` {tag}{}: {} · {}{}\n", u.when, unit_id_tag(u), u.title, u.outcome, st));
+    }
+    o
+}
+
 /// The fleet section of `status`: every machine with its liveness, who it
 /// attributes to, and the install-rate join — empty string when no streams
 /// have ever been seen (a fresh viewer before its first build).
@@ -622,27 +865,25 @@ pub fn work_json(units: &[Unit]) -> String {
     envelope("work", serde_json::Value::Array(units.iter().map(unit_json).collect()))
 }
 
+fn topic_json_obj(t: &TopicUnits) -> serde_json::Value {
+    serde_json::json!({
+        "id": t.id,
+        "key": t.cache_key,
+        "title": t.title(),
+        "label": t.label,
+        "summary": t.summary,
+        "name": t.name,
+        "last_active": t.last_active,
+        "mix": {"sessions": t.mix.0, "prs": t.mix.1, "issues": t.mix.2},
+        "repos": t.repos,
+        "authors": t.authors,
+        "span": t.span,
+        "units": t.units.iter().map(unit_json).collect::<Vec<_>>(),
+    })
+}
+
 pub fn topics_json(topics: &[TopicUnits]) -> String {
-    let arr: Vec<serde_json::Value> = topics
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "id": t.id,
-                "key": t.cache_key,
-                "title": t.title(),
-                "label": t.label,
-                "summary": t.summary,
-                "name": t.name,
-                "last_active": t.last_active,
-                "mix": {"sessions": t.mix.0, "prs": t.mix.1, "issues": t.mix.2},
-                "repos": t.repos,
-                "authors": t.authors,
-                "span": t.span,
-                "units": t.units.iter().map(unit_json).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    envelope("topics", serde_json::Value::Array(arr))
+    envelope("topics", serde_json::Value::Array(topics.iter().map(topic_json_obj).collect()))
 }
 
 pub fn status_json(s: &Status) -> String {
@@ -1015,6 +1256,193 @@ mod tests {
         assert_eq!(tool_suggestions("bash", &names), ["Bash"], "case-insensitive exact match");
         assert_eq!(tool_suggestions("re", &names), ["Read"], "prefix match");
         assert!(tool_suggestions("zzz", &names).is_empty());
+    }
+
+    fn show_session(id: &str, ask: &str) -> crate::units::Session {
+        let mut s = session();
+        s.id = id.into();
+        s.ask = ask.into();
+        s
+    }
+
+    fn show_topic(key: &str, title: &str) -> crate::units::TopicUnits {
+        crate::units::TopicUnits {
+            id: 0,
+            cache_key: key.into(),
+            label: title.into(),
+            units: vec![],
+            last_active: "2026-06-01".into(),
+            activity: vec![],
+            mix: (0, 0, 0),
+            repos: vec![],
+            authors: vec![],
+            summary: None,
+            name: None,
+            span: None,
+        }
+    }
+
+    /// unwrap_err without demanding Debug on the (heavy) Ok arm.
+    fn show_err(r: Result<ShowTarget>) -> String {
+        match r {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        }
+    }
+
+    fn pr_doc(repo: &str, n: i64) -> Doc {
+        Doc {
+            id: 7,
+            text: "fix race\n\nSerialize the tailer so restarts can't double-emit.".into(),
+            meta: crate::Meta {
+                source: "github".into(),
+                kind: "pull_request".into(),
+                repo: repo.into(),
+                author: "alice".into(),
+                session_id: String::new(),
+                ts: "2026-06-01T10:00:00Z".into(),
+                number: Some(n),
+                url: Some("https://gh/7".into()),
+                state: Some("MERGED".into()),
+                labels: vec!["bug".into()],
+                agent_attr: None,
+            },
+        }
+    }
+
+    // The ids the views print resolve to the right kind of detail: repo#N to
+    // the PR, a session id (full or unique prefix) to the session, a topic
+    // key to the topic.
+    #[test]
+    fn show_resolves_gh_session_and_topic_ids() {
+        let sess = || vec![show_session("a1b2c3d4-9999-4242-8888-777766665555", "fix login")];
+        let tops = || vec![show_topic("72a778f8aabbccdd", "Auth work")];
+        let docs = vec![pr_doc("sie", 7)];
+        assert!(matches!(resolve_among("sie#7", sess(), tops(), &docs), Ok(ShowTarget::Gh { .. })));
+        assert!(matches!(
+            resolve_among("a1b2c3d4-9999-4242-8888-777766665555", sess(), tops(), &docs),
+            Ok(ShowTarget::Session(_))
+        ));
+        assert!(matches!(resolve_among("a1b2c3d4", sess(), tops(), &docs), Ok(ShowTarget::Session(_))), "a printed id8 prefix resolves");
+        assert!(matches!(resolve_among("72a778f8aabbccdd", sess(), tops(), &docs), Ok(ShowTarget::Topic(_))));
+        assert!(matches!(resolve_among("72a778f8", sess(), tops(), &docs), Ok(ShowTarget::Topic(_))));
+        let miss = show_err(resolve_among("ffff0000", sess(), tops(), &docs));
+        assert!(miss.contains("nothing matches"), "{miss}");
+    }
+
+    // Both spellings of a GitHub ref work — `gh:` is what docs/JSON print,
+    // bare repo#N is what humans type.
+    #[test]
+    fn show_accepts_gh_prefix_and_bare_repo_number() {
+        let docs = vec![pr_doc("sie", 7)];
+        for id in ["gh:sie#7", "sie#7"] {
+            assert!(matches!(resolve_among(id, vec![], vec![], &docs), Ok(ShowTarget::Gh { .. })), "{id}");
+        }
+        let miss = show_err(resolve_among("sie#99", vec![], vec![], &docs));
+        assert!(miss.contains("no PR/issue sie#99"), "{miss}");
+    }
+
+    // An ambiguous prefix errors with the candidates, so the next try lands.
+    #[test]
+    fn show_prefix_ambiguity_lists_candidates() {
+        let sessions = vec![
+            show_session("aaaa1111-0000-4000-8000-000000000001", "first ask"),
+            show_session("aaaa2222-0000-4000-8000-000000000002", "second ask"),
+        ];
+        let e = show_err(resolve_among("aaaa", sessions, vec![], &[]));
+        assert!(e.contains("ambiguous") && e.contains("2 matches"), "{e}");
+        assert!(e.contains("aaaa1111") && e.contains("aaaa2222"), "{e}");
+        assert!(e.contains("first ask"), "candidates carry their ask: {e}");
+    }
+
+    // A 1–3 char prefix would match half the corpus — refuse it with advice.
+    #[test]
+    fn show_rejects_short_prefixes() {
+        let e = show_err(resolve_among("abc", vec![], vec![], &[]));
+        assert!(e.contains("too short"), "{e}");
+    }
+
+    // The CLI session detail carries the same facts as the TUI pane (which
+    // delegates here): header, effort, counts, files capped at 10, the ask,
+    // the prompt arc — plus the full id for prefix resolution.
+    #[test]
+    fn session_md_mirrors_tui_detail() {
+        let mut s = show_session("a1b2c3d4-9999-4242-8888-777766665555", "fix the login redirect");
+        s.repo = "sie".into();
+        s.started = "2026-06-01T08:00:00Z".into();
+        s.ended = "2026-06-01T09:30:00Z".into();
+        s.summary = Some("Fixed the redirect loop.".into());
+        s.linked_pr = Some("sie#7".into());
+        s.files = (0..12).map(|i| format!("file{i:02}.rs")).collect();
+        let prompt = |t: &str| Doc {
+            id: 0,
+            text: t.into(),
+            meta: crate::Meta {
+                source: "agent".into(),
+                kind: "user_prompt".into(),
+                repo: "sie".into(),
+                author: String::new(),
+                session_id: s.id.clone(),
+                ts: String::new(),
+                number: None,
+                url: None,
+                state: None,
+                labels: vec![],
+                agent_attr: None,
+            },
+        };
+        let (p1, p2) = (prompt("fix the login redirect"), prompt("now add a regression test"));
+        let md = session_md(&s, &[&p1, &p2]);
+        assert!(md.starts_with("session a1b2c3d4 · sie"), "{md}");
+        assert!(md.contains("id: a1b2c3d4-9999-4242-8888-777766665555"), "{md}");
+        assert!(md.contains("2026-06-01 → 2026-06-01"), "{md}");
+        assert!(md.contains("effort [") && md.contains("1 prompts · 1 assistant"), "{md}");
+        assert!(md.contains("summary: Fixed the redirect loop."), "{md}");
+        assert!(md.contains("linked PR: sie#7"), "{md}");
+        assert!(md.contains("file09.rs") && !md.contains("file10.rs"), "files cap at 10: {md}");
+        assert!(md.contains("ask:\nfix the login redirect"), "{md}");
+        assert!(md.contains("turns:") && md.contains("· now add a regression test"), "{md}");
+    }
+
+    // `show <topic>` lists every member (the topic list view caps at 6).
+    #[test]
+    fn topic_md_lists_all_members_with_ids() {
+        let mut t = show_topic("72a778f8aabbccdd", "Auth work");
+        t.units = (0..8)
+            .map(|i| Unit {
+                kind: Kind::Session,
+                when: "2026-06-01".into(),
+                repo: "sie".into(),
+                title: format!("session number {i}"),
+                outcome: "done".into(),
+                summary: None,
+                topic: Some(0),
+                rank: 0,
+                dup: false,
+                struggle: 0.0,
+                author: "alice".into(),
+                doc_id: None,
+                session_id: Some(format!("000000{i:02}-0000-4000-8000-000000000000")),
+            })
+            .collect();
+        let md = topic_md(&t);
+        assert!(md.contains("# [72a778f8] Auth work"), "{md}");
+        assert!(md.contains("key: 72a778f8aabbccdd"), "the full key is there to copy: {md}");
+        for i in 0..8 {
+            assert!(md.contains(&format!("session number {i}")), "member {i} missing: {md}");
+        }
+        assert!(md.contains("[00000007]"), "member rows carry ids: {md}");
+    }
+
+    // PR detail names its state, link, author, topic, and excerpts the body.
+    #[test]
+    fn unit_md_carries_state_topic_and_body() {
+        let md = unit_md(&pr_doc("sie", 7), Some(("72a778f8", "Auth work")));
+        assert!(md.starts_with("pull_request sie#7 [MERGED]"), "{md}");
+        assert!(md.contains("https://gh/7"), "{md}");
+        assert!(md.contains("author: alice · 2026-06-01 · labels: bug"), "{md}");
+        assert!(md.contains("topic: [72a778f8] Auth work"), "{md}");
+        assert!(md.contains("Serialize the tailer"), "{md}");
     }
 
     // Session rows print their stable id inline, so an agent reading the
