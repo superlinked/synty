@@ -327,8 +327,11 @@ fn clean_name(s: &str) -> String {
     }
     let t = title_case(line);
     let t = t.trim_end_matches(" Cluster").trim_end_matches("-Cluster").trim();
+    // A bare generic word is no title — it carries no topic signal, so route it
+    // to the (informative) summary fallback. Meaningful one-word names (NATS,
+    // Azure, a model/brand) are NOT here; only words that name nothing.
     if t.is_empty()
-        || matches!(t.to_lowercase().as_str(), "cluster" | "chores" | "update" | "fix")
+        || matches!(t.to_lowercase().as_str(), "cluster" | "chores" | "update" | "fix" | "main" | "misc" | "various" | "general")
         || looks_like_slug(t)
     {
         String::new()
@@ -503,7 +506,7 @@ struct Job {
 /// s5: centrality-ordered examples + the embedding-faithfulness gate; isolates
 /// these names from machines still generating ungated s4 ones.
 const TOPIC_PROMPT_VERSION: &str = "t8";
-const TOPIC_NAME_VERSION: &str = "s11";
+const TOPIC_NAME_VERSION: &str = "s12";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -1453,6 +1456,12 @@ mod tests {
         assert_eq!(clean_name("VISION IMPROVEMENT CLUSTER"), "Vision Improvement"); // drop generic suffix
         // Genuine non-titles still fall back to the representative-member label.
         assert_eq!(clean_name("Sharing experiments, proposing models, and cutting costs."), "");
+        // A bare generic word names nothing → fall back to the summary.
+        assert_eq!(clean_name("MAIN"), "");
+        assert_eq!(clean_name("Misc"), "");
+        // …but a meaningful one-word name (acronym / product) is kept.
+        assert_eq!(clean_name("NATS"), "NATS");
+        assert_eq!(clean_name("AZURE"), "Azure");
     }
 }
 
