@@ -29,7 +29,7 @@ opens the viewer. Distribution is internal for now (binary from
 out. *Building from source? See [Build & offline](#build--offline); replace
 `synty` with `cargo run --release --` in any command below.*
 
-## Three journeys
+## Start local, then join your team
 
 **1 · Local-first (recommended) — see the value, then join.**
 
@@ -56,9 +56,9 @@ The only thing that moves you from `◐ local` to `✓ <bucket>` is setting a bu
 Autostart (login-time tracking) is on by default the whole time and has its own
 indicator — it's never a second gate.
 
-## The two surfaces
+## Browse it yourself, or let your agents read it
 
-### TUI — for you
+### The TUI — browse, filter, drill in
 
 `synty tui` opens tabs for **Topics**, **Work**, **Search**, **Stats**, and
 **Status**, with drill-down from a topic into its sessions and the full document
@@ -70,7 +70,7 @@ Status tab shows tracker health and the fleet roster (who runs synty where, who
 runs agents untracked) and toggles login-time tracking. On startup it pulls the
 fleet's published index and freshens in the background.
 
-### CLI + MCP — for agents and scripts
+### The CLI & MCP — Markdown your agents read
 
 Every read command prints Markdown to stdout — exactly what a coding agent reads
 over the shell, no server or auth. `synty related` is the zero-effort entry
@@ -145,7 +145,7 @@ synty summarize                  # again: reduce each topic from its members
 `cluster` groups *units of work* (sessions, PRs, issues) by their summary, so run
 `summarize` first; the topic summaries are a second `summarize` pass.
 
-## Core design decisions
+## How it works — and why nothing leaves your machine
 
 - **Retrieval has no LLM in it.** `pylate-rs` runs a small ColBERT model
   (ModernBERT, 32 M params) that represents each document as one vector *per
