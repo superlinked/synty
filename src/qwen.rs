@@ -706,6 +706,86 @@ fn embed_rejects(scores: &[(usize, f32)]) -> Vec<usize> {
     scores.iter().filter(|(_, s)| *s < EMBED_FLOOR * med).map(|(i, _)| *i).collect()
 }
 
+// ── self-calibrating name gate (SYNTY_NAME_GATE=selfcal) ──────────────────
+// The run-relative median floor above is a no-op in practice (a whole run of
+// mediocre names floats the median, so almost nothing clears 0.6× it) and the
+// real rejecting is done by the cruder unigram `name_grounded`. The
+// self-calibrating gate judges each name against ITS OWN cluster's coherence:
+// a faithful abstractive title scores at least as well as the cluster's
+// least-aligned member, while a hallucinated token falls below all of them.
+// Sound because vectors are L2-normalized, so name_score is a bounded
+// mean-best-match cosine (see evals/tuning.md).
+
+/// A name whose mean-best-match cosine to its members falls below this is
+/// off-theme regardless of corpus — the floor-of-the-floor against a
+/// degenerate (all-low-coherence) cluster passing garbage.
+const ABS_FLOOR: f32 = 0.5;
+/// Reject below this fraction of the cluster's low-coherence tail (COH_PCTILE).
+const COH_BETA: f32 = 0.85;
+/// The tail percentile the name must clear — the cluster's least-aligned member.
+const COH_PCTILE: usize = 10;
+/// Below this many members the percentile is noise → use ABS_FLOOR alone.
+const MIN_MEMBERS_FOR_COH: usize = 5;
+
+/// One name's faithfulness verdict against its cluster's members.
+struct NameVerdict {
+    name_score: f32,
+    coh_p10: f32,
+    members: usize,
+    reject: bool,
+}
+
+/// Each member's leave-one-out faithfulness to the rest of the cluster — the
+/// distribution a faithful name should sit within.
+fn member_coherences(members: &[Array2<f32>]) -> Vec<f32> {
+    (0..members.len())
+        .map(|i| {
+            let others: Vec<Array2<f32>> =
+                members.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, m)| m.clone()).collect();
+            name_score(&members[i], &others)
+        })
+        .collect()
+}
+
+/// The p-th percentile (0..=100, nearest-rank) of a score list. Empty → 0.
+fn percentile(scores: &[f32], p: usize) -> f32 {
+    if scores.is_empty() {
+        return 0.0;
+    }
+    let mut v = scores.to_vec();
+    v.sort_by(f32::total_cmp);
+    let idx = ((p * (v.len() - 1)) + 50) / 100;
+    v[idx.min(v.len() - 1)]
+}
+
+/// Score a name against its cluster and decide faithfulness self-relative to the
+/// cluster's own coherence (reused by the gate and by `synty eval --names`).
+fn score_name(name: &Array2<f32>, members: &[Array2<f32>]) -> NameVerdict {
+    let ns = name_score(name, members);
+    let coh = member_coherences(members);
+    let p10 = percentile(&coh, COH_PCTILE);
+    // Tiny clusters: the percentile is noise — lean on the absolute floor only.
+    let floor = if members.len() < MIN_MEMBERS_FOR_COH { ABS_FLOOR } else { ABS_FLOOR.max(COH_BETA * p10) };
+    NameVerdict { name_score: ns, coh_p10: p10, members: members.len(), reject: ns < floor }
+}
+
+/// Top-GATE_MEMBERS member embeddings for a topic, loaded from the store
+/// (centrality-ordered, dup-excluded by `topic_member_embed_hashes`). Missing
+/// vectors (summaries drifted since `cluster` encoded them) are dropped.
+fn load_members(store: &crate::store::EmbStore, hashes: &[u64]) -> Result<Vec<Array2<f32>>> {
+    let mut mem = Vec::new();
+    for h in hashes.iter().take(GATE_MEMBERS) {
+        if let Some(e) = store.get(*h)? {
+            mem.push(e);
+        }
+    }
+    Ok(mem)
+}
+
+fn selfcal_gate() -> bool {
+    std::env::var("SYNTY_NAME_GATE").as_deref() == Ok("selfcal")
+}
+
 /// I2's embedding-faithfulness gate, over every valid LLM topic name — the
 /// unigram gate cannot see a hallucinated half ("Stablebridge Dashboard" on a
 /// dashboard cluster). Each name is embedded with the retrieval encoder
@@ -749,37 +829,42 @@ fn embed_gate_names(tjobs: &[Job], cache: &mut units::SummaryCache, bucket: &str
         }
     }
 
+    let selfcal = selfcal_gate();
     let mut scores: Vec<(usize, f32)> = Vec::new();
+    let mut verdicts: Vec<(usize, NameVerdict)> = Vec::new();
     for (i, (j, _)) in cand.iter().enumerate() {
         let stable = j.key.strip_prefix("topicname:").unwrap_or(&j.key);
         let Some(hashes) = member_hashes.get(stable) else { continue };
-        let mut mem = Vec::new();
-        for h in hashes.iter().take(GATE_MEMBERS) {
-            if let Some(e) = store.get(*h)? {
-                mem.push(e);
-            }
-        }
+        let mem = load_members(&store, hashes)?;
         if mem.is_empty() {
             continue; // summaries drifted since `cluster` encoded them — abstain
         }
         if let Some(e) = &embs[i] {
-            scores.push((i, name_score(e, &mem)));
+            let v = score_name(e, &mem);
+            scores.push((i, v.name_score));
+            verdicts.push((i, v));
         }
     }
 
-    // Debug visibility, like the cluster quality report: where the floor sits
-    // and which names are nearest it — the data for tuning EMBED_FLOOR.
+    // Debug visibility, like the cluster quality report: the lowest-scoring
+    // names and (self-cal) each one's per-cluster floor — the tuning data.
     if !scores.is_empty() {
         let mut by_score = scores.clone();
         by_score.sort_by(|a, b| a.1.total_cmp(&b.1));
         let med = by_score[by_score.len() / 2].1;
-        eprintln!("  name gate: {} scored, median {med:.2}, floor {:.2} — lowest:", scores.len(), EMBED_FLOOR * med);
+        let floor = if selfcal { "per-cluster coh".to_string() } else { format!("{:.2}", EMBED_FLOOR * med) };
+        eprintln!("  name gate ({}): {} scored, median {med:.2}, floor {floor} — lowest:", if selfcal { "selfcal" } else { "median" }, scores.len());
         for (i, s) in by_score.iter().take(5) {
-            eprintln!("    [{s:.2}] {}", cand[*i].1);
+            let p10 = verdicts.iter().find(|(x, _)| x == i).map(|(_, v)| v.coh_p10).unwrap_or(0.0);
+            eprintln!("    [{s:.2} vs coh_p10 {p10:.2}] {}", cand[*i].1);
         }
     }
 
-    let rejects = embed_rejects(&scores);
+    let rejects: Vec<usize> = if selfcal {
+        verdicts.iter().filter(|(_, v)| v.reject).map(|(i, _)| *i).collect()
+    } else {
+        embed_rejects(&scores)
+    };
     for &i in &rejects {
         let (j, name) = &cand[i];
         let fallback = fallback_name(j);
@@ -1155,6 +1240,38 @@ mod tests {
         assert!(embed_rejects(&scores).is_empty()); // above 0.6×median: kept
         let few: Vec<(usize, f32)> = vec![(0, 1.0), (1, 0.1)];
         assert!(embed_rejects(&few).is_empty()); // too few to judge
+    }
+
+    // The self-calibrating verdict keeps an on-theme name and rejects an
+    // off-theme one judged against the cluster's own members (unit vectors →
+    // maxsim is cosine). Exact thresholds are tuned in Phase 2; these cases are
+    // unambiguous either side of any reasonable floor.
+    #[test]
+    fn score_name_keeps_on_theme_rejects_off_theme() {
+        use ndarray::arr2;
+        let members: Vec<Array2<f32>> = (0..6).map(|_| arr2(&[[1.0f32, 0.0]])).collect();
+        assert!(!score_name(&arr2(&[[1.0f32, 0.0]]), &members).reject, "on-theme (cos~1) kept");
+        assert!(score_name(&arr2(&[[0.0f32, 1.0]]), &members).reject, "orthogonal/hallucinated (cos~0) rejected");
+    }
+
+    // Below MIN_MEMBERS_FOR_COH the per-cluster percentile is noise, so the gate
+    // leans on the absolute cosine floor alone (sound because vectors are
+    // L2-normalized) rather than a 3-sample tail.
+    #[test]
+    fn score_name_tiny_cluster_uses_absolute_floor() {
+        use ndarray::arr2;
+        let members: Vec<Array2<f32>> = (0..3).map(|_| arr2(&[[1.0f32, 0.0]])).collect();
+        assert!(!score_name(&arr2(&[[1.0f32, 0.0]]), &members).reject); // above ABS_FLOOR
+        assert!(score_name(&arr2(&[[0.0f32, 1.0]]), &members).reject); //  below ABS_FLOOR
+    }
+
+    #[test]
+    fn percentile_nearest_rank() {
+        let s = vec![0.1f32, 0.2, 0.3, 0.4, 0.5];
+        assert_eq!(percentile(&s, 0), 0.1);
+        assert_eq!(percentile(&s, 100), 0.5);
+        assert_eq!(percentile(&s, 50), 0.3);
+        assert_eq!(percentile(&[], 10), 0.0);
     }
 
     // Hyphen/slash compounds are cased per component (the acronym list can
