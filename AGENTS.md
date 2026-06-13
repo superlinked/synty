@@ -29,11 +29,13 @@ Rust binary.
 - On Apple Silicon, develop with `cargo build --release --features metal` (GPU
   encode, ~5.7x faster). `accelerate` (macOS CPU BLAS) and `mkl` (Linux) are
   the other opt-in backends. None may become default.
-- Distribution builds add features explicitly (this does not change the default
-  above): `--features metal,s3,gcs` for the macOS artifact, `--features s3,gcs`
-  for Linux. `synty publish` uploads the running binary as `bin/<version>/synty-
-  <os>-<arch>` and swaps `bin/latest.json`; `synty upgrade` self-updates from
-  that pointer (sha256-verified). These are ops, not pipeline steps.
+- Distribution is GitHub Releases, cut by `.github/workflows/release.yml` on a
+  `v*` tag: it builds per platform with explicit features (this does not change
+  the default above) — `--features metal,s3,gcs` for the macOS asset,
+  `--features s3,gcs` for Linux — and attaches `synty-<os>-<arch>` (+ `.sha256`).
+  `synty upgrade` self-updates from the latest release (sha256-verified, via the
+  GitHub token); a cached nag flags when behind. These are ops, not pipeline
+  steps.
 - The encoder loads the model from `$SYNTY_MODEL` (point it at a local dir for
   offline use; it otherwise downloads the default model on first run).
 - Pipeline: `ingest` → `index` (encode docs + build) → `summarize` (one-line

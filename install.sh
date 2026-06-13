@@ -10,40 +10,40 @@
 # re-paste with a bucket later and that same `init` switches you onto the team.
 # Idempotent — safe to bake into dev-VM / sandbox images.
 #
-# Binary source, in order: $SYNTY_BINARY_URL (the bucket's HTTP root — the
-# installer detects this machine's <os>-<arch> and pulls the matching artifact
-# named by bin/latest.json), $SYNTY_BINARY (a local path), else
-# ./target/release/synty (a local build). Distribution is internal for now — no
-# public package or Homebrew tap while the team rolls out. After install,
-# `synty upgrade` handles updates straight from the bucket (no URL needed).
+# Binary source, in order: $SYNTY_BINARY_URL (a direct artifact URL — a public
+# mirror or presigned link), else the latest GitHub Release of
+# $SYNTY_RELEASE_REPO (default superlinked/synty) via `gh` (which authenticates
+# to the private repo for you), else $SYNTY_BINARY / ./target/release/synty (a
+# local build). Distribution is internal for now — no public package or Homebrew
+# tap. After install, `synty upgrade` self-updates from the same releases.
 set -eu
 
 BUCKET="${1:-}"
+RELEASE_REPO="${SYNTY_RELEASE_REPO:-superlinked/synty}"
 
 # 1. Resolve the binary. This machine's platform key matches `release::platform_key`.
 os=$(uname -s); arch=$(uname -m)
 case "$os" in Darwin) os=darwin ;; Linux) os=linux ;; *) echo "unsupported OS: $os"; exit 1 ;; esac
 case "$arch" in arm64 | aarch64) arch=arm64 ;; x86_64 | amd64) arch=x64 ;; *) echo "unsupported arch: $arch"; exit 1 ;; esac
-PLAT="$os-$arch"
+PLAT="synty-$os-$arch"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 
 if [ -n "${SYNTY_BINARY_URL:-}" ]; then
-  TMP="$(mktemp)"
-  trap 'rm -f "$TMP"' EXIT
-  # latest.json names the current version; the artifact key is the deterministic
-  # bin/<version>/synty-<plat>, so we only parse the one version field.
-  ver=$(curl -fsSL "$SYNTY_BINARY_URL/bin/latest.json" \
-    | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-  [ -n "$ver" ] || { echo "no bin/latest.json under $SYNTY_BINARY_URL"; exit 1; }
-  url="$SYNTY_BINARY_URL/bin/$ver/synty-$PLAT"
-  echo "downloading synty $ver ($PLAT) from $url"
-  curl -fsSL "$url" -o "$TMP" || { echo "no $PLAT build published for synty $ver"; exit 1; }
-  chmod +x "$TMP"
-  BIN="$TMP"
+  echo "downloading $PLAT from $SYNTY_BINARY_URL"
+  curl -fsSL "$SYNTY_BINARY_URL" -o "$WORK/$PLAT"
+  BIN="$WORK/$PLAT"
+elif command -v gh >/dev/null 2>&1; then
+  echo "downloading $PLAT from the latest $RELEASE_REPO release"
+  gh release download --repo "$RELEASE_REPO" --pattern "$PLAT" --dir "$WORK" --clobber \
+    || { echo "no $PLAT in the latest $RELEASE_REPO release (is one published for your platform?)"; exit 1; }
+  BIN="$WORK/$PLAT"
 else
   BIN="${SYNTY_BINARY:-target/release/synty}"
 fi
-[ -x "$BIN" ] || {
-  echo "no synty binary at $BIN (set SYNTY_BINARY_URL, set SYNTY_BINARY, or build with: cargo build --release)"
+[ -x "$BIN" ] || chmod +x "$BIN" 2>/dev/null || true
+[ -f "$BIN" ] || {
+  echo "no synty binary: install \`gh\` (and \`gh auth login\`) to pull from $RELEASE_REPO, or set SYNTY_BINARY_URL / SYNTY_BINARY, or build with: cargo build --release"
   exit 1
 }
 

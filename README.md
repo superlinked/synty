@@ -193,37 +193,33 @@ export SYNTY_MODEL="$PWD/models/mxbai"
 
 ## Releasing & upgrades
 
-The binary ships through the **same bucket** as everything else — synty's only
-shared infrastructure. Artifacts are immutable and per-platform under
-`bin/<version>/synty-<os>-<arch>`, behind a `bin/latest.json` pointer (the same
-immutable-object + atomic-pointer shape the index uses). Each machine pulls the
-one build for its platform — **metal on Apple Silicon, plain CPU on Linux**,
-each with a runtime fallback — so nobody picks a build.
+Binaries ship as **GitHub Release** assets, built by CI. Each platform gets the
+fastest build for it — **metal on Apple Silicon, plain CPU on Linux**, each with
+a runtime fallback — so nobody picks a build.
 
-**Cut a release** — build per platform with the cloud backend(s) your team's
-bucket needs, then run the freshly built binary to publish itself:
+**Cut a release** — bump the version and push a tag; `.github/workflows/release.yml`
+runs the test suite, builds each platform, and attaches `synty-<os>-<arch>` (plus
+a `.sha256`) to the release:
 
 ```sh
-# on an Apple Silicon Mac
-cargo build --release --features metal,s3,gcs
-./target/release/synty publish --bucket gs://my-team        # → bin/<version>/synty-darwin-arm64
-
-# on a Linux x64 box
-cargo build --release --features s3,gcs
-./target/release/synty publish --bucket gs://my-team        # → bin/<version>/synty-linux-x64
+# edit Cargo.toml version → e.g. 0.2.0, commit
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
-`publish` uploads the artifact and merges it into `bin/latest.json` (same version
-accumulates platforms; a new version starts a fresh set). The version is the
-binary's own `CARGO_PKG_VERSION`, so it always matches the bytes.
+The matrix builds `macos-14` (`--features metal,s3,gcs`) and `ubuntu-latest`
+(`--features s3,gcs`); the `s3`/`gcs` features are for reading the team's *data*
+bucket and are independent of where the binary ships. Add matrix rows for more
+platforms (Intel Mac `macos-13`, `ubuntu-24.04-arm`) as needed.
 
-**Upgrade** — once a newer build is published, `synty status`, the TUI footer
-(`⬆ <v>`), and `synty up` show a nag; the actual swap stays explicit:
+**Upgrade** — once a newer release exists, `synty status`, the TUI footer
+(`⬆ <v>`), and `synty up` show a nag; the swap stays explicit:
 
 ```sh
-synty upgrade        # download this platform's build, verify sha256, replace in place, restart the tracker
+synty upgrade        # download this platform's asset, verify sha256, replace in place, restart the tracker
 ```
 
-`upgrade` uses synty's own bucket client (no URL needed — that's only the
-install bootstrap). It's a no-op when you're current and refuses on a checksum
-mismatch. `synty --version` reports the running build.
+`upgrade` fetches the release with the same GitHub token synty already uses for
+PRs/issues (no extra credential; override the source repo with
+`$SYNTY_RELEASE_REPO`). It's a no-op when you're current and refuses on a
+checksum mismatch. `synty --version` reports the running build. The install
+one-liner pulls the same assets via `gh release download`.

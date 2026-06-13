@@ -212,9 +212,6 @@ builds/<build>.<rev>.json              manifest: filename → blob, per (build, 
 current.json                           the pointer, PUT last — readers never see
                                         a torn build; rev versions the clusters
 lease/build                            soft TTL lease electing one index builder
-bin/<version>/synty-<os>-<arch>        the binary itself: immutable, per-platform
-bin/latest.json                        release pointer (version + per-platform
-                                        sha256) — `publish` writes, `upgrade` reads
 ```
 
 A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
@@ -231,16 +228,17 @@ incremental appends clone the previous build (CoW), so a reader's live mmap is
 never mutated under it. `synty up` loops locally; `synty build` is the
 one-shot fleet-aware build.
 
-The **binary distributes the same way**, because the bucket is the only shared
-infrastructure: `synty publish` uploads an immutable per-platform artifact under
-`bin/<version>/` and swaps the `bin/latest.json` pointer; `synty upgrade` reads
-the pointer through the same `Bucket` client, downloads its platform's build,
-verifies the sha256, and replaces the running binary in place. Each machine gets
-the fastest build for its platform (metal on Apple Silicon, CPU on Linux, each
-with runtime fallback) without choosing. Only the install bootstrap needs an
-HTTP-reachable `bin/` prefix (there's no synty yet to speak to the bucket);
-steady-state upgrades reuse the bucket client, and a passive nag (`status`,
-footer, `up`) flags when a machine is behind.
+The **binary distributes through GitHub Releases**, kept off the data bucket on
+purpose: CI builds a per-platform artifact on each version tag and attaches
+`synty-<os>-<arch>` (+ a `.sha256`) to the release. `synty upgrade` finds the
+latest release and downloads its platform's asset using the same GitHub token
+synty already holds for PRs/issues — no extra credential, no presigning, and the
+data bucket stays purely data. It verifies the sha256, replaces the running
+binary in place, and restarts the tracker; each machine gets the fastest build
+for its platform (metal on Apple Silicon, CPU on Linux, each with runtime
+fallback) without choosing. A passive, cached nag (`status`, footer, `up`) flags
+when a machine is behind; the install one-liner bootstraps via `gh release
+download`.
 
 ## Data compatibility
 
