@@ -327,11 +327,28 @@ fn clean_name(s: &str) -> String {
     }
     let t = title_case(line);
     let t = t.trim_end_matches(" Cluster").trim_end_matches("-Cluster").trim();
-    if t.is_empty() || matches!(t.to_lowercase().as_str(), "cluster" | "chores" | "update" | "fix") {
+    if t.is_empty()
+        || matches!(t.to_lowercase().as_str(), "cluster" | "chores" | "update" | "fix")
+        || looks_like_slug(t)
+    {
         String::new()
     } else {
         t.to_string()
     }
+}
+
+/// A mashed identifier rather than a prose title: a single whitespace-token
+/// whose hyphen-separated pieces are ≥2 word-like parts ("Terraform-SIE-Update",
+/// "SIE-Server", "MCP-Claude-Project"). The 0.6B emits these branch-name-style
+/// under the "short heading" pressure; they read as slugs and (when the same
+/// terms recur) collide into duplicate names. Reject to the summary fallback. A
+/// spaced title is never a slug, and a version/code piece ("GPT-5.5" → "5.5",
+/// "Florence-2" → "2") isn't a word, so codes survive.
+fn looks_like_slug(name: &str) -> bool {
+    if name.split_whitespace().count() != 1 {
+        return false;
+    }
+    name.split('-').filter(|p| p.chars().any(|c| c.is_ascii_alphabetic())).count() >= 2
 }
 
 /// Domain acronyms kept uppercase in titles. The model SHOUTS, so acronyms
@@ -486,7 +503,7 @@ struct Job {
 /// s5: centrality-ordered examples + the embedding-faithfulness gate; isolates
 /// these names from machines still generating ungated s4 ones.
 const TOPIC_PROMPT_VERSION: &str = "t8";
-const TOPIC_NAME_VERSION: &str = "s8";
+const TOPIC_NAME_VERSION: &str = "s9";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -1151,11 +1168,25 @@ mod tests {
         assert_eq!(clean_name("QWEN3 NAMING"), "Qwen3 Naming"); // brand beats the code rule
         assert_eq!(clean_name("CTA/GITHUB BUTTON FIXES"), "CTA/GitHub Button Fixes");
         assert_eq!(clean_name("CUDA JIT COMPILATION"), "CUDA JIT Compilation");
-        assert_eq!(clean_name("RUST-ORCHESTRATION-CLUSTER"), "Rust-Orchestration"); // generic suffix, hyphenated too
         // Not titles: hyphen-mush compounds and anything too long to display
         // untruncated (an ellipsis in a heading is worse than the fallback).
         assert_eq!(clean_name("Mcp-Claud-Eq-Reduction-Generation"), "");
         assert_eq!(clean_name("Web Deployment Notes Synchronization Prerequisites"), "");
+    }
+
+    // A mashed identifier (one token, ≥2 hyphen-joined words) is a slug, not a
+    // title — the 0.6B's branch-name reflex. Reject it (→ summary fallback) so
+    // "Terraform-SIE-Update"/"SIE-Server" stop slipping through and colliding.
+    // A spaced title is never a slug; a version/code piece doesn't count.
+    #[test]
+    fn slug_style_names_are_rejected() {
+        assert_eq!(clean_name("TERRAFORM-SIE-UPDATE"), "", "three-part slug");
+        assert_eq!(clean_name("SIE-SERVER"), "", "two-part slug");
+        assert_eq!(clean_name("MCP-CLAUDE-PROJECT"), "");
+        // Spared: spaced titles, and codes whose hyphen-piece isn't a word.
+        assert_eq!(clean_name("SIE-INTERNAL CLEANUP"), "SIE-Internal Cleanup", "has a space → not a slug");
+        assert_eq!(clean_name("GPT-5.5"), "GPT-5.5", "version code, not two words");
+        assert_eq!(clean_name("FLORENCE-2"), "Florence-2", "code piece, not a word");
     }
 
     // Two machines shuffle the same pending list differently (so concurrent
