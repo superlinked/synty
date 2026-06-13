@@ -40,10 +40,13 @@ enum View {
     Topics,
     Work,
     Search,
+    /// Usage: the agents/output charts and the repo/account/tool/model tables.
+    Stats,
+    /// Health: the synty self-box (freshness, autostart) + the fleet roster.
     Status,
 }
-const VIEWS: [View; 4] = [View::Topics, View::Work, View::Search, View::Status];
-const VIEW_NAMES: [&str; 4] = ["Topics[1]", "Work[2]", "Search[3]", "Status[4]"];
+const VIEWS: [View; 5] = [View::Topics, View::Work, View::Search, View::Stats, View::Status];
+const VIEW_NAMES: [&str; 5] = ["Topics[1]", "Work[2]", "Search[3]", "Stats[4]", "Status[5]"];
 const TL_DAYS: usize = 28; // topic activity strip: current + 3 prior weeks, by day
 
 /// Commands into the search actor: a query, or "the pointer moved — reopen
@@ -563,7 +566,8 @@ impl App {
             },
             View::Work => self.visible_work().len(),
             View::Search => self.results.len(),
-            View::Status => self.status.by_tool.len(),
+            View::Stats => self.status.by_tool.len(),
+            View::Status => self.status.fleet.machines.len(),
         }
     }
 
@@ -685,7 +689,7 @@ impl App {
         match code {
             KeyCode::Tab => return self.cycle(1),
             KeyCode::BackTab => return self.cycle(-1),
-            KeyCode::Char(c @ '1'..='4') => return self.set_view(VIEWS[c as usize - '1' as usize]),
+            KeyCode::Char(c @ '1'..='5') => return self.set_view(VIEWS[c as usize - '1' as usize]),
             _ => {}
         }
         if self.view == View::Search {
@@ -707,7 +711,7 @@ impl App {
             KeyCode::Char('g') => self.sel = 0,
             KeyCode::Char('G') => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.view == View::Status {
+                if self.view == View::Stats {
                     if self.tool_drill.is_none() {
                         if let Some(t) = self.status.by_tool.get(self.sel) {
                             self.tool_drill = Some(units::tool_profile(&t.name));
@@ -828,6 +832,7 @@ impl App {
             _ => body,
         };
         match self.view {
+            View::Stats => self.draw_stats(f, body),
             View::Status => self.draw_status(f, body),
             View::Topics => self.draw_topics(f, body),
             View::Work | View::Search => self.draw_master_detail(f, body),
@@ -904,6 +909,7 @@ impl App {
             (View::Topics, None) => format!("synty › Topics ({}){filt}", self.visible().len()),
             (View::Work, _) => format!("synty › Work ({})", self.work.len()),
             (View::Search, _) => format!("synty › Search ({})", self.results.len()),
+            (View::Stats, _) => "synty › Stats".to_string(),
             (View::Status, _) => "synty › Status".to_string(),
         }
     }
@@ -1156,7 +1162,7 @@ impl App {
                     .collect();
                 (["TYPE", "REPO", ""].map(String::from).to_vec(), vec![Constraint::Length(8), Constraint::Length(12), Constraint::Min(20)], rows)
             }
-            View::Status => (vec![], vec![], vec![]),
+            View::Stats | View::Status => (vec![], vec![], vec![]),
         }
     }
 
@@ -1223,15 +1229,9 @@ impl App {
     /// Status view: a totals/freshness/autostart header, the tokens & tools
     /// time-series panel, then two breakdown tables — docs · GitHub objects ·
     /// sessions per repo and per account.
-    fn draw_status(&self, f: &mut Frame, area: Rect) {
-        let [head, stats, cols] =
-            Layout::vertical([Constraint::Length(6), Constraint::Length(18), Constraint::Min(0)]).areas(area);
-        f.render_widget(
-            Paragraph::new(self.status_head())
-                .wrap(Wrap { trim: false })
-                .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" synty ")),
-            head,
-        );
+    /// Stats[4]: usage — what the agents consume and what the work produces.
+    fn draw_stats(&self, f: &mut Frame, area: Rect) {
+        let [stats, cols] = Layout::vertical([Constraint::Length(18), Constraint::Min(0)]).areas(area);
         let weeks = Self::stats_weeks(stats.width.saturating_sub(2));
         let block = Block::bordered()
             .border_style(Style::new().fg(theme::BORDER))
@@ -1262,6 +1262,60 @@ impl App {
         f.render_widget(models_table(&self.status.by_model), mcol);
         if let Some(p) = &self.tool_drill {
             self.draw_tool_overlay(f, area, p);
+        }
+    }
+
+    /// Status[5]: health — the synty self-box and the fleet roster (who runs
+    /// synty where, who runs agents unwatched).
+    fn draw_status(&self, f: &mut Frame, area: Rect) {
+        let [head, fleet] = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
+        f.render_widget(
+            Paragraph::new(self.status_head())
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(" synty ")),
+            head,
+        );
+        let r = &self.status.fleet;
+        let title = if r.machines.is_empty() {
+            " fleet ".to_string()
+        } else {
+            format!(
+                " fleet · {} machines ({} active) · {} actors tracked · {} active on GitHub · install rate {}% · {}d ",
+                r.machines.len(),
+                r.active(),
+                r.actors_tracked.len(),
+                r.gh_active,
+                r.install_rate_pct,
+                crate::fleet::GH_WINDOW_DAYS,
+            )
+        };
+        let block = Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(title);
+        if r.machines.is_empty() {
+            f.render_widget(
+                Paragraph::new("\n  no event streams yet — the first `synty build` (or background freshen) fills the roster")
+                    .style(Style::new().fg(theme::DIM))
+                    .block(block),
+                fleet,
+            );
+            return;
+        }
+        // The untracked line eats the table's last rows when present — it is
+        // the actionable part, never clipped.
+        let inner = block.inner(fleet);
+        f.render_widget(block, fleet);
+        let untracked_h = u16::from(!r.untracked_attributed.is_empty());
+        let [tbl, note] = Layout::vertical([Constraint::Min(0), Constraint::Length(untracked_h)]).areas(inner);
+        let mut ts = TableState::default();
+        ts.select(Some(self.sel.min(r.machines.len() - 1)));
+        f.render_stateful_widget(fleet_table(r), tbl, &mut ts);
+        if untracked_h > 0 {
+            let names: Vec<String> =
+                r.untracked_attributed.iter().map(|(a, l)| format!("{a} ({l})")).collect();
+            f.render_widget(
+                Line::from(format!(" runs agents, untracked: {}", names.join(", ")))
+                    .fg(theme::CLOSED),
+                note,
+            );
         }
     }
 
@@ -1497,7 +1551,8 @@ impl App {
             _ if self.drill_topic.is_some() => "↑↓ units · Enter detail · Esc/h back · q quit",
             View::Topics => "↑↓ move · Enter drill · Esc reset · Tab cycle · q quit",
             _ if self.tool_drill.is_some() => "Esc/h close · q quit",
-            View::Status => "↑↓ tools · Enter inspect · a autostart · Tab cycle · q quit",
+            View::Stats => "↑↓ tools · Enter inspect · Tab cycle · q quit",
+            View::Status => "↑↓ machines · a autostart · Tab cycle · q quit",
             View::Work => "↑↓ move · Esc reset · Tab cycle · q quit",
         };
         format!("  {keys}")
@@ -1581,6 +1636,50 @@ fn facet_table(title: &str, rows: &[crate::view::Tally]) -> Table<'static> {
     Table::new(body, [Constraint::Min(8), Constraint::Length(6), Constraint::Length(5), Constraint::Length(5), Constraint::Length(7), Constraint::Length(6)])
         .header(Row::new(["", "DOCS", "SESS", "GH", "TOK", "TOOLS"].map(Cell::from)).style(dim.add_modifier(Modifier::BOLD)))
         .block(Block::bordered().border_style(Style::new().fg(theme::BORDER)).title(format!(" {title} ({}) ", rows.len())))
+}
+
+/// The fleet roster: one row per machine, alive ones in sage, quiet ones
+/// (tracker rot) dimmed with their state called out. Liveness comes from
+/// envelope timestamps, so a bucket pull can't fake freshness.
+fn fleet_table(r: &crate::fleet::Roster) -> Table<'static> {
+    let dim = Style::new().fg(theme::DIM);
+    let body: Vec<Row> = r
+        .machines
+        .iter()
+        .map(|m| {
+            let tone = if m.quiet { theme::DIM } else { theme::FG };
+            Row::new(vec![
+                Cell::from(m.machine.clone()).style(Style::new().fg(tone)),
+                Cell::from(m.sources.join("+")).style(dim),
+                Cell::from(if m.actors.is_empty() { "—".to_string() } else { m.actors.join("+") }).style(Style::new().fg(tone)),
+                Cell::from(m.last_ts.split('T').next().unwrap_or("—").to_string()).style(dim),
+                Cell::from(if m.version.is_empty() { "—".to_string() } else { format!("v{}", m.version) }).style(dim),
+                Cell::from(crate::view::fmt_tokens(m.events)).style(dim),
+                if m.quiet {
+                    Cell::from("QUIET").style(Style::new().fg(theme::CLOSED))
+                } else {
+                    Cell::from("live").style(Style::new().fg(theme::SAGE))
+                },
+            ])
+        })
+        .collect();
+    Table::new(
+        body,
+        [
+            Constraint::Min(14),
+            Constraint::Length(14),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(5),
+        ],
+    )
+    .header(
+        Row::new(["MACHINE", "SOURCES", "ACTOR", "LAST", "VER", "EV30D", ""].map(Cell::from))
+            .style(dim.add_modifier(Modifier::BOLD)),
+    )
+    .row_highlight_style(Style::new().bg(theme::BG))
 }
 
 /// The fleet-wide tool mix: which tools the sessions actually call, how
@@ -2029,7 +2128,7 @@ mod tests {
         let a = app();
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        for label in ["Topics", "Work", "Search", "Status"] {
+        for label in ["Topics", "Work", "Search", "Stats", "Status"] {
             assert!(text.contains(label), "nav missing {label}");
         }
         // glyph-first, like the freshness cell ("✓ fresh" / "✗ autostart").
@@ -2095,6 +2194,8 @@ mod tests {
         a.on_key(KeyCode::Char('2'));
         assert!(matches!(a.view, View::Work));
         a.on_key(KeyCode::Char('4'));
+        assert!(matches!(a.view, View::Stats));
+        a.on_key(KeyCode::Char('5'));
         assert!(matches!(a.view, View::Status));
     }
 
@@ -2185,20 +2286,18 @@ mod tests {
         assert!(a.quit, "Esc on a clean screen quits");
     }
 
-    // The Status view shows totals, per-repo/account breakdowns, and the
-    // autostart state. (The toggle itself has side effects, so it isn't pressed.)
+    // Stats[4] is the usage view: charts, per-repo/account spend, tools and
+    // models — the autostart toggle lives on Status[5] now, not here.
     #[test]
-    fn status_view_shows_breakdowns_and_autostart() {
+    fn stats_view_shows_usage_breakdowns() {
         let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
         let mut a = app();
-        a.view = View::Status;
+        a.view = View::Stats;
         term.draw(|f| a.draw(f)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("docs") && text.contains("github") && text.contains("sessions"), "totals row missing: {text}");
         assert!(text.contains("Repos (1)") && text.contains("Accounts (1)"), "breakdown table titles missing: {text}");
         assert!(text.contains("SESS") && text.contains("GH") && text.contains("DOCS"), "table headers missing");
         assert!(text.contains("sie") && text.contains("alice"), "facet rows missing");
-        assert!(text.contains("autostart") && text.contains("OFF"), "autostart state missing");
         // the tokens & tools panel: a log-scale braille line chart for the
         // token classes (legend carries the window totals) over height-bar
         // rows for the counts, windowed to whatever the width fits.
@@ -2213,18 +2312,47 @@ mod tests {
         assert!(text.contains("AGENT") && text.contains("claude"), "tools agent column missing: {text}");
         assert!(text.contains("~TOK") && text.contains("20.3k"), "estimated context column missing: {text}");
         assert!(text.contains("Models (1)") && text.contains("claude-fable-5") && text.contains("CACHE-R"), "models table missing: {text}");
-        // the toggle uses the keycap convention, not an explanation sentence.
-        assert!(text.contains("autostart[a]"), "autostart keycap hint missing: {text}");
-        assert!(!text.contains("press a to toggle"), "explanation sentence should be gone");
+        assert!(text.contains("Enter inspect"), "stats footer hint missing: {text}");
+        assert!(!text.contains("autostart[a]"), "the toggle belongs to Status[5], not Stats");
     }
 
-    // Enter on a Status tool opens its profile overlay — argument-key shares,
-    // common values, latency — and Esc peels it like every other drill.
+    // Status[5] is the health view: the synty self-box (totals, freshness,
+    // the autostart keycap) over the fleet roster — who runs synty where,
+    // whose tracker rotted, and who runs agents unwatched.
+    #[test]
+    fn status_view_shows_health_and_fleet_roster() {
+        let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        let mut a = app();
+        a.view = View::Status;
+        term.draw(|f| a.draw(f)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("docs") && text.contains("github") && text.contains("sessions"), "totals row missing: {text}");
+        assert!(text.contains("autostart") && text.contains("OFF"), "autostart state missing");
+        // the toggle uses the keycap convention, not an explanation sentence.
+        assert!(text.contains("autostart[a]"), "autostart keycap hint missing: {text}");
+        assert!(text.contains("a autostart"), "status footer hint missing: {text}");
+        // the roster: a live machine with its agents/actor/version, a quiet
+        // one called out, the coverage join in the block title.
+        assert!(text.contains("install rate 50%"), "coverage summary missing: {text}");
+        assert!(text.contains("mac-3939") && text.contains("claude+codex") && text.contains("svonava"), "live machine row missing: {text}");
+        assert!(text.contains("v0.1.0"), "tracker version missing: {text}");
+        assert!(text.contains("ci-runner-7") && text.contains("QUIET"), "quiet machine not called out: {text}");
+        assert!(text.contains("runs agents, untracked: bob (claude)"), "untracked-attributed line missing: {text}");
+        // none of the usage furniture leaks onto the health tab.
+        assert!(!text.contains("Models (1)") && !text.contains("agents · output"), "usage panels belong to Stats[4]: {text}");
+    }
+
+    // Enter on a Stats tool opens its profile overlay — argument-key shares,
+    // common values, latency — and Esc peels it like every other drill. On
+    // Status[5] Enter opens nothing (the roster is table-only for now).
     #[test]
     fn tool_drill_overlay_renders_profile() {
         let mut term = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let mut a = app();
         a.view = View::Status;
+        a.on_key(KeyCode::Enter);
+        assert!(a.tool_drill.is_none(), "Enter on the roster must not open a tool overlay");
+        a.view = View::Stats;
         a.tool_drill = Some(units::ToolProfile {
             name: "Bash".into(),
             agent: "claude".into(),

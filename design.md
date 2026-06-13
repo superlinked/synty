@@ -137,8 +137,9 @@ runs on CI or a server without a developer machine.
 
 - **CLI → stdout (agents):** `search`, `topic`, `recent`, `status` print Markdown
   an agent reads over the shell — no server, no auth, no network. *Built.*
-- **TUI (humans):** `synty tui` — tabs for status, topics, recent, and search,
-  with browse/drill (topic → members → full document), reusing the CLI's
+- **TUI (humans):** `synty tui` — tabs for topics, work, search, stats (usage
+  charts + spend tables), and status (self-health + fleet roster), with
+  browse/drill (topic → members → full document), reusing the CLI's
   view-models. *Built.*
 - **MCP server:** `synty mcp` serves `synty_search / synty_topics /
   synty_recent / synty_status` as agent tools over stdio (hand-rolled JSON-RPC,

@@ -57,12 +57,14 @@ Results are ranked Markdown cards — PRs, issues, and session moments — that 
 or an agent can read directly. No accounts, no network calls.
 
 Prefer to browse? `cargo run --release -- tui` opens an interactive terminal UI:
-tabs for **Topics**, **Work**, **Search**, and **Status**, with drill-down from
-a topic into its sessions and the full document text. Filter any list to one
-repo or account with `r`/`a`, refresh on demand with `u` (the footer shows
-build progress and staleness), and the Status tab breaks activity down per
-repo and account and toggles login-time tracking. The CLI has the same surface
-for agents and scripts:
+tabs for **Topics**, **Work**, **Search**, **Stats**, and **Status**, with
+drill-down from a topic into its sessions and the full document text. Filter
+any list to one repo or account with `r`/`a`, refresh on demand with `u` (the
+footer shows build progress and staleness). The Stats tab charts what the
+agents consume against what the work produces and breaks the spend down per
+repo, account, tool, and model; the Status tab shows tracker health, the fleet
+roster (who runs synty where, who runs agents untracked), and toggles
+login-time tracking. The CLI has the same surface for agents and scripts:
 
 ```sh
 cargo run --release -- topic            # emergent topics (or `topic auth` to filter)

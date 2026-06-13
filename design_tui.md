@@ -14,7 +14,9 @@ Work backwards from what the user is trying to do; each maps to one view.
 - **B — situational awareness:** "what's been happening / what's active?" → Work.
 - **C — catch up on a thread:** "what happened with topic X, and how is it going?" → Topics.
 - **D — orient / prioritize:** "where should I look first?" → Overview.
-- **E — is it healthy:** "is tracking fresh, what's indexed?" → Status.
+- **E — is it healthy:** "is tracking fresh, is the fleet covered?" → Status.
+- **F — what does it cost / produce:** "what are the agents consuming, what
+  comes out?" → Stats.
 
 ## Principles
 
@@ -71,8 +73,8 @@ Truecolor; degrades to the nearest 16-color on terminals without it.
 ```
 
 Master/detail split ~40/60. The detail pane scrolls. A top tab strip names the
-four views (Topics, Work, Search, Status) and highlights the active one in
-accent. The Topics list carries a per-day activity strip (last four weeks, week
+five views (Topics, Work, Search, Stats, Status) and highlights the active one
+in accent. The Topics list carries a per-day activity strip (last four weeks, week
 dividers) and drilling a topic opens an overlay (the right three-quarters of
 the screen; full-screen when narrow) with its description, repos, people, and
 member units. Enter on a member unit splits the overlay with that unit's
@@ -106,17 +108,21 @@ search is instant.
   issues): `when · type · repo · title/ask · outcome · struggle`. The "recent"
   feed, reframed to units. Drill → unit detail.
 - **Search** (job A) — query → results as units → drill to detail → messages.
-- **Status** (job E) — tracker/index health: docs by source/kind/repo, newest
-  item, last indexed, last tracked, per-source freshness; a tokens & tools
-  bar chart tracks the four token classes, tool calls, active sessions, and the
-  GitHub artifacts (PRs, issues) per day — full width, over as many Mon-aligned weeks as fit, day bars
-  height-scaled (▁..█) against each row's own peak — above the repo/account
-  breakdowns — which carry TOK/TOOLS spend columns — a Models table splitting
-  the spend per model, and a selectable Tools table (agent · calls · errors);
-  Enter on a tool opens its profile overlay: volume, call→result latency
-  p50/p95, the day strip, argument-key shares with common values for the
-  enum-ish keys, and the most recent invocations. The autostart toggle uses
-  the keycap convention (autostart[a]).
+- **Stats** (job F) — usage: two stacked log-scale charts (what the agents
+  consumed — tokens, cache, tool calls, sessions — over what the work produced
+  — LOC±, PRs, issues) per day over as many Mon-aligned weeks as fit; above the
+  repo/account breakdowns — which carry TOK/TOOLS spend columns — a Models
+  table splitting the spend per model, and a selectable Tools table (agent ·
+  calls · errors); Enter on a tool opens its profile overlay: volume,
+  call→result latency p50/p95, the day strip, argument-key shares with common
+  values for the enum-ish keys, and the most recent invocations.
+- **Status** (job E) — health: the synty self-box (docs by source/kind, newest
+  item, last indexed, last tracked, staleness, the autostart toggle on the
+  keycap convention autostart[a]) over the fleet roster — one row per machine
+  (sources · actor · last event · tracker version · 30d events · live/QUIET),
+  liveness from envelope timestamps, the coverage join (actors tracked vs
+  GitHub-active, install rate) in the panel title, and the agent-attributed
+  untracked authors called out on their own line.
 
 ### Unit detail (the drill target)
 
@@ -138,6 +144,9 @@ envelopes under corpus/local + clusters.json). Sketch, not exact types:
 - `Topic { id, label, units: [UnitRef], span, activity: [(bucket, count)],
   type_mix, summary }`
 - `Rollup` — activity counts per time bucket (day/week), per topic/unit/repo.
+- `Roster { machines: [Machine { machine, sources, actors, last_ts, version,
+  events, quiet }], install_rate_pct, untracked_attributed }` — folded from
+  the raw envelopes + GitHub docs (see design.md, Fleet coverage).
 
 `thinking_blocks`, `tool_calls`, etc. come from the raw envelopes (which carry
 `ts`, `session_id`, `attachment_ref` for files, `pr_link` for the PR linkage).
