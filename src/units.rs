@@ -569,6 +569,27 @@ fn combine_activity(
     out
 }
 
+/// Every distinct tool name seen in the envelopes — the suggestion pool when
+/// `synty tool <name>` misses. One light scan, called only on that miss.
+pub fn tool_names() -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for path in jsonl_files(Path::new(LOCAL_DIR)) {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            for line in data.lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                if v["kind"].as_str() == Some("tool_call") {
+                    if let Some(n) = v["payload"]["name"].as_str() {
+                        if !n.is_empty() {
+                            names.insert(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// Days from the CE epoch for a YYYY-MM-DD day (the time-series x scale).
 pub fn day_num(day: &str) -> Option<i32> {
     use chrono::Datelike;

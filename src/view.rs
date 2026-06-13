@@ -263,6 +263,109 @@ pub fn stats_json(s: &StatsView) -> String {
     )
 }
 
+/// `synty tool <name>` as Markdown — the same facts the TUI's tool overlay
+/// shows: volume, latency, input sizes, context estimate, weekly call counts,
+/// argument-key shares (with common values for the enum-ish keys), and the
+/// most recent invocations.
+pub fn tool_md(p: &crate::units::ToolProfile) -> String {
+    let mut o = format!("# {} · {}\n\n", p.name, p.agent);
+    let mut head = format!("{} calls · {} errors", fmt_tokens(p.calls), p.errs);
+    if p.timed > 0 {
+        head.push_str(&format!(" · result p50 {}ms · p95 {}ms ({} timed)", p.p50_ms, p.p95_ms, p.timed));
+    }
+    if p.input_p95 > 0 {
+        head.push_str(&format!(" · input p50 {} / p95 {} chars", p.input_p50, p.input_p95));
+    }
+    if p.chars > 0 {
+        head.push_str(&format!(" · context ~{} tok", fmt_tokens(p.chars / 4)));
+    }
+    o.push_str(&head);
+    o.push('\n');
+    // The Markdown stand-in for the overlay's day strip: per-week call counts
+    // over the trailing four weeks of data.
+    let by_num: Vec<(i32, u64)> =
+        p.days.iter().filter_map(|(d, n)| Some((crate::units::day_num(d)?, *n))).collect();
+    if let Some(gmax) = by_num.iter().map(|(d, _)| *d).max() {
+        let start = crate::units::week_start_for(gmax, 4);
+        let mut weeks = [0u64; 4];
+        for (d, n) in &by_num {
+            if *d >= start {
+                weeks[(((d - start) / 7) as usize).min(3)] += n;
+            }
+        }
+        o.push_str(&format!(
+            "calls by week (oldest→newest): {}\n",
+            weeks.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" · "),
+        ));
+    }
+    if !p.arg_keys.is_empty() {
+        o.push_str("\nargs (share of calls):\n");
+        for (key, n) in p.arg_keys.iter().take(10) {
+            let pct = 100 * n / p.calls.max(1);
+            o.push_str(&format!("  {:<22} {:>6} ({:>3}%)", key, fmt_tokens(*n), pct));
+            if let Some((_, tops)) = p.arg_tops.iter().find(|(k, _)| k == key) {
+                let vals: Vec<String> = tops.iter().map(|(v, c)| format!("{v}×{c}")).collect();
+                o.push_str(&format!("  {}", vals.join(" · ")));
+            }
+            o.push('\n');
+        }
+    }
+    if !p.samples.is_empty() {
+        o.push_str("\nrecent:\n");
+        for s in &p.samples {
+            o.push_str(&format!("  {s}\n"));
+        }
+    }
+    o
+}
+
+pub fn tool_json(p: &crate::units::ToolProfile) -> String {
+    envelope(
+        "tool",
+        serde_json::json!({
+            "name": p.name,
+            "agent": p.agent,
+            "calls": p.calls,
+            "errors": p.errs,
+            "context_chars": p.chars,
+            "context_tokens_est": p.chars / 4,
+            "p50_ms": p.p50_ms,
+            "p95_ms": p.p95_ms,
+            "timed": p.timed,
+            "input_p50": p.input_p50,
+            "input_p95": p.input_p95,
+            "days": p.days,
+            "arg_keys": p.arg_keys,
+            "arg_tops": p.arg_tops,
+            "samples": p.samples,
+        }),
+    )
+}
+
+/// The shared CLI/MCP entry for `tool <name>`: the profile as Markdown, or an
+/// error that names close matches — misses behave identically on both
+/// surfaces.
+pub fn tool_report(name: &str) -> Result<String> {
+    let p = crate::units::tool_profile(name);
+    if p.calls > 0 {
+        return Ok(tool_md(&p));
+    }
+    let sugg = tool_suggestions(name, &crate::units::tool_names());
+    if sugg.is_empty() {
+        anyhow::bail!("no calls recorded for tool `{name}` — names appear in `synty status`");
+    }
+    anyhow::bail!("no calls recorded for tool `{name}` — did you mean {}?", sugg.join(", "))
+}
+
+/// Case-insensitive exact and prefix matches, exact first.
+fn tool_suggestions(name: &str, names: &[String]) -> Vec<String> {
+    let q = name.to_lowercase();
+    let mut out: Vec<String> = names.iter().filter(|n| n.to_lowercase() == q).cloned().collect();
+    out.extend(names.iter().filter(|n| n.to_lowercase().starts_with(&q) && n.to_lowercase() != q).cloned());
+    out.truncate(5);
+    out
+}
+
 /// The fleet section of `status`: every machine with its liveness, who it
 /// attributes to, and the install-rate join — empty string when no streams
 /// have ever been seen (a fresh viewer before its first build).
@@ -849,6 +952,59 @@ mod tests {
         assert_eq!(v["data"]["days"]["2026-06-12"]["tok_in"], 46_100);
         assert_eq!(v["data"]["weeks"][0]["start"], "2026-05-25");
         assert_eq!(v["data"]["total"]["prs"], 7);
+    }
+
+    fn tool_profile_fixture() -> crate::units::ToolProfile {
+        crate::units::ToolProfile {
+            name: "Bash".into(),
+            agent: "claude".into(),
+            calls: 3665,
+            errs: 106,
+            chars: 5_600_000,
+            days: [("2026-06-12".to_string(), 12u64), ("2026-05-26".to_string(), 30u64)].into_iter().collect(),
+            arg_keys: vec![("command".into(), 3665), ("timeout".into(), 420)],
+            arg_tops: vec![("timeout".into(), vec![("120000".into(), 300), ("600000".into(), 120)])],
+            p50_ms: 740,
+            p95_ms: 12_400,
+            timed: 3600,
+            input_p50: 180,
+            input_p95: 900,
+            samples: vec![r#"{"command":"cargo test"}"#.into()],
+        }
+    }
+
+    // The CLI tool profile carries the same facts as the TUI overlay: volume,
+    // latency, context estimate, weekly calls, argument shares, recent calls.
+    #[test]
+    fn tool_md_shows_volume_latency_args_and_samples() {
+        let md = tool_md(&tool_profile_fixture());
+        assert!(md.contains("# Bash · claude"), "{md}");
+        assert!(md.contains("3.7k calls") && md.contains("106 errors"), "{md}");
+        assert!(md.contains("result p50 740ms · p95 12400ms (3600 timed)"), "{md}");
+        assert!(md.contains("input p50 180 / p95 900 chars"), "{md}");
+        assert!(md.contains("context ~1.4M tok"), "{md}");
+        assert!(md.contains("calls by week (oldest→newest): 0 · 30 · 0 · 12"), "{md}");
+        assert!(md.contains("command") && md.contains("(100%)"), "{md}");
+        assert!(md.contains("120000×300 · 600000×120"), "common values for enum-ish keys: {md}");
+        assert!(md.contains("cargo test"), "{md}");
+    }
+
+    #[test]
+    fn tool_json_envelope_kind_is_tool() {
+        let v: serde_json::Value = serde_json::from_str(&tool_json(&tool_profile_fixture())).unwrap();
+        assert_eq!((v["v"].as_i64(), v["kind"].as_str()), (Some(1), Some("tool")));
+        assert_eq!(v["data"]["calls"], 3665);
+        assert_eq!(v["data"]["context_tokens_est"], 1_400_000);
+        assert_eq!(v["data"]["days"]["2026-06-12"], 12);
+    }
+
+    // A near-miss name gets pointed at the real one; rubbish gets nothing.
+    #[test]
+    fn tool_suggestions_match_case_and_prefix() {
+        let names = vec!["Bash".to_string(), "Edit".to_string(), "Read".to_string()];
+        assert_eq!(tool_suggestions("bash", &names), ["Bash"], "case-insensitive exact match");
+        assert_eq!(tool_suggestions("re", &names), ["Read"], "prefix match");
+        assert!(tool_suggestions("zzz", &names).is_empty());
     }
 
     // Every --json output arrives in the same versioned envelope, so a script

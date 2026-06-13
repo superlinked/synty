@@ -71,6 +71,7 @@ cargo run --release -- topic            # emergent topics (or `topic auth` to fi
 cargo run --release -- recent           # latest PRs, issues, and prompts
 cargo run --release -- status           # health: what's indexed, freshness, the fleet roster
 cargo run --release -- stats            # usage: tokens/tools/sessions vs LOC/PRs/issues per week
+cargo run --release -- tool Bash        # one tool's profile: volume, latency, argument mix
 ```
 
 Every read command takes `--json` for scripts; the output is one versioned

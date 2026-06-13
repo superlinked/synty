@@ -214,6 +214,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Fleet-wide profile of one tool: volume, latency, argument mix, recent
+    /// invocations (tool names appear in `synty status`)
+    Tool {
+        /// The tool name as the agent calls it (e.g. Bash, Edit, Read)
+        name: String,
+        /// Print as JSON (for scripts and agents)
+        #[arg(long)]
+        json: bool,
+    },
     /// First-run onboarding: connect GitHub, pick an org to back-fill, enable autostart
     Setup,
     /// Interactive terminal UI: status + browse/drill over topics, recent, search.
@@ -407,6 +416,18 @@ fn main() -> Result<()> {
                 println!("{}", view::stats_json(&s));
             } else {
                 print!("{}", view::stats_md(&s));
+            }
+        }
+        Cmd::Tool { name, json } => {
+            if json {
+                let p = units::tool_profile(&name);
+                if p.calls == 0 {
+                    // Same miss behavior as the Markdown path.
+                    view::tool_report(&name)?;
+                }
+                println!("{}", view::tool_json(&p));
+            } else {
+                print!("{}", view::tool_report(&name)?);
             }
         }
         Cmd::Setup => setup::run()?,
