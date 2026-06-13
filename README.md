@@ -72,7 +72,9 @@ cargo run --release -- recent           # latest PRs, issues, and prompts
 cargo run --release -- status           # what's indexed and how fresh it is
 ```
 
-`search`, `topic`, `recent`, and `status` all take `--json` for scripts. For
+Every read command takes `--json` for scripts; the output is one versioned
+envelope, `{"v": 1, "kind": "…", "data": …}` — check `v` once, dispatch on
+`kind`. For
 coding agents there's an MCP server — add it to the agent's MCP config and it
 gets `synty_search` / `synty_topics` / `synty_recent` / `synty_status` as tools:
 

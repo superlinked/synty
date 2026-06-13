@@ -69,7 +69,7 @@ pub fn render_json(docs: &[Doc], res: &QueryResult) -> String {
             }))
         })
         .collect();
-    serde_json::Value::Array(arr).to_string()
+    crate::view::envelope("search", serde_json::Value::Array(arr))
 }
 
 /// Render a result set as Markdown. Shared with the eval harness.

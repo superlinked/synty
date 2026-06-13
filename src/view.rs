@@ -355,6 +355,13 @@ pub fn status_md(s: &Status) -> String {
 
 // ── JSON renderers (CLI --json, for scripts and agents) ──────────────────
 
+/// Every --json output, one shape: `{"v": 1, "kind": "...", "data": ...}` —
+/// a consumer checks `v` once and dispatches on `kind`. Pre-release the inner
+/// shapes may still move; `v` bumps only for a break we intend to keep.
+pub fn envelope(kind: &str, data: serde_json::Value) -> String {
+    serde_json::json!({"v": 1, "kind": kind, "data": data}).to_string()
+}
+
 fn unit_json(u: &Unit) -> serde_json::Value {
     serde_json::json!({
         "kind": match u.kind { Kind::Session => "session", Kind::Pr => "pr", Kind::Issue => "issue" },
@@ -372,7 +379,7 @@ fn unit_json(u: &Unit) -> serde_json::Value {
 }
 
 pub fn work_json(units: &[Unit]) -> String {
-    serde_json::Value::Array(units.iter().map(unit_json).collect()).to_string()
+    envelope("work", serde_json::Value::Array(units.iter().map(unit_json).collect()))
 }
 
 pub fn topics_json(topics: &[TopicUnits]) -> String {
@@ -395,11 +402,11 @@ pub fn topics_json(topics: &[TopicUnits]) -> String {
             })
         })
         .collect();
-    serde_json::Value::Array(arr).to_string()
+    envelope("topics", serde_json::Value::Array(arr))
 }
 
 pub fn status_json(s: &Status) -> String {
-    serde_json::json!({
+    envelope("status", serde_json::json!({
         "docs": s.docs,
         "github": s.github,
         "sessions": s.sessions,
@@ -428,8 +435,7 @@ pub fn status_json(s: &Status) -> String {
             "install_rate_pct": s.fleet.install_rate_pct,
             "quiet_days": s.fleet.quiet_days,
         },
-    })
-    .to_string()
+    }))
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -657,6 +663,55 @@ mod tests {
         assert!(md.contains("ci-runner-7") && md.contains("QUIET"), "{md}");
         assert!(md.contains("runs agents, untracked: bob (claude)"), "{md}");
         assert!(fleet_md(&Default::default()).is_empty(), "no streams yet → no section");
+    }
+
+    // Every --json output arrives in the same versioned envelope, so a script
+    // checks `v` once and dispatches on `kind` — and the data keeps its shape.
+    #[test]
+    fn json_outputs_carry_versioned_envelope() {
+        let unit = Unit {
+            kind: Kind::Session,
+            when: "2026-06-01".into(),
+            repo: "sie".into(),
+            title: "fix login".into(),
+            outcome: "done".into(),
+            summary: None,
+            topic: None,
+            rank: 0,
+            dup: false,
+            struggle: 0.0,
+            author: "alice".into(),
+            doc_id: None,
+            session_id: Some("S1".into()),
+        };
+        let w: serde_json::Value = serde_json::from_str(&work_json(&[unit])).unwrap();
+        assert_eq!((w["v"].as_i64(), w["kind"].as_str()), (Some(1), Some("work")));
+        assert_eq!(w["data"][0]["repo"], "sie", "the data keeps the prior array shape");
+
+        let t: serde_json::Value = serde_json::from_str(&topics_json(&[])).unwrap();
+        assert_eq!((t["v"].as_i64(), t["kind"].as_str()), (Some(1), Some("topics")));
+        assert!(t["data"].is_array());
+
+        let s = Status {
+            docs: 3,
+            github: 1,
+            sessions: 1,
+            by_kind: vec![],
+            by_repo: vec![],
+            by_user: vec![],
+            by_tool: vec![],
+            by_model: vec![],
+            newest_ts: String::new(),
+            last_indexed: None,
+            last_tracked: None,
+            autostart: false,
+            stale: false,
+            fleet: Default::default(),
+        };
+        let s: serde_json::Value = serde_json::from_str(&status_json(&s)).unwrap();
+        assert_eq!((s["v"].as_i64(), s["kind"].as_str()), (Some(1), Some("status")));
+        assert_eq!(s["data"]["docs"], 3, "the data keeps the prior object shape");
+        assert!(s["data"]["fleet"]["machines"].is_array());
     }
 
     fn doc(source: &str, kind: &str, repo: &str, author: &str, sid: &str) -> Doc {
