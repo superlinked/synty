@@ -69,6 +69,7 @@ impl Server {
         let a = &p["arguments"];
         let out = match name {
             "synty_search" => self.search(a),
+            "synty_related" => self.related(a),
             "synty_topics" => topics_text(a),
             "synty_recent" => recent_text(a),
             "synty_status" => view::status().map(|s| view::status_md(&s)),
@@ -102,6 +103,28 @@ impl Server {
         anyhow::ensure!(!query.is_empty(), "query is required");
         let k = a["k"].as_u64().unwrap_or(5) as usize;
         let filter = a["filter"].as_str().filter(|f| !f.is_empty());
+        self.search_query(query, k, filter)
+    }
+
+    /// `synty_related`: derive the query from a git repo (the `repo` path, or the
+    /// server's cwd) and search cross-repo. The agent knows its own working
+    /// directory; passing it lets the daemon find prior work for that task.
+    fn related(&mut self, a: &Value) -> Result<String> {
+        let cwd = match a["repo"].as_str().filter(|r| !r.is_empty()) {
+            Some(r) => std::path::PathBuf::from(r),
+            None => std::env::current_dir()?,
+        };
+        let query = crate::related::context_query(&cwd).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no git context at {} — pass `repo` as the path to a git repo you're working in, or use synty_search",
+                cwd.display()
+            )
+        })?;
+        let k = a["k"].as_u64().unwrap_or(5) as usize;
+        self.search_query(&query, k, None)
+    }
+
+    fn search_query(&mut self, query: &str, k: usize, filter: Option<&str>) -> Result<String> {
         // Reopen the index when the pointer moved (a builder published a new
         // read-model while we were serving); the encoder stays loaded.
         let cur = readmodel::current();
@@ -161,6 +184,14 @@ fn tool_defs() -> Value {
                 "k": {"type": "integer", "description": "Number of results (default 5)"},
                 "filter": {"type": "string", "description": "Optional metadata filter, column=value (e.g. repo=sie-web, kind=pull_request, source=agent)"}
             }), json!(["query"])),
+        },
+        {
+            "name": "synty_related",
+            "description": "Prior work related to what you're doing now, with NO query: synty derives one from the repo's recent commits and changed files, then searches every repo the fleet has seen. Call at the start of a task to find earlier attempts, decisions, and related PRs. Ids in the output feed synty_show.",
+            "inputSchema": obj(json!({
+                "repo": {"type": "string", "description": "Absolute path to the git repo you're working in (defaults to the server's working directory)"},
+                "k": {"type": "integer", "description": "Number of results (default 5)"}
+            }), json!([])),
         },
         {
             "name": "synty_topics",
@@ -243,7 +274,7 @@ mod tests {
             resp["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["synty_search", "synty_topics", "synty_recent", "synty_status", "synty_stats", "synty_tool", "synty_show"]
+            ["synty_search", "synty_related", "synty_topics", "synty_recent", "synty_status", "synty_stats", "synty_tool", "synty_show"]
         );
         assert_eq!(resp["result"]["tools"][0]["inputSchema"]["required"][0], "query");
     }

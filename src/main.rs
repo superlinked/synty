@@ -23,6 +23,7 @@ mod metrics;
 mod progress;
 mod readmodel;
 mod join;
+mod related;
 mod store;
 mod sync;
 mod tail;
@@ -162,6 +163,19 @@ enum Cmd {
         query: String,
         #[arg(long)]
         filter: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+        /// Bucket to pull the published index from when local is stale/absent
+        #[arg(long)]
+        bucket: Option<String>,
+        /// Print results as JSON (for scripts and agents)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prior work related to what you're doing right now: derives a query from
+    /// this repo's recent commits and changed files, then searches every repo
+    /// the fleet has seen. Run it at the start of a task to build on past work.
+    Related {
         #[arg(long, default_value_t = 5)]
         k: usize,
         /// Bucket to pull the published index from when local is stale/absent
@@ -400,6 +414,9 @@ fn main() -> Result<()> {
         Cmd::Index { bucket } => index::run(DOCS_PATH, &model_id(), &config::resolve_bucket(bucket))?,
         Cmd::Search { query, filter, k, bucket, json } => {
             search::run(&query, filter.as_deref(), k, &model_id(), &config::resolve_bucket(bucket), json)?
+        }
+        Cmd::Related { k, bucket, json } => {
+            related::run(k, &model_id(), &config::resolve_bucket(bucket), json)?
         }
         Cmd::Cluster { resolution, bucket } => {
             topics::run(resolution, &model_id(), &config::resolve_bucket(bucket))?

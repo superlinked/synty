@@ -239,7 +239,7 @@ fn name_grounded(name: &str, terms: &[String]) -> bool {
 
 /// Generic developer vocabulary that must not count as a cluster's term at all —
 /// a name should match on a concrete subject, not "update"/"fix"/"feature".
-const STOPWORDS: &[&str] = &[
+pub(crate) const STOPWORDS: &[&str] = &[
     "the", "and", "for", "was", "were", "with", "that", "this", "from", "into", "are", "has", "have",
     "had", "not", "added", "add", "adds", "fix", "fixes", "fixed", "update", "updates", "updated",
     "updating", "implement", "implemented", "implementing", "support", "new", "using", "use", "used",
