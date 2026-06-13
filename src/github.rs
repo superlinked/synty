@@ -274,7 +274,7 @@ fn quick_agent() -> ureq::Agent {
 }
 
 /// The authenticated login plus every org the token can see — the accounts
-/// `synty setup` offers to backfill from (personal account first, then orgs).
+/// `synty init` pins from (personal account first, then orgs).
 pub fn accounts() -> Result<Vec<String>> {
     let token = resolve_token()?;
     let data = post(&quick_agent(), &token, "query { viewer { login organizations(first:100) { nodes { login } } } }", json!({}))?;
@@ -286,6 +286,106 @@ pub fn accounts() -> Result<Vec<String>> {
         out.extend(nodes.iter().filter_map(|o| o["login"].as_str()).map(str::to_string));
     }
     Ok(out)
+}
+
+/// A release asset: its filename and the API URL that serves its bytes.
+pub struct ReleaseAsset {
+    pub name: String,
+    pub api_url: String,
+}
+
+/// A published release: the tag (e.g. `v0.2.0`) and its uploaded assets. Used by
+/// `synty upgrade` — the binary distributes through GitHub Releases, fetched
+/// with the same token synty already uses for PRs/issues.
+pub struct Release {
+    pub tag: String,
+    pub assets: Vec<ReleaseAsset>,
+}
+
+impl Release {
+    pub fn asset(&self, name: &str) -> Option<&ReleaseAsset> {
+        self.assets.iter().find(|a| a.name == name)
+    }
+    pub fn asset_names(&self) -> String {
+        self.assets.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// The repo's latest published release (REST). Ok(None) when the repo has no
+/// releases yet (404). Needs a token (private repos); callers that nag treat a
+/// token error as "don't know" and stay quiet.
+pub fn latest_release(repo: &str) -> Result<Option<Release>> {
+    let token = resolve_token()?;
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let body: Value = match quick_agent()
+        .get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("User-Agent", "synty")
+        .set("Accept", "application/vnd.github+json")
+        .call()
+    {
+        Ok(r) => r.into_json().map_err(|e| anyhow!("github: bad JSON: {e}"))?,
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(ureq::Error::Status(code, r)) => {
+            let snippet: String = r.into_string().unwrap_or_default().chars().take(200).collect();
+            bail!("github: HTTP {code}: {snippet}");
+        }
+        Err(e) => bail!("github: request failed: {e}"),
+    };
+    let tag = body["tag_name"].as_str().unwrap_or_default().to_string();
+    let assets = body["assets"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    Some(ReleaseAsset { name: x["name"].as_str()?.to_string(), api_url: x["url"].as_str()?.to_string() })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(Release { tag, assets }))
+}
+
+/// Download a release asset's bytes from its API `url`. GitHub answers with a
+/// 302 to a signed object-store URL that *rejects* an Authorization header, so
+/// we disable auto-follow and re-request the redirect target without auth.
+pub fn download_asset(api_url: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let token = resolve_token()?;
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(180))
+        .build();
+    let resp = agent
+        .get(api_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("User-Agent", "synty")
+        .set("Accept", "application/octet-stream")
+        .call();
+    let mut reader = match resp {
+        // Direct bytes (some setups don't redirect).
+        Ok(r) if r.status() == 200 => r.into_reader(),
+        // The expected case: follow the signed redirect WITHOUT the auth header.
+        Ok(r) if (300..400).contains(&r.status()) => {
+            let loc = r.header("location").ok_or_else(|| anyhow!("github: asset redirect without Location"))?.to_string();
+            quick_agent()
+                .get(&loc)
+                .set("User-Agent", "synty")
+                .call()
+                .map_err(|e| anyhow!("github: signed asset fetch failed: {e}"))?
+                .into_reader()
+        }
+        Ok(r) => bail!("github: unexpected asset status {}", r.status()),
+        Err(ureq::Error::Status(code, r)) => {
+            let snippet: String = r.into_string().unwrap_or_default().chars().take(200).collect();
+            bail!("github: HTTP {code}: {snippet}");
+        }
+        Err(e) => bail!("github: asset download failed: {e}"),
+    };
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).map_err(|e| anyhow!("github: read asset: {e}"))?;
+    Ok(buf)
 }
 
 /// Every member of `org` the token can see — the roster's "core users", so

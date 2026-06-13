@@ -262,23 +262,11 @@ enum Cmd {
         #[arg(long)]
         no_build: bool,
     },
-    /// Publish this machine's binary to the bucket as the current platform's
-    /// release artifact (bin/<version>/synty-<os>-<arch>) and update the
-    /// bin/latest.json pointer. Build the release binary, then run it to publish.
-    Publish {
-        #[arg(long)]
-        bucket: Option<String>,
-        /// Binary to upload (default: the running binary)
-        #[arg(long)]
-        binary: Option<String>,
-    },
-    /// Self-update from the bucket: if a newer build is published for this
-    /// platform, download it, verify its checksum, replace this binary, and
-    /// restart the tracker. No-op when already current.
-    Upgrade {
-        #[arg(long)]
-        bucket: Option<String>,
-    },
+    /// Self-update from the latest GitHub Release: if a newer build is published
+    /// for this platform, download it, verify its checksum, replace this binary,
+    /// and restart the tracker. No-op when already current. Releases are cut by
+    /// CI on a tag; override the source repo with $SYNTY_RELEASE_REPO.
+    Upgrade,
     /// Interactive terminal UI: status + browse/drill over topics, recent, search.
     /// Pulls the fleet's read-model at startup and freshens in the background.
     Tui {
@@ -437,8 +425,7 @@ fn main() -> Result<()> {
         Cmd::Related { k, bucket, json } => {
             related::run(k, &model_id(), &config::resolve_bucket(bucket), json)?
         }
-        Cmd::Publish { bucket, binary } => release::publish(&config::resolve_bucket(bucket), binary)?,
-        Cmd::Upgrade { bucket } => release::upgrade(&config::resolve_bucket(bucket))?,
+        Cmd::Upgrade => release::upgrade()?,
         Cmd::Cluster { resolution, bucket } => {
             topics::run(resolution, &model_id(), &config::resolve_bucket(bucket))?
         }
@@ -587,21 +574,12 @@ mod tests {
         assert!(Cli::try_parse_from(["synty", "join"]).is_err());
     }
 
-    // Binary distribution: `publish` takes an optional binary path, `upgrade`
-    // just a bucket — both default to the configured bucket when omitted.
+    // `upgrade` is argument-free: it self-updates from the latest GitHub Release.
     #[test]
-    fn publish_and_upgrade_parse() {
-        let p = Cli::try_parse_from(["synty", "publish", "--bucket", "gs://t", "--binary", "/b/synty"])
-            .expect("publish parses");
-        assert!(matches!(p.cmd, Cmd::Publish { bucket: Some(b), binary: Some(bin) } if b == "gs://t" && bin == "/b/synty"));
-        assert!(matches!(
-            Cli::try_parse_from(["synty", "publish"]).expect("bare publish").cmd,
-            Cmd::Publish { bucket: None, binary: None }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["synty", "upgrade"]).expect("bare upgrade").cmd,
-            Cmd::Upgrade { bucket: None }
-        ));
+    fn upgrade_parses_without_args() {
+        assert!(matches!(Cli::try_parse_from(["synty", "upgrade"]).expect("upgrade").cmd, Cmd::Upgrade));
+        // The bucket-publish path is gone — distribution is GitHub Releases.
+        assert!(Cli::try_parse_from(["synty", "publish"]).is_err());
     }
 
     #[test]

@@ -124,10 +124,10 @@ pub fn status() -> Result<Status> {
     by_tool.sort_by(|a, b| b.chars.cmp(&a.chars).then(b.calls.cmp(&a.calls)).then(a.name.cmp(&b.name)));
     let mut by_model: Vec<crate::units::ModelUsage> = models.into_values().collect();
     by_model.sort_by(|a, b| b.tok_out.cmp(&a.tok_out).then(a.model.cmp(&b.model)));
-    // Only an activated (bucket-configured) machine checks for a newer binary;
-    // local-trial users pay nothing. Best-effort — `available` swallows errors.
+    // A newer binary published to GitHub Releases (cached, token-gated, best-
+    // effort). Independent of the bucket — it's about synty itself, not the data.
     let bucket = crate::config::load().bucket;
-    let upgrade = bucket.as_deref().and_then(crate::release::available);
+    let upgrade = crate::release::available();
     Ok(Status {
         docs: docs.len(),
         github,

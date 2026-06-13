@@ -1,30 +1,20 @@
-// `synty publish` / `synty upgrade` — binary distribution through the same
-// bucket that already carries events and the index. The bucket is synty's only
-// shared infrastructure, so the binary lives there too: immutable, per-version,
-// per-platform artifacts under `bin/<version>/synty-<os>-<arch>` behind a
-// `bin/latest.json` pointer — the same immutable-object + atomic-pointer shape
-// the index uses. A machine pulls the one artifact built for its platform
-// (metal on Apple Silicon, plain CPU on Linux), so nobody picks a build.
+// `synty upgrade` — self-update from GitHub Releases. CI builds a per-platform
+// artifact on each tag and publishes it as a release asset
+// (`synty-<os>-<arch>` + a `.sha256` sidecar); a machine pulls the one built
+// for its platform — metal on Apple Silicon, plain CPU on Linux, each with
+// runtime fallback — so nobody picks a build. The binary fetches releases with
+// the same GitHub token synty already uses for PRs/issues, so there's no extra
+// credential and no second distribution channel.
 
-use crate::{bucket, track};
-use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use crate::track;
+use anyhow::{anyhow, bail, Result};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const MANIFEST_KEY: &str = "bin/latest.json";
+const RELEASE_REPO_DEFAULT: &str = "superlinked/synty";
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Artifact {
-    pub key: String,
-    pub sha256: String,
-    pub bytes: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct Manifest {
-    pub version: String,
-    pub artifacts: BTreeMap<String, Artifact>,
+/// Where releases are published. Overridable for forks / private mirrors.
+fn release_repo() -> String {
+    std::env::var("SYNTY_RELEASE_REPO").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| RELEASE_REPO_DEFAULT.to_string())
 }
 
 /// macos/aarch64 → "darwin-arm64", etc. None for a platform we don't ship, so
@@ -48,7 +38,7 @@ pub fn platform_key() -> Option<String> {
 }
 
 /// True when `a` is a strictly newer x.y.z than `b`. Malformed → false, so a
-/// garbage manifest never triggers a spurious "upgrade available".
+/// garbage tag never triggers a spurious "upgrade available".
 pub fn version_gt(a: &str, b: &str) -> bool {
     match (parse_semver(a), parse_semver(b)) {
         (Some(a), Some(b)) => a > b,
@@ -57,7 +47,7 @@ pub fn version_gt(a: &str, b: &str) -> bool {
 }
 
 fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
-    let mut it = v.trim().split('.');
+    let mut it = v.trim().trim_start_matches('v').split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next()?.parse().ok()?;
     // Tolerate a pre-release/build suffix on the patch ("1-rc.2" → 1).
@@ -70,89 +60,46 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Add/replace `plat`'s artifact. A new version starts a fresh set (old
-/// binaries stay in the bucket under their own dir, just not pointed-to); the
-/// same version merges, so each platform publishes independently.
-pub fn merge_artifact(mut m: Manifest, version: &str, plat: &str, art: Artifact) -> Manifest {
-    if m.version != version {
-        m = Manifest { version: version.to_string(), artifacts: BTreeMap::new() };
-    }
-    m.artifacts.insert(plat.to_string(), art);
-    m
-}
-
-fn read_manifest(b: &dyn bucket::Bucket) -> Result<Option<Manifest>> {
-    match b.get(MANIFEST_KEY)? {
-        Some(raw) => Ok(Some(serde_json::from_slice(&raw).context("parse bin/latest.json")?)),
-        None => Ok(None),
-    }
-}
-
-/// Upload this binary as the current platform's artifact for its version, then
-/// merge it into the `latest.json` pointer. Run the freshly built release binary
-/// so its version always matches the bytes it uploads.
-pub fn publish(bucket_uri: &str, binary: Option<String>) -> Result<()> {
-    let plat = platform_key().ok_or_else(|| {
-        anyhow!(
-            "{}/{} isn't a published target — build and host it yourself",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )
-    })?;
-    let path = match binary {
-        Some(p) => std::path::PathBuf::from(p),
-        None => std::env::current_exe().context("locate the running binary")?,
-    };
-    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let key = format!("bin/{VERSION}/synty-{plat}");
-
-    let b = bucket::open(bucket_uri)?;
-    b.put(&key, &bytes)?;
-    let art = Artifact { key: key.clone(), sha256: sha256_hex(&bytes), bytes: bytes.len() as u64 };
-    let updated = merge_artifact(read_manifest(&*b)?.unwrap_or_default(), VERSION, &plat, art);
-    b.put(MANIFEST_KEY, &serde_json::to_vec_pretty(&updated)?)?;
-
-    let plats: Vec<&str> = updated.artifacts.keys().map(String::as_str).collect();
-    eprintln!(
-        "publish: {key} ({} MiB) → {bucket_uri}\npublish: latest.json now v{VERSION} [{}]",
-        bytes.len() / 1024 / 1024,
-        plats.join(", ")
-    );
-    Ok(())
-}
-
-/// Self-update from the bucket: if `latest.json` names a newer version with a
-/// build for this platform, download it, verify its sha256, replace the running
-/// binary in place, and restart the tracker. No-op when already current.
-pub fn upgrade(bucket_uri: &str) -> Result<()> {
-    let b = bucket::open(bucket_uri)?;
-    let manifest = read_manifest(&*b)?
-        .ok_or_else(|| anyhow!("no published binaries in {bucket_uri} (nothing at {MANIFEST_KEY})"))?;
-    if !version_gt(&manifest.version, VERSION) {
+/// Self-update from the latest release: if it's a newer version with a build for
+/// this platform, download it, verify its sha256 against the `.sha256` sidecar,
+/// replace the running binary in place, and restart the tracker. No-op when
+/// already current; refuses on a checksum mismatch.
+pub fn upgrade() -> Result<()> {
+    let repo = release_repo();
+    let rel = crate::github::latest_release(&repo)?.ok_or_else(|| anyhow!("no releases published for {repo} yet"))?;
+    let latest = rel.tag.trim_start_matches('v');
+    if !version_gt(latest, VERSION) {
         eprintln!("upgrade: already up to date (v{VERSION})");
         return Ok(());
     }
     let plat = platform_key()
         .ok_or_else(|| anyhow!("{}/{} has no published build", std::env::consts::OS, std::env::consts::ARCH))?;
-    let art = manifest.artifacts.get(&plat).ok_or_else(|| {
-        anyhow!(
-            "no {plat} build published for v{} (have: {})",
-            manifest.version,
-            manifest.artifacts.keys().cloned().collect::<Vec<_>>().join(", ")
-        )
-    })?;
-    let bytes = b.get(&art.key)?.ok_or_else(|| anyhow!("manifest points at {}, which is missing", art.key))?;
-    let got = sha256_hex(&bytes);
-    if got != art.sha256 {
-        bail!("sha256 mismatch for {} (expected {}, got {got}) — refusing to install", art.key, art.sha256);
+    let name = format!("synty-{plat}");
+    let asset =
+        rel.asset(&name).ok_or_else(|| anyhow!("release {} has no {name} (assets: {})", rel.tag, rel.asset_names()))?;
+    let bytes = crate::github::download_asset(&asset.api_url)?;
+
+    // Integrity: verify against the .sha256 sidecar when the release carries one.
+    match rel.asset(&format!("{name}.sha256")) {
+        Some(sc) => {
+            let raw = crate::github::download_asset(&sc.api_url)?;
+            let want = String::from_utf8_lossy(&raw).split_whitespace().next().unwrap_or("").to_lowercase();
+            let got = sha256_hex(&bytes);
+            if want != got {
+                bail!("sha256 mismatch for {name} (expected {want}, got {got}) — refusing to install");
+            }
+        }
+        None => eprintln!("upgrade: no {name}.sha256 in the release — skipping checksum verification"),
     }
+
     replace_self(&bytes)?;
-    eprintln!("upgrade: v{VERSION} → v{} installed", manifest.version);
+    eprintln!("upgrade: v{VERSION} → v{latest} installed");
     match track::restart() {
         Ok(true) => eprintln!("upgrade: tracker restarted on the new binary"),
         Ok(false) => eprintln!("upgrade: open a new shell (or `synty up`) to use the new binary"),
         Err(e) => eprintln!("upgrade: installed, but tracker restart failed ({e}) — restart it yourself"),
     }
+    let _ = std::fs::remove_file(CHECK_PATH); // status should reflect the new version now
     Ok(())
 }
 
@@ -160,27 +107,51 @@ pub fn upgrade(bucket_uri: &str) -> Result<()> {
 /// rename over `current_exe()`. The live process keeps the old inode, so this
 /// call returns normally and the new file takes effect on the next launch.
 fn replace_self(bytes: &[u8]) -> Result<()> {
-    let exe = std::env::current_exe().context("locate the running binary")?;
+    let exe = std::env::current_exe().map_err(|e| anyhow!("locate the running binary: {e}"))?;
     let dir = exe.parent().ok_or_else(|| anyhow!("binary has no parent directory"))?;
     let tmp = dir.join(format!(".synty-upgrade.{}", std::process::id()));
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, bytes).map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::fs::rename(&tmp, &exe).with_context(|| format!("replace {}", exe.display()))?;
+    std::fs::rename(&tmp, &exe).map_err(|e| anyhow!("replace {}: {e}", exe.display()))?;
     Ok(())
 }
 
-/// Best-effort: the newer version published to `bucket`, or None (no access, no
-/// manifest, parse error, or we're current). Never errors — it feeds the status
-/// nag, not a gate.
-pub fn available(bucket_uri: &str) -> Option<String> {
-    let b = bucket::open(bucket_uri).ok()?;
-    let raw = b.get(MANIFEST_KEY).ok()??;
-    let m: Manifest = serde_json::from_slice(&raw).ok()?;
-    version_gt(&m.version, VERSION).then_some(m.version)
+const CHECK_TTL_SECS: u64 = 6 * 3600;
+const CHECK_PATH: &str = ".synty/upgrade_check.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Check {
+    checked: u64,
+    latest: String,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Best-effort: the newer version published to the release repo, or None (no
+/// token, no releases, or we're current). Cached for a few hours in the local
+/// store so `status`/the TUI don't query GitHub on every refresh. Never errors
+/// — it feeds the nag, not a gate.
+pub fn available() -> Option<String> {
+    if let Ok(raw) = std::fs::read_to_string(CHECK_PATH) {
+        if let Ok(c) = serde_json::from_str::<Check>(&raw) {
+            if now_unix().saturating_sub(c.checked) < CHECK_TTL_SECS {
+                return version_gt(&c.latest, VERSION).then_some(c.latest);
+            }
+        }
+    }
+    let rel = crate::github::latest_release(&release_repo()).ok()??;
+    let latest = rel.tag.trim_start_matches('v').to_string();
+    let _ = std::fs::create_dir_all(".synty");
+    if let Ok(raw) = serde_json::to_string(&Check { checked: now_unix(), latest: latest.clone() }) {
+        let _ = std::fs::write(CHECK_PATH, raw);
+    }
+    version_gt(&latest, VERSION).then_some(latest)
 }
 
 #[cfg(test)]
@@ -196,40 +167,14 @@ mod tests {
     }
 
     #[test]
-    fn version_gt_compares_semver_and_ignores_garbage() {
+    fn version_gt_compares_semver_handles_v_prefix_and_garbage() {
         assert!(version_gt("0.2.0", "0.1.0"));
         assert!(version_gt("0.1.10", "0.1.9"), "numeric, not lexical");
-        assert!(version_gt("1.0.0", "0.9.9"));
+        assert!(version_gt("v0.2.0", "0.1.0"), "tolerates a leading v from a tag");
         assert!(!version_gt("0.1.0", "0.1.0"), "equal is not newer");
         assert!(!version_gt("0.1.0", "0.2.0"));
         assert!(!version_gt("garbage", "0.1.0"), "malformed never nags");
         assert!(!version_gt("0.1.0", ""));
-    }
-
-    #[test]
-    fn merge_keeps_platforms_within_a_version_and_resets_across() {
-        let art = |k: &str| Artifact { key: k.into(), sha256: "x".into(), bytes: 1 };
-        let m = merge_artifact(Manifest::default(), "0.1.0", "darwin-arm64", art("a"));
-        let m = merge_artifact(m, "0.1.0", "linux-x64", art("b"));
-        assert_eq!(m.version, "0.1.0");
-        assert_eq!(m.artifacts.len(), 2, "same version accumulates platforms");
-        // A new version starts fresh — stale platforms don't linger in the pointer.
-        let m = merge_artifact(m, "0.2.0", "darwin-arm64", art("c"));
-        assert_eq!(m.version, "0.2.0");
-        assert_eq!(m.artifacts.len(), 1);
-        assert_eq!(m.artifacts["darwin-arm64"].key, "c");
-    }
-
-    #[test]
-    fn manifest_round_trips_through_json() {
-        let m = merge_artifact(
-            Manifest::default(),
-            "0.1.0",
-            "darwin-arm64",
-            Artifact { key: "bin/0.1.0/synty-darwin-arm64".into(), sha256: "abc".into(), bytes: 42 },
-        );
-        let raw = serde_json::to_vec(&m).unwrap();
-        assert_eq!(serde_json::from_slice::<Manifest>(&raw).unwrap(), m);
     }
 
     #[test]

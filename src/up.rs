@@ -21,7 +21,7 @@ pub fn run(bucket: &str, machine: &str, poll_secs: u64, github: bool) -> Result<
 
     // One-time upgrade nag (the TUI footer and `synty status` catch later
     // releases live); best-effort, never blocks the loop.
-    if let Some(v) = crate::release::available(bucket) {
+    if let Some(v) = crate::release::available() {
         eprintln!("up: synty {v} available — run `synty upgrade`");
     }
 
