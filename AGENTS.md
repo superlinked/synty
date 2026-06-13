@@ -45,7 +45,7 @@ Operations that produce health or quality numbers emit them the same way, never
 ad hoc: build a `metrics::Run`, record named fields, `emit()` a `[metrics <op>]`
 block to stderr. `cluster` logs modularity, misplaced %, grab-bag and collapsed-duplicate
 counts, cluster-size min/median/max, and the session/doc mix; `summarize` logs
-unit coverage, topics named, duplicate names, keyword-fallback names, name
+unit coverage, topics named, duplicate names, fallback names, name
 faithfulness, and throughput; a `stats` block reports session token-usage
 capture coverage; `ingest` also emits a `coverage` block (fleet machines,
 actor↔GitHub join, install rate). Redirect stderr (`2>> runs.log`) if you

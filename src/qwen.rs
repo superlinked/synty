@@ -471,6 +471,9 @@ struct Job {
     short: bool,
     gate: Option<Vec<String>>,
     ban: Vec<String>,
+    /// For a name job, the topic summary it titles — the fallback when the
+    /// model's own title is rejected (its lead clause beats keyword tokens).
+    summary: Option<String>,
 }
 
 /// Salt for the topic reduce / name prompts; bump to regenerate them only.
@@ -483,7 +486,7 @@ struct Job {
 /// s5: centrality-ordered examples + the embedding-faithfulness gate; isolates
 /// these names from machines still generating ungated s4 ones.
 const TOPIC_PROMPT_VERSION: &str = "t8";
-const TOPIC_NAME_VERSION: &str = "s5";
+const TOPIC_NAME_VERSION: &str = "s8";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -491,10 +494,10 @@ fn unit_jobs() -> Result<Vec<Job>> {
     let docs = units::doc_inputs()?;
     let mut jobs = Vec::with_capacity(sessions.len() + docs.len());
     for s in &sessions {
-        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id), short: false, gate: None, ban: Vec::new() });
+        jobs.push(Job { key: s.id.clone(), hash: input_hash(s), prompt: prompt_for(s), label: crate::short(&s.id), short: false, gate: None, ban: Vec::new(), summary: None });
     }
     for d in &docs {
-        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone(), short: false, gate: None, ban: Vec::new() });
+        jobs.push(Job { key: d.key.clone(), hash: doc_hash(d), prompt: prompt_for_doc(d), label: d.key.clone(), short: false, gate: None, ban: Vec::new(), summary: None });
     }
     Ok(jobs)
 }
@@ -556,12 +559,14 @@ fn topic_jobs() -> Result<Vec<Job>> {
             short: false,
             gate: None,
             ban: Vec::new(),
+            summary: None,
         });
         // The name titles the topic summary, so it depends on it. The summary job
         // above runs first in the same pass; for a topic whose summary isn't
         // cached yet the name regenerates next run, once the summary exists. The
         // gate carries the cluster's distinctive terms and `ban` its repo slugs,
-        // so an off-theme or repo-echo name falls back to the keyword label.
+        // so an off-theme or repo-echo name falls back — to the summary's lead
+        // clause, kept on the job, or the keyword label as a last resort.
         if let Some(sum) = &t.summary {
             let terms = cluster_terms(members, 12, &idf);
             let examples = pick_examples(members);
@@ -573,6 +578,7 @@ fn topic_jobs() -> Result<Vec<Job>> {
                 short: true,
                 gate: Some(terms),
                 ban: repo_ban(&t.repos),
+                summary: Some(sum.clone()),
             });
         }
     }
@@ -697,12 +703,13 @@ fn embed_gate_names(tjobs: &[Job], cache: &mut units::SummaryCache, bucket: &str
     let store = crate::store::EmbStore::open(bucket, &model)?;
     let member_hashes = units::topic_member_embed_hashes()?;
 
-    // Candidates: cached LLM-authored names. Keyword fallbacks are extractive
-    // — grounded by construction — and skipped.
+    // Candidates: cached LLM-authored names. Fallback names (summary lead
+    // clause or keyword label) are extractive — grounded by construction — and
+    // skipped.
     let mut cand: Vec<(&Job, String)> = Vec::new();
     for j in tjobs.iter().filter(|j| j.short) {
         let Some(c) = cache.get(&j.key) else { continue };
-        if c.summary.is_empty() || c.summary == keyword_label(j.gate.as_deref().unwrap_or_default(), &j.ban) {
+        if c.summary.is_empty() || c.summary == fallback_name(j) {
             continue;
         }
         cand.push((j, c.summary.clone()));
@@ -758,7 +765,7 @@ fn embed_gate_names(tjobs: &[Job], cache: &mut units::SummaryCache, bucket: &str
     let rejects = embed_rejects(&scores);
     for &i in &rejects {
         let (j, name) = &cand[i];
-        let fallback = keyword_label(j.gate.as_deref().unwrap_or_default(), &j.ban);
+        let fallback = fallback_name(j);
         let score = scores.iter().find(|(x, _)| *x == i).map(|(_, s)| *s).unwrap_or(0.0);
         eprintln!("  name gate: “{name}” unfaithful to its members ({score:.2}) → “{fallback}”");
         if let Some(c) = cache.get_mut(&j.key) {
@@ -768,10 +775,50 @@ fn embed_gate_names(tjobs: &[Job], cache: &mut units::SummaryCache, bucket: &str
     Ok((scores.len(), rejects.len()))
 }
 
+/// A short heading distilled from a topic's one-line summary: the lead clause,
+/// title-cased. The fallback for a rejected name — the 0.6B writes a coherent
+/// summary even when its compressed-to-a-title attempt drifts or echoes a slug,
+/// so "Updating Terraform Configurations" beats the keyword soup
+/// "Terraform · SIE · Update". Empty when the summary is too thin to title;
+/// the caller then drops to the keyword label.
+fn summary_heading(summary: &str) -> String {
+    let clause = summary.trim().split(|c| matches!(c, ',' | ';' | ':' | '.')).next().unwrap_or("").trim();
+    let mut words: Vec<&str> = clause.split_whitespace().take(8).collect();
+    // Capping mid-clause can leave a dangling function word ("…Tracking
+    // Through", "…Exhaustion By"); trim any trailing preposition/conjunction/
+    // copula so the heading ends on a content word. (Content-word truncations
+    // like "…a Self-Contained" can't be detected here — that's the cap's edge.)
+    const TRAIL: &[&str] = &[
+        "and", "or", "the", "a", "an", "to", "of", "for", "with", "in", "on", "at", "by", "via",
+        "from", "into", "through", "then", "that", "which", "was", "were", "is", "are", "as", "using",
+    ];
+    while words.last().map(|w| TRAIL.contains(&w.to_lowercase().as_str())).unwrap_or(false) {
+        words.pop();
+    }
+    if words.len() < 2 {
+        return String::new();
+    }
+    title_case(&words.join(" "))
+}
+
+/// The name a topic falls back to when its generated title is rejected: the
+/// summary's lead clause if there is a usable summary, else the extractive
+/// keyword label. Shared by `finish` and the embedding gate so the rejection
+/// path is identical wherever it fires.
+fn fallback_name(j: &Job) -> String {
+    if let Some(sum) = &j.summary {
+        let h = summary_heading(sum);
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    keyword_label(j.gate.as_deref().unwrap_or_default(), &j.ban)
+}
+
 /// Clean a raw generation per the job type and apply the faithfulness gates: a
 /// topic name must be well-formed, share a distinctive term with its cluster,
-/// and not be a bare repo slug — otherwise it falls back to the extractive
-/// keyword label (empty only when the cluster has no terms at all).
+/// and not be a bare repo slug — otherwise it falls back (to the summary's lead
+/// clause, else the keyword label).
 fn finish(j: &Job, raw: &str) -> String {
     if !j.short {
         return clean(raw);
@@ -783,7 +830,7 @@ fn finish(j: &Job, raw: &str) -> String {
     if ok {
         name
     } else {
-        keyword_label(j.gate.as_deref().unwrap_or_default(), &j.ban)
+        fallback_name(j)
     }
 }
 
@@ -966,7 +1013,7 @@ mod tests {
     }
 
     // A name that fails the gate or cleans to nothing yields the extractive
-    // keyword title — never an empty name (which would surface a sentence).
+    // keyword title when there's no usable summary — never an empty name.
     #[test]
     fn finish_falls_back_to_keywords() {
         let j = Job {
@@ -977,10 +1024,50 @@ mod tests {
             short: true,
             gate: Some(vec!["voyage".into(), "reranker".into(), "cohere".into(), "benchmark".into()]),
             ban: vec!["sieinternal".into()],
+            summary: None,
         };
         assert_eq!(finish(&j, "Colpali Visual Retrieval"), "Voyage · Reranker · Cohere"); // off-theme
         assert_eq!(finish(&j, "Sharing models, cutting costs."), "Voyage · Reranker · Cohere"); // not a title
         assert_eq!(finish(&j, "Voyage Reranker Benchmarks"), "Voyage Reranker Benchmarks"); // grounded → kept
+    }
+
+    // When a summary is on the job, a rejected name falls back to the summary's
+    // lead clause (a real phrase) rather than the keyword soup — the soup is
+    // the last resort, only when the summary is too thin to title.
+    #[test]
+    fn finish_prefers_summary_lead_clause_over_keyword_soup() {
+        let with_summary = |sum: &str| Job {
+            key: "topicname:x".into(),
+            hash: String::new(),
+            prompt: String::new(),
+            label: String::new(),
+            short: true,
+            gate: Some(vec!["voyage".into(), "reranker".into()]),
+            ban: vec![],
+            summary: Some(sum.into()),
+        };
+        // Off-theme name rejected → the summary's first clause, title-cased.
+        let j = with_summary("Migrating the gateway to NATS, then wiring telemetry.");
+        assert_eq!(finish(&j, "Colpali Visual Retrieval"), "Migrating the Gateway to NATS");
+        // A one-word summary is too thin to title → keyword soup is the last resort.
+        let thin = with_summary("Cleanup.");
+        assert_eq!(finish(&thin, "Colpali Visual Retrieval"), "Voyage · Reranker");
+    }
+
+    // The summary heading takes the lead clause, caps the length, and drops a
+    // dangling conjunction so it reads as a phrase.
+    #[test]
+    fn summary_heading_distills_a_lead_clause() {
+        assert_eq!(
+            summary_heading("Updating Terraform configurations, migrating infrastructure to SIE."),
+            "Updating Terraform Configurations"
+        );
+        // Caps at 8 words and won't end on a dangling "and"/"to".
+        assert_eq!(
+            summary_heading("Refactoring the adapter registry to support pluggable backends and more"),
+            "Refactoring the Adapter Registry to Support Pluggable Backends"
+        );
+        assert_eq!(summary_heading("Misc."), "", "too thin to title");
     }
 
     // The repo is already a facet on every surface — a "name" that is just the
@@ -997,6 +1084,7 @@ mod tests {
             short: true,
             gate: Some(vec!["sie".into(), "pool".into(), "warmup".into()]),
             ban: repo_ban(&["sie-internal".into()]),
+            summary: None,
         };
         // Grounded (shares "sie") but still just the repo / a repo fragment.
         assert_eq!(finish(&j, "Sie-Internal"), "Pool · Warmup");
@@ -1217,19 +1305,22 @@ pub fn summarize_all(bucket: &str) -> Result<()> {
     let named = cache.iter().filter(|(k, v)| k.starts_with("topicname:") && !v.summary.is_empty()).count();
     let topics = cache.keys().filter(|k| k.starts_with("topic:")).count();
     // Name quality: topics sharing an identical name (a name's one job is to
-    // tell topics apart), and names equal to their keyword fallback — i.e. how
-    // often the LLM's title was rejected (exact right after a regen pass).
+    // tell topics apart), how often the LLM's title was rejected for a fallback
+    // (exact right after a regen pass), and how many of those dropped all the
+    // way to the keyword label rather than the summary's lead clause.
     let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut kw_fallback = 0usize;
+    let mut fallback = 0usize;
+    let mut kw_last_resort = 0usize;
     for j in tjobs.iter().filter(|j| j.short) {
         let Some(c) = cache.get(&j.key) else { continue };
         if c.summary.is_empty() {
             continue;
         }
         *name_counts.entry(c.summary.as_str()).or_default() += 1;
-        if let Some(terms) = &j.gate {
-            if c.summary == keyword_label(terms, &j.ban) {
-                kw_fallback += 1;
+        if c.summary == fallback_name(j) {
+            fallback += 1;
+            if c.summary == keyword_label(j.gate.as_deref().unwrap_or_default(), &j.ban) {
+                kw_last_resort += 1;
             }
         }
     }
@@ -1240,7 +1331,8 @@ pub fn summarize_all(bucket: &str) -> Result<()> {
         .set("topics", topics)
         .set("topics_named", named)
         .set("name_dupes", name_dupes)
-        .set("names_kw_fallback", kw_fallback)
+        .set("names_fallback", fallback)
+        .set("names_kw_last_resort", kw_last_resort)
         .set("names_scored", scored)
         .set("name_faithful_pct", if scored > 0 { 100.0 * (scored - rejected) as f64 / scored as f64 } else { 100.0 })
         .set("regenerated", n)
