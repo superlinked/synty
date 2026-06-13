@@ -74,9 +74,11 @@ cargo run --release -- stats            # usage: tokens/tools/sessions vs LOC/PR
 cargo run --release -- tool Bash        # one tool's profile: volume, latency, argument mix
 ```
 
-Every read command takes `--json` for scripts; the output is one versioned
-envelope, `{"v": 1, "kind": "…", "data": …}` — check `v` once, dispatch on
-`kind`. For
+Output is built to be drilled: `search`, `recent`, and `topic` print stable
+ids inline (`[a1b2c3d4]` for sessions, `repo#123` for PRs/issues, `[72a778f8]`
+for topics) that feed `synty show <id>`. Every read command takes `--json`
+for scripts; the output is one versioned envelope,
+`{"v": 1, "kind": "…", "data": …}` — check `v` once, dispatch on `kind`. For
 coding agents there's an MCP server — add it to the agent's MCP config and it
 gets `synty_search` / `synty_topics` / `synty_recent` / `synty_status` as tools:
 

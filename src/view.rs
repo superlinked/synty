@@ -449,9 +449,19 @@ pub fn work_md(units: &[Unit]) -> String {
         };
         let st = if matches!(u.kind, Kind::Session) { format!(" {}", meter(u.struggle)) } else { String::new() };
         let what = u.summary.as_deref().unwrap_or(&u.title);
-        o.push_str(&format!("- `{}` {:<7} _{}_ — {} · {}{}\n", u.when, tag, u.repo, what, u.outcome, st));
+        o.push_str(&format!("- `{}` {:<7}{} _{}_ — {} · {}{}\n", u.when, tag, unit_id_tag(u), u.repo, what, u.outcome, st));
     }
     o
+}
+
+/// The inline id a session row carries (` [a1b2c3d4]`) so a follow-up
+/// `synty show <id>` needs nothing but this output. GitHub rows already lead
+/// their title with `repo#N`, which `show` accepts directly.
+fn unit_id_tag(u: &Unit) -> String {
+    match (&u.kind, &u.session_id) {
+        (Kind::Session, Some(s)) if !s.is_empty() => format!(" [{}]", crate::short(s)),
+        _ => String::new(),
+    }
 }
 
 /// Topics with activity, type mix, and their member units.
@@ -462,8 +472,8 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
         let n = t.activity.len();
         let wk = |i: usize| n.checked_sub(i).and_then(|x| t.activity.get(x)).copied().unwrap_or(0);
         o.push_str(&format!(
-            "## {} — {}\n{} units · last active {} · activity this/last/prior wk: {}/{}/{} · {sess} sessions / {prs} PRs / {issues} issues\n",
-            t.id,
+            "## [{}] {}\n{} units · last active {} · activity this/last/prior wk: {}/{}/{} · {sess} sessions / {prs} PRs / {issues} issues\n",
+            crate::short(&t.cache_key),
             t.title(),
             t.units.len(),
             t.last_active,
@@ -486,7 +496,7 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
                 Kind::Pr => "pr",
                 Kind::Issue => "issue",
             };
-            o.push_str(&format!("- `{}` {tag}: {}\n", u.when, u.title));
+            o.push_str(&format!("- `{}` {tag}{}: {}\n", u.when, unit_id_tag(u), u.title));
         }
         o.push('\n');
     }
@@ -1005,6 +1015,67 @@ mod tests {
         assert_eq!(tool_suggestions("bash", &names), ["Bash"], "case-insensitive exact match");
         assert_eq!(tool_suggestions("re", &names), ["Read"], "prefix match");
         assert!(tool_suggestions("zzz", &names).is_empty());
+    }
+
+    // Session rows print their stable id inline, so an agent reading the
+    // Markdown can `synty show <id>` without re-querying in JSON.
+    #[test]
+    fn work_md_inlines_session_ids() {
+        let unit = Unit {
+            kind: Kind::Session,
+            when: "2026-06-01".into(),
+            repo: "sie".into(),
+            title: "fix login".into(),
+            outcome: "done".into(),
+            summary: None,
+            topic: None,
+            rank: 0,
+            dup: false,
+            struggle: 0.0,
+            author: "alice".into(),
+            doc_id: None,
+            session_id: Some("a1b2c3d4-9999-4242-8888-777766665555".into()),
+        };
+        let md = work_md(&[unit]);
+        assert!(md.contains("session [a1b2c3d4]"), "{md}");
+    }
+
+    // Topic headers lead with the stable content-addressed key — the
+    // positional index is display-only and lies across re-clusters.
+    #[test]
+    fn topics_md_leads_with_the_stable_key() {
+        let t = crate::units::TopicUnits {
+            id: 3,
+            cache_key: "72a778f8aabbccdd".into(),
+            label: "auth work".into(),
+            units: vec![Unit {
+                kind: Kind::Session,
+                when: "2026-06-01".into(),
+                repo: "sie".into(),
+                title: "fix login".into(),
+                outcome: "done".into(),
+                summary: None,
+                topic: Some(3),
+                rank: 0,
+                dup: false,
+                struggle: 0.0,
+                author: "alice".into(),
+                doc_id: None,
+                session_id: Some("a1b2c3d4-9999-4242-8888-777766665555".into()),
+            }],
+            last_active: "2026-06-01".into(),
+            activity: vec![1],
+            mix: (1, 0, 0),
+            repos: vec!["sie".into()],
+            authors: vec!["alice".into()],
+            summary: None,
+            name: None,
+            span: None,
+        };
+        let md = topics_md(&[t]);
+        assert!(md.contains("## [72a778f8] auth work"), "{md}");
+        assert!(!md.contains("## 3 —"), "the positional id is gone from MD: {md}");
+        assert!(md.contains("session [a1b2c3d4]:"), "member rows carry ids too: {md}");
     }
 
     // Every --json output arrives in the same versioned envelope, so a script
