@@ -179,7 +179,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "synty_status",
-            "description": "Health: doc counts, repos, accounts, index freshness, and the fleet roster (machines, liveness, install rate, who runs agents untracked).",
+            "description": "Health: doc counts, repos, accounts, index freshness, and the fleet roster (machines, liveness, install rate, and who's active on GitHub but not tracked).",
             "inputSchema": obj(json!({}), json!([])),
         },
         {

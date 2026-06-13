@@ -135,7 +135,7 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
         .set("actors_tracked", r.actors_tracked.len())
         .set("gh_active_authors", r.gh_active)
         .set("untracked", r.untracked.len())
-        .set("untracked_attributed", r.untracked_attributed.len())
+        .set("untracked_attributed", r.untracked_attributed())
         .set("install_rate_pct", r.install_rate_pct)
         .set("window_days", crate::fleet::GH_WINDOW_DAYS)
         .set("quiet_days", r.quiet_days);

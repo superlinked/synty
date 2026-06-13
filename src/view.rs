@@ -639,11 +639,18 @@ fn fleet_md(f: &crate::fleet::Roster) -> String {
             if m.quiet { "  QUIET" } else { "" },
         ));
     }
-    if !f.untracked_attributed.is_empty() {
-        o.push_str(&format!(
-            "  runs agents, untracked: {}\n",
-            f.untracked_attributed.iter().map(|(a, l)| format!("{a} ({l})")).collect::<Vec<_>>().join(", "),
-        ));
+    if !f.untracked.is_empty() {
+        let names: Vec<String> = f
+            .untracked
+            .iter()
+            .map(|u| match &u.agent {
+                Some(a) => format!("{} ({a})", u.login),
+                None => u.login.clone(),
+            })
+            .collect();
+        // Everyone active and uncovered, attributed marked — agent use is
+        // wider than the artifacts, so don't gate the list on them.
+        o.push_str(&format!("  active on GitHub, not tracked ({}): {}\n", names.len(), names.join(", ")));
     }
     o
 }
@@ -911,8 +918,10 @@ pub fn status_json(s: &Status) -> String {
             })).collect::<Vec<_>>(),
             "actors_tracked": s.fleet.actors_tracked,
             "gh_active": s.fleet.gh_active,
-            "untracked": s.fleet.untracked,
-            "untracked_attributed": s.fleet.untracked_attributed,
+            "untracked": s.fleet.untracked.iter().map(|u| serde_json::json!({
+                "login": u.login, "agent": u.agent,
+            })).collect::<Vec<_>>(),
+            "untracked_attributed": s.fleet.untracked_attributed(),
             "install_rate_pct": s.fleet.install_rate_pct,
             "quiet_days": s.fleet.quiet_days,
         },
@@ -1132,17 +1141,21 @@ mod tests {
                 },
             ],
             actors_tracked: vec!["svonava".into()],
-            gh_active: 2,
-            untracked: vec!["bob".into()],
-            untracked_attributed: vec![("bob".into(), "claude".into())],
-            install_rate_pct: 50,
+            gh_active: 3,
+            untracked: vec![
+                crate::fleet::UntrackedAuthor { login: "bob".into(), agent: Some("claude".into()) },
+                crate::fleet::UntrackedAuthor { login: "carol".into(), agent: None },
+            ],
+            install_rate_pct: 33,
             quiet_days: 7,
         };
         let md = fleet_md(&roster);
-        assert!(md.contains("install rate 50%"), "{md}");
+        assert!(md.contains("install rate 33%"), "{md}");
         assert!(md.contains("mac-3939") && md.contains("claude+codex") && md.contains("v0.1.0"), "{md}");
         assert!(md.contains("ci-runner-7") && md.contains("QUIET"), "{md}");
-        assert!(md.contains("runs agents, untracked: bob (claude)"), "{md}");
+        // Everyone uncovered is listed — carol too, though she left no
+        // artifact — with bob's agent marked.
+        assert!(md.contains("active on GitHub, not tracked (2): bob (claude), carol"), "{md}");
         assert!(fleet_md(&Default::default()).is_empty(), "no streams yet → no section");
     }
 

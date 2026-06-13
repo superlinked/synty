@@ -92,6 +92,16 @@ pub struct Machine {
     pub quiet: bool,
 }
 
+/// A human active on GitHub in the window whose machine no tracker covers.
+/// `agent` carries the agent label when their work named one (a Co-authored-by
+/// trailer, etc.) — a bonus signal, not the reason they're listed: most agent
+/// users leave no such artifact, so the roster lists everyone uncovered.
+#[derive(Default, Clone)]
+pub struct UntrackedAuthor {
+    pub login: String,
+    pub agent: Option<String>,
+}
+
 /// The fleet as the bucket sees it, joined against GitHub activity.
 #[derive(Default, Clone)]
 pub struct Roster {
@@ -99,13 +109,11 @@ pub struct Roster {
     pub machines: Vec<Machine>,
     /// Distinct actors on machines active within the GH window.
     pub actors_tracked: Vec<String>,
-    /// Distinct GitHub authors active within the window.
+    /// Distinct human GitHub authors active within the window (bots excluded).
     pub gh_active: usize,
-    /// GitHub-active authors (lowercased) with no tracked actor.
-    pub untracked: Vec<String>,
-    /// Untracked authors whose work names an agent — definitely running
-    /// agents, definitely unwatched. (login, agent label).
-    pub untracked_attributed: Vec<(String, String)>,
+    /// Active human authors with no tracker, agent-attributed first. The
+    /// coverage gap a team lead acts on, not just the few who left artifacts.
+    pub untracked: Vec<UntrackedAuthor>,
     /// tracked ∩ gh-active / gh-active, 0 when there is no GitHub activity.
     pub install_rate_pct: u32,
     /// The quiet threshold the fold used (config, default QUIET_DAYS_DEFAULT).
@@ -116,6 +124,25 @@ impl Roster {
     pub fn active(&self) -> usize {
         self.machines.iter().filter(|m| !m.quiet).count()
     }
+    /// How many uncovered authors left agent-attribution artifacts — the
+    /// high-precision subset, surfaced as a count for the metrics block.
+    pub fn untracked_attributed(&self) -> usize {
+        self.untracked.iter().filter(|u| u.agent.is_some()).count()
+    }
+}
+
+/// GitHub automation accounts — CI/release bots and the agent bot accounts
+/// themselves — excluded from the human coverage roster and the install-rate
+/// denominator. Heuristic on the login (the cheap signal we already store);
+/// the clean fix is the GraphQL `__typename` (User vs Bot), a scraper change.
+fn is_bot(login: &str) -> bool {
+    let l = login.trim().to_lowercase();
+    let core = l.strip_suffix("[bot]").unwrap_or(&l);
+    let core = core.strip_prefix("app/").unwrap_or(core);
+    BOT_AUTHORS.iter().any(|(b, _)| *b == core)
+        || l.ends_with("[bot]")
+        || l.contains("bot")
+        || matches!(core, "github-actions" | "renovate" | "octo-patch")
 }
 
 /// Per-stream accumulator; streams of one machine merge in `finish`.
@@ -229,35 +256,38 @@ impl Acc {
             .collect();
         let tracked_lower: BTreeSet<String> = actors_tracked.iter().map(|a| a.to_lowercase()).collect();
 
-        // GitHub side of the join: distinct windowed authors, each carrying
-        // the first agent attribution seen on their work (if any).
+        // GitHub side of the join: distinct human authors active in the
+        // window (bots excluded), each carrying the first agent attribution
+        // seen on their work (if any).
         let mut gh: BTreeMap<String, Option<String>> = BTreeMap::new();
         for d in docs {
             if d.meta.source != "github" || d.meta.author.is_empty() || d.meta.ts.as_str() < win_cutoff.as_str() {
                 continue;
             }
-            let e = gh.entry(d.meta.author.to_lowercase()).or_default();
+            let login = d.meta.author.to_lowercase();
+            if is_bot(&login) {
+                continue;
+            }
+            let e = gh.entry(login).or_default();
             if e.is_none() {
                 *e = d.meta.agent_attr.clone();
             }
         }
         let gh_active = gh.len();
         let on_both = gh.keys().filter(|a| tracked_lower.contains(*a)).count();
-        let untracked: Vec<String> =
-            gh.keys().filter(|a| !tracked_lower.contains(*a)).cloned().collect();
-        let untracked_attributed: Vec<(String, String)> = gh
-            .iter()
-            .filter_map(|(a, attr)| match (tracked_lower.contains(a), attr) {
-                (false, Some(l)) => Some((a.clone(), l.clone())),
-                _ => None,
-            })
+        // Everyone active and uncovered — not just those who left an artifact.
+        // Agent-attributed first (the strongest signal), then alphabetical.
+        let mut untracked: Vec<UntrackedAuthor> = gh
+            .into_iter()
+            .filter(|(a, _)| !tracked_lower.contains(a))
+            .map(|(login, agent)| UntrackedAuthor { login, agent })
             .collect();
+        untracked.sort_by(|a, b| b.agent.is_some().cmp(&a.agent.is_some()).then(a.login.cmp(&b.login)));
         Roster {
             machines,
             actors_tracked: actors_tracked.into_iter().collect(),
             gh_active,
             untracked,
-            untracked_attributed,
             install_rate_pct: if gh_active == 0 { 0 } else { (100 * on_both / gh_active) as u32 },
             quiet_days,
         }
@@ -418,7 +448,7 @@ mod tests {
     }
 
     // Alice's machine streams; bob only shows up on GitHub: install rate 50%,
-    // bob on the untracked list.
+    // bob on the untracked list whether or not he ever named an agent.
     #[test]
     fn actor_join_yields_install_rate_and_untracked() {
         let mut acc = Acc::new(now_ms());
@@ -431,22 +461,43 @@ mod tests {
         assert_eq!(r.actors_tracked, ["Alice"]);
         assert_eq!(r.gh_active, 2);
         assert_eq!(r.install_rate_pct, 50, "the join is case-insensitive");
-        assert_eq!(r.untracked, ["bob"]);
+        let logins: Vec<&str> = r.untracked.iter().map(|u| u.login.as_str()).collect();
+        assert_eq!(logins, ["bob"], "bob is listed though he left no agent artifact");
+        assert_eq!(r.untracked[0].agent, None);
     }
 
-    // Bob's PR credits claude and no tracker has ever seen bob — the exact
-    // "runs agents, untracked" case the roster exists to name. Carol is just
-    // untracked, not attributed.
+    // Every uncovered author is listed; the one who credited an agent sorts
+    // first and carries the label — a marker, not the membership test.
     #[test]
-    fn untracked_author_with_agent_attribution_is_flagged() {
+    fn untracked_lists_everyone_attributed_first() {
         let acc = Acc::new(now_ms());
         let docs = vec![
-            gh_doc("bob", "2026-06-11T00:00:00Z", Some("claude")),
             gh_doc("carol", "2026-06-11T00:00:00Z", None),
+            gh_doc("bob", "2026-06-11T00:00:00Z", Some("claude")),
         ];
         let r = acc.finish(&docs, 7);
-        assert_eq!(r.untracked_attributed, [("bob".to_string(), "claude".to_string())]);
-        assert_eq!(r.untracked, ["bob", "carol"]);
+        let listed: Vec<(&str, Option<&str>)> =
+            r.untracked.iter().map(|u| (u.login.as_str(), u.agent.as_deref())).collect();
+        assert_eq!(listed, [("bob", Some("claude")), ("carol", None)], "attributed first, then alphabetical");
+        assert_eq!(r.untracked_attributed(), 1);
+    }
+
+    // CI/release/agent bot accounts are not humans to chase — they drop out
+    // of both the active count and the uncovered list.
+    #[test]
+    fn bots_are_excluded_from_active_authors_and_roster() {
+        let acc = Acc::new(now_ms());
+        let docs = vec![
+            gh_doc("alice", "2026-06-11T00:00:00Z", None),
+            gh_doc("dependabot", "2026-06-11T00:00:00Z", None),
+            gh_doc("sie-web-sync-bot", "2026-06-11T00:00:00Z", None),
+            gh_doc("github-actions", "2026-06-11T00:00:00Z", None),
+            gh_doc("devin-ai-integration[bot]", "2026-06-11T00:00:00Z", Some("devin")),
+        ];
+        let r = acc.finish(&docs, 7);
+        assert_eq!(r.gh_active, 1, "only the human counts");
+        let logins: Vec<&str> = r.untracked.iter().map(|u| u.login.as_str()).collect();
+        assert_eq!(logins, ["alice"]);
     }
 
     // An author whose last activity predates the window is not "active" —

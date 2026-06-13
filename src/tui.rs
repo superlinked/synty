@@ -1268,21 +1268,29 @@ impl App {
             );
             return;
         }
-        // The untracked line eats the table's last rows when present — it is
-        // the actionable part, never clipped.
+        // The uncovered line is the actionable part: everyone active on
+        // GitHub whose machine no tracker covers (attributed marked). It gets
+        // its own wrapped band below the roster so the full list shows.
         let inner = block.inner(fleet);
         f.render_widget(block, fleet);
-        let untracked_h = u16::from(!r.untracked_attributed.is_empty());
+        let untracked_h = if r.untracked.is_empty() { 0 } else { 3 };
         let [tbl, note] = Layout::vertical([Constraint::Min(0), Constraint::Length(untracked_h)]).areas(inner);
         let mut ts = TableState::default();
         ts.select(Some(self.sel.min(r.machines.len() - 1)));
         f.render_stateful_widget(fleet_table(r), tbl, &mut ts);
         if untracked_h > 0 {
-            let names: Vec<String> =
-                r.untracked_attributed.iter().map(|(a, l)| format!("{a} ({l})")).collect();
+            let names: Vec<String> = r
+                .untracked
+                .iter()
+                .map(|u| match &u.agent {
+                    Some(a) => format!("{} ({a})", u.login),
+                    None => u.login.clone(),
+                })
+                .collect();
             f.render_widget(
-                Line::from(format!(" runs agents, untracked: {}", names.join(", ")))
-                    .fg(theme::CLOSED),
+                Paragraph::new(format!("active on GitHub, not tracked ({}): {}", names.len(), names.join(", ")))
+                    .style(Style::new().fg(theme::CLOSED))
+                    .wrap(Wrap { trim: true }),
                 note,
             );
         }
@@ -1973,7 +1981,7 @@ mod tests {
             sessions: vec![session],
             work,
             topics,
-            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1, chars: 81_200 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0, chars: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false, fleet: crate::fleet::Roster { machines: vec![crate::fleet::Machine { machine: "mac-3939".into(), sources: vec!["claude".into(), "codex".into()], actors: vec!["svonava".into()], last_ts: "2026-05-31T09:00:00Z".into(), version: "0.1.0".into(), events: 41, quiet: false }, crate::fleet::Machine { machine: "ci-runner-7".into(), sources: vec!["claude".into()], actors: vec![], last_ts: "2026-05-12T09:00:00Z".into(), version: String::new(), events: 0, quiet: true }], actors_tracked: vec!["svonava".into()], gh_active: 2, untracked: vec!["bob".into()], untracked_attributed: vec![("bob".into(), "claude".into())], install_rate_pct: 50, quiet_days: 7 } },
+            status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1, chars: 81_200 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0, chars: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false, fleet: crate::fleet::Roster { machines: vec![crate::fleet::Machine { machine: "mac-3939".into(), sources: vec!["claude".into(), "codex".into()], actors: vec!["svonava".into()], last_ts: "2026-05-31T09:00:00Z".into(), version: "0.1.0".into(), events: 41, quiet: false }, crate::fleet::Machine { machine: "ci-runner-7".into(), sources: vec!["claude".into()], actors: vec![], last_ts: "2026-05-12T09:00:00Z".into(), version: String::new(), events: 0, quiet: true }], actors_tracked: vec!["svonava".into()], gh_active: 2, untracked: vec![crate::fleet::UntrackedAuthor { login: "bob".into(), agent: Some("claude".into()) }], install_rate_pct: 50, quiet_days: 7 } },
             view: View::Topics,
             sel: 0,
             drill_topic: None,
@@ -2302,7 +2310,7 @@ mod tests {
         assert!(text.contains("mac-3939") && text.contains("claude+codex") && text.contains("svonava"), "live machine row missing: {text}");
         assert!(text.contains("v0.1.0"), "tracker version missing: {text}");
         assert!(text.contains("ci-runner-7") && text.contains("QUIET"), "quiet machine not called out: {text}");
-        assert!(text.contains("runs agents, untracked: bob (claude)"), "untracked-attributed line missing: {text}");
+        assert!(text.contains("not tracked (1): bob (claude)"), "uncovered line missing: {text}");
         // none of the usage furniture leaks onto the health tab.
         assert!(!text.contains("Models (1)") && !text.contains("agents · output"), "usage panels belong to Stats[4]: {text}");
     }
