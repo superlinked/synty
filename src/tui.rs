@@ -113,6 +113,17 @@ impl Facet {
     }
 }
 
+/// Held-arrow acceleration state. The terminal's key-repeat rate is a fixed
+/// ceiling we can't raise, so the lever is rows-per-keypress: a tap moves one
+/// row, but holding ramps the step by how long the key's been down. `at` is the
+/// last move, `since` is when the current hold began, `dir` its direction.
+#[derive(Default)]
+struct Nav {
+    at: Option<std::time::Instant>,
+    since: Option<std::time::Instant>,
+    dir: i32,
+}
+
 struct App {
     docs: Vec<Doc>,
     doc_by_id: HashMap<i64, usize>,
@@ -123,6 +134,7 @@ struct App {
     status: crate::view::Status,
     view: View,
     sel: usize,
+    nav: Nav,
     drill_topic: Option<usize>, // Topics: viewing a topic's units (index into visible())
     drill_unit: bool,           // Topics, drilled: the selected unit's detail pane is open
     tool_drill: Option<units::ToolProfile>, // Status: the inspected tool's profile overlay
@@ -410,6 +422,7 @@ impl App {
             status: b.status,
             view: View::Topics,
             sel: 0,
+            nav: Nav::default(),
             drill_topic: None,
             drill_unit: false,
             tool_drill: None,
@@ -435,20 +448,13 @@ impl App {
         while !self.quit {
             term.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(150))? {
-                // Drain the whole input burst before the next redraw. Holding
-                // an arrow then scrolls at the terminal's key-repeat rate
-                // instead of once per (full) redraw — the old one-key-per-frame
-                // loop capped scrolling at the draw rate. `Repeat` events (the
-                // kitty keyboard protocol emits them for held keys) count like
-                // presses; only `Release` is ignored.
-                loop {
-                    if let Event::Key(k) = event::read()? {
-                        if k.kind != KeyEventKind::Release {
-                            self.on_key(k.code);
-                        }
-                    }
-                    if self.quit || !event::poll(Duration::from_millis(0))? {
-                        break;
+                if let Event::Key(k) = event::read()? {
+                    // `Repeat` (held key on a kitty-protocol terminal) counts
+                    // like a press; only `Release` is ignored. Held-arrow speed
+                    // is handled by nav()'s acceleration, not by draining the
+                    // buffer (which would over-jump a backed-up burst).
+                    if k.kind != KeyEventKind::Release {
+                        self.on_key(k.code);
                     }
                 }
             }
@@ -717,8 +723,8 @@ impl App {
                     self.quit = true;
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.nav(1),
+            KeyCode::Up | KeyCode::Char('k') => self.nav(-1),
             // Fast jump for long lists; g/G still go all the way.
             KeyCode::PageDown => self.move_sel(10),
             KeyCode::PageUp => self.move_sel(-10),
@@ -799,6 +805,35 @@ impl App {
         if n > 0 {
             self.sel = (self.sel as i32 + d).clamp(0, n as i32 - 1) as usize;
         }
+    }
+
+    /// One arrow/`j`/`k` step, accelerated while the key is held. A fresh press
+    /// (or a gap longer than a key-repeat interval, or a direction change)
+    /// always moves exactly one row; holding ramps the step by how long the key
+    /// has been down — so the terminal's fixed repeat rate stops capping how
+    /// fast a long list scrolls. The ramp is keyed on wall-clock hold time, not
+    /// event count, so it can't run away if the loop processes events in a burst.
+    fn nav(&mut self, dir: i32) {
+        let now = std::time::Instant::now();
+        let repeat = self.nav.dir == dir
+            && self.nav.at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(160));
+        if !repeat {
+            self.nav.since = Some(now); // a tap, or the start of a new hold
+        }
+        self.nav.at = Some(now);
+        self.nav.dir = dir;
+        let held = self.nav.since.map(|s| now.duration_since(s).as_millis()).unwrap_or(0);
+        // Precise taps; holding ramps 1 → 3 → 6 → 12 rows per repeat.
+        let step = if held < 160 {
+            1
+        } else if held < 450 {
+            3
+        } else if held < 900 {
+            6
+        } else {
+            12
+        };
+        self.move_sel(dir * step);
     }
 
     /// Esc: peel back one layer of state — close a unit detail, exit a drill,
@@ -1998,6 +2033,7 @@ mod tests {
             status: crate::view::Status { docs: 2, github: 1, sessions: 1, by_kind: vec![("user_prompt".into(), 1), ("pull_request".into(), 1)], by_repo: vec![crate::view::Tally { name: "sie".into(), docs: 1, github: 0, sessions: 1, tok_out: 18_900, tools: 8 }], by_user: vec![crate::view::Tally { name: "alice".into(), docs: 1, github: 1, sessions: 0, tok_out: 0, tools: 0 }], by_tool: vec![crate::view::ToolTally { name: "Bash".into(), agent: "claude".into(), calls: 5, errs: 1, chars: 81_200 }, crate::view::ToolTally { name: "Edit".into(), agent: "claude".into(), calls: 3, errs: 0, chars: 0 }], by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }], newest_ts: "2026-05-31".into(), last_indexed: None, last_tracked: None, autostart: false, stale: false, fleet: crate::fleet::Roster { machines: vec![crate::fleet::Machine { machine: "mac-3939".into(), sources: vec!["claude".into(), "codex".into()], actors: vec!["svonava".into()], last_ts: "2026-05-31T09:00:00Z".into(), version: "0.1.0".into(), events: 41, quiet: false }, crate::fleet::Machine { machine: "ci-runner-7".into(), sources: vec!["claude".into()], actors: vec![], last_ts: "2026-05-12T09:00:00Z".into(), version: String::new(), events: 0, quiet: true }], actors_tracked: vec!["svonava".into()], gh_active: 2, untracked: vec![crate::fleet::UntrackedAuthor { login: "bob".into(), agent: Some("claude".into()) }], install_rate_pct: 50, quiet_days: 7 } },
             view: View::Topics,
             sel: 0,
+            nav: Nav::default(),
             drill_topic: None,
             drill_unit: false,
             tool_drill: None,
