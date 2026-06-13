@@ -424,10 +424,23 @@ pub fn autostart_set(on: bool) -> Result<()> {
     Ok(())
 }
 
+/// Restart the login-time tracker so a freshly installed binary takes over
+/// (called by `synty upgrade`). Ok(false) when no unit is installed — nothing
+/// to restart. Best-effort like `loader`: it reports "tried", not "succeeded".
+pub fn restart() -> Result<bool> {
+    let Some((path, kind)) = autostart_unit() else { return Ok(false) };
+    if !Path::new(&path).exists() {
+        return Ok(false);
+    }
+    loader(kind, &path, false);
+    loader(kind, &path, true);
+    Ok(true)
+}
+
 /// The directory the autostart unit runs from. The current home when it holds
 /// synty state (the dev-checkout case), else ~/.synty — created so a fresh
 /// install's tracker has a stable, machine-wide home instead of whatever
-/// directory `setup` happened to run in.
+/// directory `init` happened to run in.
 fn unit_workdir() -> Result<String> {
     if Path::new(".synty").exists() {
         return Ok(std::env::current_dir()?.display().to_string());

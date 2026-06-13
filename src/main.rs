@@ -24,6 +24,7 @@ mod progress;
 mod readmodel;
 mod init;
 mod related;
+mod release;
 mod store;
 mod sync;
 mod tail;
@@ -137,7 +138,7 @@ pub fn write_atomic(path: &str, data: &[u8]) -> Result<()> {
 }
 
 #[derive(Parser)]
-#[command(name = "synty", about = "late-interaction work memory (experiment)")]
+#[command(name = "synty", version, about = "late-interaction work memory (experiment)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -260,6 +261,23 @@ enum Cmd {
         /// Configure + enable tracking but skip the first build
         #[arg(long)]
         no_build: bool,
+    },
+    /// Publish this machine's binary to the bucket as the current platform's
+    /// release artifact (bin/<version>/synty-<os>-<arch>) and update the
+    /// bin/latest.json pointer. Build the release binary, then run it to publish.
+    Publish {
+        #[arg(long)]
+        bucket: Option<String>,
+        /// Binary to upload (default: the running binary)
+        #[arg(long)]
+        binary: Option<String>,
+    },
+    /// Self-update from the bucket: if a newer build is published for this
+    /// platform, download it, verify its checksum, replace this binary, and
+    /// restart the tracker. No-op when already current.
+    Upgrade {
+        #[arg(long)]
+        bucket: Option<String>,
     },
     /// Interactive terminal UI: status + browse/drill over topics, recent, search.
     /// Pulls the fleet's read-model at startup and freshens in the background.
@@ -419,6 +437,8 @@ fn main() -> Result<()> {
         Cmd::Related { k, bucket, json } => {
             related::run(k, &model_id(), &config::resolve_bucket(bucket), json)?
         }
+        Cmd::Publish { bucket, binary } => release::publish(&config::resolve_bucket(bucket), binary)?,
+        Cmd::Upgrade { bucket } => release::upgrade(&config::resolve_bucket(bucket))?,
         Cmd::Cluster { resolution, bucket } => {
             topics::run(resolution, &model_id(), &config::resolve_bucket(bucket))?
         }
@@ -565,6 +585,23 @@ mod tests {
         // The earlier names no longer exist — one onboarding path, no confusion.
         assert!(Cli::try_parse_from(["synty", "setup"]).is_err());
         assert!(Cli::try_parse_from(["synty", "join"]).is_err());
+    }
+
+    // Binary distribution: `publish` takes an optional binary path, `upgrade`
+    // just a bucket — both default to the configured bucket when omitted.
+    #[test]
+    fn publish_and_upgrade_parse() {
+        let p = Cli::try_parse_from(["synty", "publish", "--bucket", "gs://t", "--binary", "/b/synty"])
+            .expect("publish parses");
+        assert!(matches!(p.cmd, Cmd::Publish { bucket: Some(b), binary: Some(bin) } if b == "gs://t" && bin == "/b/synty"));
+        assert!(matches!(
+            Cli::try_parse_from(["synty", "publish"]).expect("bare publish").cmd,
+            Cmd::Publish { bucket: None, binary: None }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["synty", "upgrade"]).expect("bare upgrade").cmd,
+            Cmd::Upgrade { bucket: None }
+        ));
     }
 
     #[test]
