@@ -10,19 +10,33 @@
 # re-paste with a bucket later and that same `init` switches you onto the team.
 # Idempotent — safe to bake into dev-VM / sandbox images.
 #
-# Binary source, in order: $SYNTY_BINARY_URL (downloaded), $SYNTY_BINARY (a
-# local path), else ./target/release/synty (a local build). Distribution is
-# internal for now — no public package or Homebrew tap while the team rolls out.
+# Binary source, in order: $SYNTY_BINARY_URL (the bucket's HTTP root — the
+# installer detects this machine's <os>-<arch> and pulls the matching artifact
+# named by bin/latest.json), $SYNTY_BINARY (a local path), else
+# ./target/release/synty (a local build). Distribution is internal for now — no
+# public package or Homebrew tap while the team rolls out. After install,
+# `synty upgrade` handles updates straight from the bucket (no URL needed).
 set -eu
 
 BUCKET="${1:-}"
 
-# 1. Resolve the binary.
+# 1. Resolve the binary. This machine's platform key matches `release::platform_key`.
+os=$(uname -s); arch=$(uname -m)
+case "$os" in Darwin) os=darwin ;; Linux) os=linux ;; *) echo "unsupported OS: $os"; exit 1 ;; esac
+case "$arch" in arm64 | aarch64) arch=arm64 ;; x86_64 | amd64) arch=x64 ;; *) echo "unsupported arch: $arch"; exit 1 ;; esac
+PLAT="$os-$arch"
+
 if [ -n "${SYNTY_BINARY_URL:-}" ]; then
   TMP="$(mktemp)"
   trap 'rm -f "$TMP"' EXIT
-  echo "downloading synty from $SYNTY_BINARY_URL"
-  curl -fsSL "$SYNTY_BINARY_URL" -o "$TMP"
+  # latest.json names the current version; the artifact key is the deterministic
+  # bin/<version>/synty-<plat>, so we only parse the one version field.
+  ver=$(curl -fsSL "$SYNTY_BINARY_URL/bin/latest.json" \
+    | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$ver" ] || { echo "no bin/latest.json under $SYNTY_BINARY_URL"; exit 1; }
+  url="$SYNTY_BINARY_URL/bin/$ver/synty-$PLAT"
+  echo "downloading synty $ver ($PLAT) from $url"
+  curl -fsSL "$url" -o "$TMP" || { echo "no $PLAT build published for synty $ver"; exit 1; }
   chmod +x "$TMP"
   BIN="$TMP"
 else
