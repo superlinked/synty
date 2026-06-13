@@ -261,6 +261,10 @@ impl Stream {
             for e in &mut evts {
                 if e.kind == kind::SESSION_START {
                     e.payload["actor"] = json!(self.actor);
+                    // Which synty produced this stream — distinct from the
+                    // agent's own `version` the parser may have captured.
+                    // Lets the fleet roster report upgrade lag per machine.
+                    e.payload["tracker_version"] = json!(env!("CARGO_PKG_VERSION"));
                 }
             }
             for e in &evts {
@@ -600,6 +604,40 @@ mod tests {
         let starts = out.lines().filter(|l| l.contains("\"session_start\"")).count();
         assert_eq!(starts, 1, "restart must not re-emit session_start:\n{out}");
         assert!(out.contains("second prompt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // session_start carries who (actor) and which synty (tracker_version), so
+    // the fleet roster can join machines to people and spot upgrade lag.
+    #[test]
+    fn session_start_carries_tracker_version() {
+        let dir = std::env::temp_dir().join(format!("synty-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let l1 = r#"{"type":"user","sessionId":"S1","version":"2.1.30","timestamp":"2026-05-31T20:00:00Z","message":{"content":"a prompt"}}"#;
+        std::fs::write(root.join("s.jsonl"), format!("{l1}\n")).unwrap();
+
+        let mut st = Stream {
+            src: Box::new(ClaudeCode),
+            roots: vec![root.to_string_lossy().into_owned()],
+            name: "edge-t-claudecode".into(),
+            out: dir.join("out.jsonl"),
+            seq: Sequencer::new(),
+            started: HashSet::new(),
+            files: HashMap::new(),
+            open: HashMap::new(),
+            n_sessions: 0,
+            n_skipped: 0,
+            actor: "tester".into(),
+        };
+        st.drain(0, &HashMap::new()).unwrap();
+
+        let out = std::fs::read_to_string(dir.join("out.jsonl")).unwrap();
+        let line = out.lines().find(|l| l.contains("\"session_start\"")).expect("session_start emitted");
+        let e: Event = serde_json::from_str(line).unwrap();
+        assert_eq!(e.payload["actor"], "tester", "actor stamp must survive alongside the version");
+        assert_eq!(e.payload["tracker_version"], env!("CARGO_PKG_VERSION"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
