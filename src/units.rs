@@ -494,6 +494,81 @@ pub fn day_stats() -> HashMap<String, DayStat> {
     f.finish()
 }
 
+/// One day's full activity: what the agents consumed (tokens, cache, tools,
+/// sessions) and what the work produced (merged LOC, PRs, issues). The one
+/// substrate behind the TUI charts and `synty stats`.
+#[derive(Default, Clone, Copy)]
+pub struct DayRow {
+    pub tok_in: u64,
+    pub tok_out: u64,
+    pub cache_read: u64,
+    pub cache_create: u64,
+    pub tools: u64,
+    pub sessions: u64,
+    pub loc_add: u64,
+    pub loc_del: u64,
+    pub prs: u64,
+    pub issues: u64,
+}
+
+/// day (YYYY-MM-DD) → combined activity: usage from the raw envelopes, LOC±
+/// from merged PRs, PR/issue counts from the given unit list.
+pub fn activity_by_day(units: &[Unit]) -> HashMap<String, DayRow> {
+    combine_activity(day_stats(), gh_loc_by_day(), units)
+}
+
+fn combine_activity(
+    day: HashMap<String, DayStat>,
+    loc: HashMap<String, (u64, u64)>,
+    units: &[Unit],
+) -> HashMap<String, DayRow> {
+    let mut out: HashMap<String, DayRow> = HashMap::new();
+    for (d, s) in day {
+        let r = out.entry(d).or_default();
+        r.tok_in = s.tok_in;
+        r.tok_out = s.tok_out;
+        r.cache_read = s.cache_read;
+        r.cache_create = s.cache_create;
+        r.tools = s.tools;
+        r.sessions = s.sessions;
+    }
+    for (d, (add, del)) in loc {
+        let r = out.entry(d).or_default();
+        r.loc_add = add;
+        r.loc_del = del;
+    }
+    for u in units {
+        if day_num(&u.when).is_none() {
+            continue;
+        }
+        // Every dated unit claims its day (the charts anchor to the newest
+        // one), but only GitHub kinds add to the output counters.
+        let r = out.entry(u.when.clone()).or_default();
+        match u.kind {
+            Kind::Pr => r.prs += 1,
+            Kind::Issue => r.issues += 1,
+            Kind::Session => {}
+        }
+    }
+    out
+}
+
+/// Days from the CE epoch for a YYYY-MM-DD day (the time-series x scale).
+pub fn day_num(day: &str) -> Option<i32> {
+    use chrono::Datelike;
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok().map(|d| d.num_days_from_ce())
+}
+
+/// The oldest visible Monday (num_days_from_ce) for a window of `weeks`
+/// Mon-Sun weeks ending with the week of `gmax`.
+pub fn week_start_for(gmax: i32, weeks: usize) -> i32 {
+    use chrono::Datelike;
+    let dow = chrono::NaiveDate::from_num_days_from_ce_opt(gmax)
+        .map(|d| d.weekday().num_days_from_monday() as i32)
+        .unwrap_or(0);
+    gmax - dow - 7 * (weeks as i32 - 1)
+}
+
 /// Everything gleanable about one tool across the corpus: call/error volume,
 /// per-day usage, which argument keys appear — and the common values of the
 /// low-cardinality ones — input sizes, and call→result latency where both
@@ -1321,6 +1396,51 @@ mod tests {
             f.fold(line);
         }
         f.finish()
+    }
+
+    // One activity row per day: usage copied through, LOC landing on its
+    // merge day, PRs/issues counted by their day — and a session unit claims
+    // its day without inventing output.
+    #[test]
+    fn activity_by_day_merges_usage_loc_and_unit_counts() {
+        let unit = |kind: Kind, when: &str| Unit {
+            kind,
+            when: when.into(),
+            repo: String::new(),
+            title: String::new(),
+            outcome: String::new(),
+            summary: None,
+            topic: None,
+            rank: 0,
+            dup: false,
+            struggle: 0.0,
+            author: String::new(),
+            doc_id: None,
+            session_id: None,
+        };
+        let day: HashMap<String, DayStat> = [(
+            "2026-06-01".to_string(),
+            DayStat { tok_in: 100, tok_out: 50, cache_read: 7, cache_create: 3, tools: 4, sessions: 2 },
+        )]
+        .into_iter()
+        .collect();
+        let loc: HashMap<String, (u64, u64)> = [("2026-06-02".to_string(), (120u64, 40u64))].into_iter().collect();
+        let units = vec![
+            unit(Kind::Issue, "2026-06-01"),
+            unit(Kind::Pr, "2026-06-02"),
+            unit(Kind::Session, "2026-06-03"),
+            unit(Kind::Pr, "not-a-date"),
+        ];
+        let act = combine_activity(day, loc, &units);
+        let d1 = &act["2026-06-01"];
+        assert_eq!((d1.tok_in, d1.tok_out, d1.tools, d1.sessions), (100, 50, 4, 2));
+        assert_eq!((d1.issues, d1.prs), (1, 0));
+        let d2 = &act["2026-06-02"];
+        assert_eq!((d2.loc_add, d2.loc_del, d2.prs), (120, 40, 1));
+        assert_eq!(d2.tok_in, 0, "a day present only in one source still appears");
+        let d3 = &act["2026-06-03"];
+        assert_eq!((d3.prs, d3.issues, d3.sessions), (0, 0, 0), "a session unit claims the day, nothing else");
+        assert_eq!(act.len(), 3, "an undated unit lands nowhere");
     }
 
     // The day series attributes usage to the day of its event (exact even for

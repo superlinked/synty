@@ -5,7 +5,7 @@
 // below. The embedding model loads on a background thread (a search actor) so the
 // first query is instant and the UI never blocks.
 
-use crate::units::{self, Kind, Session, TopicUnits, Unit};
+use crate::units::{self, day_num, week_start_for, Kind, Session, TopicUnits, Unit};
 use crate::{first_line, load_docs, readmodel, short, Doc};
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate};
@@ -154,8 +154,7 @@ struct Bundle {
     work: Vec<Unit>,
     topics: Vec<TopicUnits>,
     status: crate::view::Status,
-    day_stats: HashMap<String, units::DayStat>,
-    loc_days: HashMap<String, (u64, u64)>,
+    activity: HashMap<String, units::DayRow>,
 }
 
 impl Bundle {
@@ -180,7 +179,8 @@ impl Bundle {
             stale: false,
             fleet: Default::default(),
         });
-        Self { docs, sessions, work, topics, status, day_stats: units::day_stats(), loc_days: units::gh_loc_by_day() }
+        let activity = units::activity_by_day(&work);
+        Self { docs, sessions, work, topics, status, activity }
     }
 }
 
@@ -264,12 +264,7 @@ struct ViewCache {
 }
 
 impl ViewCache {
-    fn build(
-        topics: &[TopicUnits],
-        work: &[Unit],
-        day_stats: &HashMap<String, units::DayStat>,
-        loc_days: &HashMap<String, (u64, u64)>,
-    ) -> Self {
+    fn build(topics: &[TopicUnits], work: &[Unit], activity: &HashMap<String, units::DayRow>) -> Self {
         let facet = |repo: bool| {
             let mut ct: HashMap<&str, usize> = HashMap::new();
             for t in topics {
@@ -289,53 +284,30 @@ impl ViewCache {
             ct
         };
         // The stats time series, anchored to the most recent day with data so
-        // rendering stays deterministic (no wall clock).
-        let by_num: Vec<(i32, units::DayStat)> =
-            day_stats.iter().filter_map(|(d, s)| Some((day_num(d)?, *s))).collect();
-        let loc_num: Vec<(i32, (u64, u64))> =
-            loc_days.iter().filter_map(|(d, v)| Some((day_num(d)?, *v))).collect();
-        let stats_gmax = by_num
-            .iter()
-            .map(|(d, _)| *d)
-            .chain(work.iter().filter_map(|u| day_num(&u.when)))
-            .chain(loc_num.iter().map(|(d, _)| *d))
-            .max()
-            .unwrap_or(0);
-        let fold_stat = |get: fn(&units::DayStat) -> u64| {
+        // rendering stays deterministic (no wall clock). The shared
+        // activity_by_day fold already merged usage, LOC, and unit counts.
+        let by_num: Vec<(i32, units::DayRow)> =
+            activity.iter().filter_map(|(d, r)| Some((day_num(d)?, *r))).collect();
+        let stats_gmax = by_num.iter().map(|(d, _)| *d).max().unwrap_or(0);
+        let fold = |get: fn(&units::DayRow) -> u64| {
             let mut days: HashMap<i32, u64> = HashMap::new();
-            for (d, s) in &by_num {
-                *days.entry(*d).or_default() += get(s);
-            }
-            days
-        };
-        let fold_kind = |kind: Kind| {
-            let mut days: HashMap<i32, u64> = HashMap::new();
-            for u in work.iter().filter(|u| u.kind == kind) {
-                if let Some(d) = day_num(&u.when) {
-                    *days.entry(d).or_default() += 1;
-                }
-            }
-            days
-        };
-        let fold_loc = |del: bool| {
-            let mut days: HashMap<i32, u64> = HashMap::new();
-            for (d, (add, rm)) in &loc_num {
-                *days.entry(*d).or_default() += if del { *rm } else { *add };
+            for (d, r) in &by_num {
+                *days.entry(*d).or_default() += get(r);
             }
             days
         };
         // Two timelines: what the agents consumed, and what the work produced.
         let chart_agent: Vec<(&'static str, HashMap<i32, u64>)> = vec![
-            ("tokens", fold_stat(|s| s.tok_in + s.tok_out)),
-            ("cache", fold_stat(|s| s.cache_read + s.cache_create)),
-            ("tools", fold_stat(|s| s.tools)),
-            ("sessions", fold_stat(|s| s.sessions)),
+            ("tokens", fold(|r| r.tok_in + r.tok_out)),
+            ("cache", fold(|r| r.cache_read + r.cache_create)),
+            ("tools", fold(|r| r.tools)),
+            ("sessions", fold(|r| r.sessions)),
         ];
         let chart_output: Vec<(&'static str, HashMap<i32, u64>)> = vec![
-            ("loc+", fold_loc(false)),
-            ("loc-", fold_loc(true)),
-            ("prs", fold_kind(Kind::Pr)),
-            ("issues", fold_kind(Kind::Issue)),
+            ("loc+", fold(|r| r.loc_add)),
+            ("loc-", fold(|r| r.loc_del)),
+            ("prs", fold(|r| r.prs)),
+            ("issues", fold(|r| r.issues)),
         ];
 
         Self {
@@ -422,7 +394,7 @@ impl App {
         let doc_by_id = b.docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
         let sess_by_id = b.sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
         let (qtx, rrx) = spawn_search(model_id);
-        let cache = ViewCache::build(&b.topics, &b.work, &b.day_stats, &b.loc_days);
+        let cache = ViewCache::build(&b.topics, &b.work, &b.activity);
         let (btx, brx) = channel::<Bundle>();
         Self {
             cache,
@@ -527,7 +499,7 @@ impl App {
             .and_then(|vi| self.drilled(vi))
             .map(|t| t.cache_key.clone());
 
-        self.cache = ViewCache::build(&b.topics, &b.work, &b.day_stats, &b.loc_days);
+        self.cache = ViewCache::build(&b.topics, &b.work, &b.activity);
         self.doc_by_id = b.docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
         self.sess_by_id = b.sessions.iter().enumerate().map(|(i, s)| (s.id.clone(), i)).collect();
         self.docs = b.docs;
@@ -1707,18 +1679,6 @@ fn shade(count: u64, gmax: u64) -> Color {
     SHADES[lvl]
 }
 
-/// Days from the CE epoch for a YYYY-MM-DD day.
-fn day_num(day: &str) -> Option<i32> {
-    NaiveDate::parse_from_str(day, "%Y-%m-%d").ok().map(|d| d.num_days_from_ce())
-}
-
-/// The oldest visible Monday (num_days_from_ce) for a window of `weeks`
-/// Mon-Sun weeks ending with the week of `gmax`.
-fn week_start_for(gmax: i32, weeks: usize) -> i32 {
-    let dow = NaiveDate::from_num_days_from_ce_opt(gmax).map(|d| d.weekday().num_days_from_monday() as i32).unwrap_or(0);
-    gmax - dow - 7 * (weeks as i32 - 1)
-}
-
 /// The four-week window the Topics activity strip uses.
 fn week_start(gmax: i32) -> i32 {
     week_start_for(gmax, TL_DAYS / 7)
@@ -1942,7 +1902,7 @@ mod tests {
         ];
         let topics = vec![TopicUnits { id: 0, cache_key: "t0".into(), label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()), name: Some("OCR & Document Extraction".into()), span: Some(("2026-05-29".into(), "2026-05-31".into())) }];
         App {
-            cache: ViewCache::build(&topics, &work, &test_day_stats(), &test_loc_days()),
+            cache: ViewCache::build(&topics, &work, &test_activity()),
             docs,
             doc_by_id,
             sess_by_id: [("S1".to_string(), 0)].into_iter().collect(),
@@ -1973,14 +1933,13 @@ mod tests {
         }
     }
 
-    fn test_loc_days() -> HashMap<String, (u64, u64)> {
-        [("2026-05-31".to_string(), (120u64, 40u64))].into_iter().collect()
-    }
-
-    fn test_day_stats() -> HashMap<String, units::DayStat> {
+    fn test_activity() -> HashMap<String, units::DayRow> {
         let mut m = HashMap::new();
-        m.insert("2026-05-31".to_string(), units::DayStat { tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, tools: 8, sessions: 1 });
-        m.insert("2026-05-30".to_string(), units::DayStat { tok_out: 2_000, tools: 3, sessions: 1, ..Default::default() });
+        m.insert(
+            "2026-05-31".to_string(),
+            units::DayRow { tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, tools: 8, sessions: 1, loc_add: 120, loc_del: 40, prs: 1, issues: 0 },
+        );
+        m.insert("2026-05-30".to_string(), units::DayRow { tok_out: 2_000, tools: 3, sessions: 1, ..Default::default() });
         m
     }
 
@@ -2008,7 +1967,7 @@ mod tests {
             name: Some("Infra & Terraform".into()),
             span: Some(("2026-05-28".into(), "2026-05-30".into())),
         });
-        a.cache = ViewCache::build(&a.topics, &a.work, &test_day_stats(), &test_loc_days());
+        a.cache = ViewCache::build(&a.topics, &a.work, &test_activity());
         a
     }
 
@@ -2055,8 +2014,7 @@ mod tests {
             work: donor.work,
             topics: donor.topics,
             status: donor.status,
-            day_stats: test_day_stats(),
-            loc_days: test_loc_days(),
+            activity: test_activity(),
         };
         a.apply(b);
         let vi = a.drill_topic.expect("drill survives the reload");
