@@ -47,5 +47,15 @@ events; whoever opens a viewer contributes the compute.
 - Compatibility: add-only envelopes (`v` field), model-namespaced embedding/summary stores, `format` gate on the read-model pointer (see design.md "Data compatibility").
 - Deferred: Cursor tailer (needs a machine with Cursor data); hosted agents (Claude Code web, Devin) need per-platform log-export exploration.
 
+## M8 — Fleet coverage & agent surface
+Pre-release work, pulled ahead of M5/M6. Coverage tells an org whether synty
+runs everywhere agents run; the agent surface makes every TUI fact reachable
+from the CLI and MCP.
+- Fleet roster folded from `events/edge-*` streams: per-machine liveness and actor join; tracker-rot (went quiet) vs never-installed; `[metrics coverage]` block with install rate.
+- Agent-attribution detection at ingest (`Co-authored-by` trailers, "Generated with" footers, bot author logins): the high-precision "runs agents, untracked" list.
+- TUI: current Status[4] becomes Stats[4] (usage); new Status[5] tab = synty self-health box + fleet roster.
+- Agent interface parity: `stats`, `tool <name>`, `show <unit|session>`, topic members on CLI and MCP; stable ids inline in Markdown; `--json` on every read command behind a versioned envelope.
+- Tracker binary version stamped into `session_start` (upgrade-rate monitoring); `setup` nudges GitHub-login pinning so actors join to GitHub authors.
+
 ## Future work (after the milestones)
 - ~~MCP server exposing agent tools over stdio~~ — done (`synty mcp`: synty_search / synty_topics / synty_recent / synty_status).

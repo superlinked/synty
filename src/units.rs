@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const LOCAL_DIR: &str = "corpus/local";
+pub(crate) const LOCAL_DIR: &str = "corpus/local";
 const FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 /// A coding session as one unit of work.
@@ -1289,7 +1289,7 @@ fn day(ts: &str) -> String {
     ts.split('T').next().unwrap_or("").to_string()
 }
 
-fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if dir.is_dir() {
         for e in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {

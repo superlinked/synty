@@ -58,6 +58,8 @@ pub struct Status {
     pub autostart: bool,
     /// Tracked events are newer than the index — answers may miss recent work.
     pub stale: bool,
+    /// Per-machine liveness and the actor↔GitHub-author join (M8 coverage).
+    pub fleet: crate::fleet::Roster,
 }
 
 /// What synty holds and how fresh it is.
@@ -130,7 +132,47 @@ pub fn status() -> Result<Status> {
         last_tracked: mtime_str(".synty/cursors.json"),
         autostart: crate::track::autostart_enabled(),
         stale: stale_note().is_some(),
+        fleet: crate::fleet::roster(&docs, std::path::Path::new(crate::units::LOCAL_DIR)),
     })
+}
+
+/// The fleet section of `status`: every machine with its liveness, who it
+/// attributes to, and the install-rate join — empty string when no streams
+/// have ever been seen (a fresh viewer before its first build).
+fn fleet_md(f: &crate::fleet::Roster) -> String {
+    if f.machines.is_empty() {
+        return String::new();
+    }
+    let mut o = format!(
+        "\n\nfleet ({}d window · quiet after {}d): {} machines ({} active, {} quiet) · {} actors tracked · {} active on GitHub · install rate {}%\n",
+        crate::fleet::GH_WINDOW_DAYS,
+        f.quiet_days,
+        f.machines.len(),
+        f.active(),
+        f.machines.len() - f.active(),
+        f.actors_tracked.len(),
+        f.gh_active,
+        f.install_rate_pct,
+    );
+    for m in &f.machines {
+        o.push_str(&format!(
+            "  {:<26} {:<14} {:<14} {:>10} {:>8} {:>6}{}\n",
+            m.machine,
+            m.sources.join("+"),
+            if m.actors.is_empty() { "—".to_string() } else { m.actors.join("+") },
+            m.last_ts.split('T').next().unwrap_or("—"),
+            if m.version.is_empty() { "—".to_string() } else { format!("v{}", m.version) },
+            m.events,
+            if m.quiet { "  QUIET" } else { "" },
+        ));
+    }
+    if !f.untracked_attributed.is_empty() {
+        o.push_str(&format!(
+            "  runs agents, untracked: {}\n",
+            f.untracked_attributed.iter().map(|(a, l)| format!("{a} ({l})")).collect::<Vec<_>>().join(", "),
+        ));
+    }
+    o
 }
 
 /// Add a session's token/tool spend to its facet row, creating the row when
@@ -264,6 +306,7 @@ pub fn status_md(s: &Status) -> String {
             ));
         }
     }
+    o.push_str(&fleet_md(&s.fleet));
     let block = |o: &mut String, label: &str, rows: &[Tally]| {
         o.push_str(&format!("\n\n{label} (docs · sessions · github · tok-out · tools):\n"));
         for f in rows.iter().take(12) {
@@ -368,6 +411,23 @@ pub fn status_json(s: &Status) -> String {
         "last_tracked": s.last_tracked,
         "autostart": s.autostart,
         "stale": s.stale,
+        "fleet": {
+            "machines": s.fleet.machines.iter().map(|m| serde_json::json!({
+                "machine": m.machine,
+                "sources": m.sources,
+                "actors": m.actors,
+                "last_ts": m.last_ts,
+                "tracker_version": m.version,
+                "events": m.events,
+                "quiet": m.quiet,
+            })).collect::<Vec<_>>(),
+            "actors_tracked": s.fleet.actors_tracked,
+            "gh_active": s.fleet.gh_active,
+            "untracked": s.fleet.untracked,
+            "untracked_attributed": s.fleet.untracked_attributed,
+            "install_rate_pct": s.fleet.install_rate_pct,
+            "quiet_days": s.fleet.quiet_days,
+        },
     })
     .to_string()
 }
@@ -555,6 +615,48 @@ mod tests {
         assert!(line.starts_with("tools: T0×8"));
         assert!(line.contains("(+2 more)") && line.ends_with("2 errors"), "{line}");
         assert!(!line.contains("T6×"), "capped at six names: {line}");
+    }
+
+    // The fleet section names every machine, marks the rotted tracker, and
+    // calls out who runs agents unwatched — the numbers a team lead acts on.
+    // (status_md inlines this section verbatim; the helper keeps the test off
+    // the corpus-walking day_stats path.)
+    #[test]
+    fn fleet_section_names_machines_quiet_and_untracked() {
+        let roster = crate::fleet::Roster {
+            machines: vec![
+                crate::fleet::Machine {
+                    machine: "mac-3939".into(),
+                    sources: vec!["claude".into(), "codex".into()],
+                    actors: vec!["svonava".into()],
+                    last_ts: "2026-06-12T08:00:00Z".into(),
+                    version: "0.1.0".into(),
+                    events: 41,
+                    quiet: false,
+                },
+                crate::fleet::Machine {
+                    machine: "ci-runner-7".into(),
+                    sources: vec!["claude".into()],
+                    actors: vec![],
+                    last_ts: "2026-05-20T08:00:00Z".into(),
+                    version: String::new(),
+                    events: 0,
+                    quiet: true,
+                },
+            ],
+            actors_tracked: vec!["svonava".into()],
+            gh_active: 2,
+            untracked: vec!["bob".into()],
+            untracked_attributed: vec![("bob".into(), "claude".into())],
+            install_rate_pct: 50,
+            quiet_days: 7,
+        };
+        let md = fleet_md(&roster);
+        assert!(md.contains("install rate 50%"), "{md}");
+        assert!(md.contains("mac-3939") && md.contains("claude+codex") && md.contains("v0.1.0"), "{md}");
+        assert!(md.contains("ci-runner-7") && md.contains("QUIET"), "{md}");
+        assert!(md.contains("runs agents, untracked: bob (claude)"), "{md}");
+        assert!(fleet_md(&Default::default()).is_empty(), "no streams yet → no section");
     }
 
     fn doc(source: &str, kind: &str, repo: &str, author: &str, sid: &str) -> Doc {

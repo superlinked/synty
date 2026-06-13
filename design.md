@@ -122,6 +122,16 @@ runs on CI or a server without a developer machine.
   edges; per-model tables, tool durations, and an optional pricing map are
   deferred with it. `[metrics stats]` reports `usage_coverage_pct` — the
   share of sessions whose source recorded usage. *Built (P1).*
+- **Fleet coverage (install rate).** Whether synty runs everywhere agents run,
+  from data already in the bucket: the roster folds every `edge-<machine>-…`
+  stream (liveness from envelope timestamps — file mtimes lie after a pull;
+  actor stamps; `tracker_version` for upgrade lag) and joins it against the
+  GitHub authors active in a trailing window. Untracked authors whose PRs name
+  an agent (Co-authored-by trailer, Generated-with footer, bot author — flagged
+  at ingest as `agent_attr`, precision-first) are the actionable "runs agents,
+  unwatched" list; a machine that streamed and went quiet is tracker rot,
+  distinct from never-installed. `ingest` emits a `[metrics coverage]` block
+  (machines, actors, install rate). *Built (M8).*
 
 ## Surfaces
 

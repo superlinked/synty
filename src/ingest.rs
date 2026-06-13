@@ -125,6 +125,21 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
         .set("lines_skipped", n_skipped)
         .set("github_files_failed", gh_failed);
     m.emit();
+    // Fleet coverage rides on every full ingest: streams and docs are both in
+    // hand here, and this is the moment the numbers can change.
+    let r = crate::fleet::roster(&docs, &local_dir);
+    let mut c = crate::metrics::Run::new("coverage");
+    c.set("machines", r.machines.len())
+        .set("machines_active", r.active())
+        .set("machines_quiet", r.machines.len() - r.active())
+        .set("actors_tracked", r.actors_tracked.len())
+        .set("gh_active_authors", r.gh_active)
+        .set("untracked", r.untracked.len())
+        .set("untracked_attributed", r.untracked_attributed.len())
+        .set("install_rate_pct", r.install_rate_pct)
+        .set("window_days", crate::fleet::GH_WINDOW_DAYS)
+        .set("quiet_days", r.quiet_days);
+    c.emit();
     eprintln!(
         "ingest: {n_github} github + {n_session} session = {total} → kept {} (dropped {dropped} oldest) → {out_path}",
         docs.len()

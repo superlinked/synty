@@ -34,6 +34,10 @@ pub struct Config {
     /// defaults to it; an explicit --bucket flag still wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
+    /// Days of stream silence before a machine's tracker counts as gone quiet
+    /// on the fleet roster (default 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_quiet_days: Option<u64>,
 }
 
 /// Bucket precedence: explicit flag > config > the local default.

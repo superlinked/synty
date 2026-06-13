@@ -47,7 +47,9 @@ block to stderr. `cluster` logs modularity, misplaced %, grab-bag and collapsed-
 counts, cluster-size min/median/max, and the session/doc mix; `summarize` logs
 unit coverage, topics named, duplicate names, keyword-fallback names, name
 faithfulness, and throughput; a `stats` block reports session token-usage
-capture coverage. Redirect stderr (`2>> runs.log`) if you want a history.
+capture coverage; `ingest` also emits a `coverage` block (fleet machines,
+actor↔GitHub join, install rate). Redirect stderr (`2>> runs.log`) if you
+want a history.
 When a change is meant to move quality, read the metric — don't eyeball it or
 recompute in a throwaway script.
 

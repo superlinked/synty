@@ -1,7 +1,19 @@
 // Fleet coverage: who runs coding agents, and is synty watching them. This
 // module owns agent-attribution detection over GitHub docs (Co-authored-by
 // trailers, Generated-with footers, bot author logins) — the high-precision
-// evidence that agents ran for a piece of work even when no tracker saw it.
+// evidence that agents ran for a piece of work even when no tracker saw it —
+// and the roster folded from the edge event streams: per-machine liveness,
+// the actor join against GitHub authors, and the install-rate number.
+
+use crate::Doc;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+/// Days of stream silence before a machine's tracker counts as gone quiet.
+pub const QUIET_DAYS_DEFAULT: u64 = 7;
+/// The activity window for the actor↔author join and the install rate.
+pub const GH_WINDOW_DAYS: i64 = 30;
+const DAY_MS: i64 = 86_400_000;
 
 /// Agent needles recognized inside an attribution line, mapped to the
 /// canonical label reported on the doc. Matching is line-anchored (see
@@ -59,6 +71,238 @@ pub fn detect_agent(text: &str, author: &str) -> Option<&'static str> {
     None
 }
 
+/// One tracked machine, merged across its `edge-<machine>-<source>` streams.
+#[derive(Default, Clone)]
+pub struct Machine {
+    pub machine: String,
+    /// Agent labels seen on the machine's envelopes ("claude", "codex", …).
+    pub sources: Vec<String>,
+    /// Distinct session_start actor stamps — who this machine's sessions
+    /// attribute to. Empty (pre-stamp streams) renders as unknown, never guessed.
+    pub actors: Vec<String>,
+    /// Newest envelope ts (RFC3339). File mtimes lie after a bucket pull;
+    /// liveness always comes from the events themselves.
+    pub last_ts: String,
+    /// tracker_version from the newest session_start ("" before stamping).
+    pub version: String,
+    /// Envelopes within the GH_WINDOW_DAYS window.
+    pub events: u64,
+    /// No envelope within the quiet window — the tracker rotted (autostart
+    /// broken, parser version gap), distinct from never-installed.
+    pub quiet: bool,
+}
+
+/// The fleet as the bucket sees it, joined against GitHub activity.
+#[derive(Default, Clone)]
+pub struct Roster {
+    /// Active first, then newest last_ts.
+    pub machines: Vec<Machine>,
+    /// Distinct actors on machines active within the GH window.
+    pub actors_tracked: Vec<String>,
+    /// Distinct GitHub authors active within the window.
+    pub gh_active: usize,
+    /// GitHub-active authors (lowercased) with no tracked actor.
+    pub untracked: Vec<String>,
+    /// Untracked authors whose work names an agent — definitely running
+    /// agents, definitely unwatched. (login, agent label).
+    pub untracked_attributed: Vec<(String, String)>,
+    /// tracked ∩ gh-active / gh-active, 0 when there is no GitHub activity.
+    pub install_rate_pct: u32,
+    /// The quiet threshold the fold used (config, default QUIET_DAYS_DEFAULT).
+    pub quiet_days: u64,
+}
+
+impl Roster {
+    pub fn active(&self) -> usize {
+        self.machines.iter().filter(|m| !m.quiet).count()
+    }
+}
+
+/// Per-stream accumulator; streams of one machine merge in `finish`.
+#[derive(Default)]
+struct StreamAcc {
+    last_ts: String,
+    sources: BTreeSet<String>,
+    actors: BTreeSet<String>,
+    ver_ts: String,
+    version: String,
+    events: u64,
+}
+
+impl StreamAcc {
+    fn merge(&mut self, o: StreamAcc) {
+        if o.last_ts > self.last_ts {
+            self.last_ts = o.last_ts;
+        }
+        self.sources.extend(o.sources);
+        self.actors.extend(o.actors);
+        if o.ver_ts >= self.ver_ts && !o.version.is_empty() {
+            self.ver_ts = o.ver_ts;
+            self.version = o.version;
+        }
+        self.events += o.events;
+    }
+}
+
+/// Folds raw envelope lines into the roster. Envelopes carry their stream
+/// name, so the fold never trusts directory layout; event_id dedup makes the
+/// count stable when overlapping trackers re-emit.
+pub(crate) struct Acc {
+    now_ms: i64,
+    win_cutoff: String,
+    streams: HashMap<String, StreamAcc>,
+    seen: HashSet<u64>,
+}
+
+impl Acc {
+    pub(crate) fn new(now_ms: i64) -> Self {
+        Self {
+            now_ms,
+            win_cutoff: rfc3339(now_ms - GH_WINDOW_DAYS * DAY_MS),
+            streams: HashMap::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn fold(&mut self, line: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        if !crate::event::first_sighting(&mut self.seen, v["event_id"].as_str().unwrap_or("")) {
+            return;
+        }
+        let stream = v["stream"].as_str().unwrap_or("");
+        if stream.is_empty() {
+            return;
+        }
+        let ts = v["ts"].as_str().unwrap_or("");
+        let e = self.streams.entry(stream.to_string()).or_default();
+        if ts > e.last_ts.as_str() {
+            e.last_ts = ts.to_string();
+        }
+        if ts >= self.win_cutoff.as_str() {
+            e.events += 1;
+        }
+        let source = v["source"].as_str().unwrap_or("");
+        if !source.is_empty() {
+            e.sources.insert(crate::units::agent_label(source).to_string());
+        }
+        if v["kind"].as_str() == Some("session_start") {
+            if let Some(a) = v["payload"]["actor"].as_str() {
+                if !a.is_empty() {
+                    e.actors.insert(a.to_string());
+                }
+            }
+            if let Some(ver) = v["payload"]["tracker_version"].as_str() {
+                if ts >= e.ver_ts.as_str() && !ver.is_empty() {
+                    e.ver_ts = ts.to_string();
+                    e.version = ver.to_string();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn finish(self, docs: &[Doc], quiet_days: u64) -> Roster {
+        let quiet_cutoff = rfc3339(self.now_ms - quiet_days as i64 * DAY_MS);
+        let win_cutoff = self.win_cutoff;
+
+        let mut merged: BTreeMap<String, StreamAcc> = BTreeMap::new();
+        for (stream, sa) in self.streams {
+            merged.entry(machine_of(&stream).0).or_default().merge(sa);
+        }
+        let mut machines: Vec<Machine> = merged
+            .into_iter()
+            .map(|(name, sa)| Machine {
+                quiet: sa.last_ts.as_str() < quiet_cutoff.as_str(),
+                machine: name,
+                sources: sa.sources.into_iter().collect(),
+                actors: sa.actors.into_iter().collect(),
+                last_ts: sa.last_ts,
+                version: sa.version,
+                events: sa.events,
+            })
+            .collect();
+        machines.sort_by(|a, b| a.quiet.cmp(&b.quiet).then(b.last_ts.cmp(&a.last_ts)));
+
+        let actors_tracked: BTreeSet<String> = machines
+            .iter()
+            .filter(|m| m.last_ts.as_str() >= win_cutoff.as_str())
+            .flat_map(|m| m.actors.iter().cloned())
+            .collect();
+        let tracked_lower: BTreeSet<String> = actors_tracked.iter().map(|a| a.to_lowercase()).collect();
+
+        // GitHub side of the join: distinct windowed authors, each carrying
+        // the first agent attribution seen on their work (if any).
+        let mut gh: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for d in docs {
+            if d.meta.source != "github" || d.meta.author.is_empty() || d.meta.ts.as_str() < win_cutoff.as_str() {
+                continue;
+            }
+            let e = gh.entry(d.meta.author.to_lowercase()).or_default();
+            if e.is_none() {
+                *e = d.meta.agent_attr.clone();
+            }
+        }
+        let gh_active = gh.len();
+        let on_both = gh.keys().filter(|a| tracked_lower.contains(*a)).count();
+        let untracked: Vec<String> =
+            gh.keys().filter(|a| !tracked_lower.contains(*a)).cloned().collect();
+        let untracked_attributed: Vec<(String, String)> = gh
+            .iter()
+            .filter_map(|(a, attr)| match (tracked_lower.contains(a), attr) {
+                (false, Some(l)) => Some((a.clone(), l.clone())),
+                _ => None,
+            })
+            .collect();
+        Roster {
+            machines,
+            actors_tracked: actors_tracked.into_iter().collect(),
+            gh_active,
+            untracked,
+            untracked_attributed,
+            install_rate_pct: if gh_active == 0 { 0 } else { (100 * on_both / gh_active) as u32 },
+            quiet_days,
+        }
+    }
+}
+
+/// The fleet roster: every edge stream under `local` (the bucket pull lands
+/// all machines' streams there) folded per machine, joined against the given
+/// docs' GitHub authors. One full corpus walk — call per load, never per
+/// frame.
+pub fn roster(docs: &[Doc], local: &std::path::Path) -> Roster {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut acc = Acc::new(now_ms);
+    for path in crate::units::jsonl_files(local) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                acc.fold(line);
+            }
+        }
+    }
+    let quiet_days = crate::config::load().fleet_quiet_days.unwrap_or(QUIET_DAYS_DEFAULT);
+    acc.finish(docs, quiet_days)
+}
+
+/// `edge-<machine>-<sourceid>` → (machine, sourceid). Streams that predate
+/// the grammar fold to machine "local".
+fn machine_of(stream: &str) -> (String, String) {
+    let Some(rest) = stream.strip_prefix("edge-") else {
+        return ("local".into(), stream.to_string());
+    };
+    match rest.rsplit_once('-') {
+        Some((m, src)) => (m.to_string(), src.to_string()),
+        None => (rest.to_string(), String::new()),
+    }
+}
+
+fn rfc3339(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +342,148 @@ mod tests {
         assert_eq!(detect_agent("the cursor jumps when scrolling the table", "alice"), None);
         assert_eq!(detect_agent("bump serde to 1.0.200", "dependabot[bot]"), None);
         assert_eq!(detect_agent("nightly corpus refresh", "github-actions[bot]"), None);
+    }
+
+    // ── roster fold ───────────────────────────────────────────────────────
+
+    /// A fixed "now" all roster tests share: 2026-06-13T00:00:00Z.
+    fn now_ms() -> i64 {
+        chrono::DateTime::parse_from_rfc3339("2026-06-13T00:00:00Z").unwrap().timestamp_millis()
+    }
+
+    /// One envelope line. `actor`/`ver` empty → omitted from the payload.
+    fn line(id: &str, stream: &str, ts: &str, kind: &str, source: &str, actor: &str, ver: &str) -> String {
+        let mut payload = serde_json::Map::new();
+        if !actor.is_empty() {
+            payload.insert("actor".into(), actor.into());
+        }
+        if !ver.is_empty() {
+            payload.insert("tracker_version".into(), ver.into());
+        }
+        serde_json::json!({
+            "event_id": id, "stream": stream, "ts": ts, "kind": kind,
+            "source": source, "payload": payload,
+        })
+        .to_string()
+    }
+
+    fn gh_doc(author: &str, ts: &str, attr: Option<&str>) -> Doc {
+        Doc {
+            id: 0,
+            text: String::new(),
+            meta: crate::Meta {
+                source: "github".into(),
+                kind: "pull_request".into(),
+                repo: "r".into(),
+                author: author.into(),
+                session_id: String::new(),
+                ts: ts.into(),
+                number: None,
+                url: None,
+                state: None,
+                labels: vec![],
+                agent_attr: attr.map(String::from),
+            },
+        }
+    }
+
+    // A machine that streamed yesterday is alive; one silent for 20 days has
+    // a rotted tracker. The quiet machine still appears — after the alive one.
+    #[test]
+    fn roster_separates_active_from_quiet_machines() {
+        let mut acc = Acc::new(now_ms());
+        acc.fold(&line("e1", "edge-mac-1-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", ""));
+        acc.fold(&line("e2", "edge-ci-7-codex", "2026-05-24T08:00:00Z", "user_prompt", "codex_cli", "", ""));
+        let r = acc.finish(&[], 7);
+        assert_eq!(r.machines.len(), 2);
+        assert_eq!(r.machines[0].machine, "mac-1");
+        assert!(!r.machines[0].quiet);
+        assert_eq!(r.machines[1].machine, "ci-7");
+        assert!(r.machines[1].quiet, "20 days of silence is a rotted tracker");
+        assert_eq!(r.active(), 1);
+    }
+
+    // One laptop runs two agents — two streams, one roster row.
+    #[test]
+    fn streams_of_one_machine_merge_sources() {
+        let mut acc = Acc::new(now_ms());
+        acc.fold(&line("e1", "edge-mac-1234-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", ""));
+        acc.fold(&line("e2", "edge-mac-1234-codex", "2026-06-11T08:00:00Z", "user_prompt", "codex_cli", "", ""));
+        let r = acc.finish(&[], 7);
+        assert_eq!(r.machines.len(), 1);
+        assert_eq!(r.machines[0].machine, "mac-1234");
+        assert_eq!(r.machines[0].sources, ["claude", "codex"]);
+        assert_eq!(r.machines[0].last_ts, "2026-06-12T08:00:00Z");
+        assert_eq!(r.machines[0].events, 2);
+    }
+
+    // Alice's machine streams; bob only shows up on GitHub: install rate 50%,
+    // bob on the untracked list.
+    #[test]
+    fn actor_join_yields_install_rate_and_untracked() {
+        let mut acc = Acc::new(now_ms());
+        acc.fold(&line("e1", "edge-m1-claudecode", "2026-06-12T08:00:00Z", "session_start", "claude_code", "Alice", ""));
+        let docs = vec![
+            gh_doc("alice", "2026-06-10T00:00:00Z", None),
+            gh_doc("bob", "2026-06-11T00:00:00Z", None),
+        ];
+        let r = acc.finish(&docs, 7);
+        assert_eq!(r.actors_tracked, ["Alice"]);
+        assert_eq!(r.gh_active, 2);
+        assert_eq!(r.install_rate_pct, 50, "the join is case-insensitive");
+        assert_eq!(r.untracked, ["bob"]);
+    }
+
+    // Bob's PR credits claude and no tracker has ever seen bob — the exact
+    // "runs agents, untracked" case the roster exists to name. Carol is just
+    // untracked, not attributed.
+    #[test]
+    fn untracked_author_with_agent_attribution_is_flagged() {
+        let acc = Acc::new(now_ms());
+        let docs = vec![
+            gh_doc("bob", "2026-06-11T00:00:00Z", Some("claude")),
+            gh_doc("carol", "2026-06-11T00:00:00Z", None),
+        ];
+        let r = acc.finish(&docs, 7);
+        assert_eq!(r.untracked_attributed, [("bob".to_string(), "claude".to_string())]);
+        assert_eq!(r.untracked, ["bob", "carol"]);
+    }
+
+    // An author whose last activity predates the window is not "active" —
+    // they neither lower the install rate nor land on the untracked list.
+    #[test]
+    fn old_github_activity_does_not_count_as_active() {
+        let acc = Acc::new(now_ms());
+        let r = acc.finish(&[gh_doc("zoe", "2026-05-04T00:00:00Z", None)], 7);
+        assert_eq!(r.gh_active, 0);
+        assert!(r.untracked.is_empty());
+        assert_eq!(r.install_rate_pct, 0);
+    }
+
+    // Overlapping trackers re-emit the same envelope; the event count must
+    // not double.
+    #[test]
+    fn roster_counts_duplicate_envelopes_once() {
+        let mut acc = Acc::new(now_ms());
+        let l = line("same-id", "edge-m1-claudecode", "2026-06-12T08:00:00Z", "user_prompt", "claude_code", "", "");
+        acc.fold(&l);
+        acc.fold(&l);
+        let r = acc.finish(&[], 7);
+        assert_eq!(r.machines[0].events, 1);
+    }
+
+    // After an upgrade the roster shows the version the machine runs NOW; a
+    // stream from before stamping shows none rather than a guess.
+    #[test]
+    fn tracker_version_newest_session_start_wins() {
+        let mut acc = Acc::new(now_ms());
+        acc.fold(&line("e1", "edge-m1-claudecode", "2026-06-01T08:00:00Z", "session_start", "claude_code", "a", "0.1.0"));
+        acc.fold(&line("e2", "edge-m1-claudecode", "2026-06-12T08:00:00Z", "session_start", "claude_code", "a", "0.2.0"));
+        acc.fold(&line("e3", "edge-old-claudecode", "2026-06-12T09:00:00Z", "session_start", "claude_code", "a", ""));
+        let r = acc.finish(&[], 7);
+        let m1 = r.machines.iter().find(|m| m.machine == "m1").unwrap();
+        let old = r.machines.iter().find(|m| m.machine == "old").unwrap();
+        assert_eq!(m1.version, "0.2.0");
+        assert_eq!(old.version, "");
     }
 }
