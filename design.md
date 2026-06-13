@@ -128,7 +128,10 @@ runs on CI or a server without a developer machine.
   actor stamps; `tracker_version` for upgrade lag) and joins it against the
   org's **members** active on GitHub in a trailing window — scoped to the team
   (`synty github` caches `membersWithRole`), not every external contributor who
-  opened one PR; CI/bot accounts filtered out. Everyone active and uncovered is
+  opened one PR. Membership is authoritative: when the member list is known it
+  is the sole filter, and `config.fleet_ignore` drops a service-account member
+  by data, not a name in code; the `is_bot` login heuristic is only the
+  no-member-list fallback. Everyone active and uncovered is
   listed (the install gap a lead acts on), with agent-attribution
   (Co-authored-by trailer, Generated-with footer, bot author — flagged at
   ingest as `agent_attr`, precision-first) shown as a per-author marker rather
