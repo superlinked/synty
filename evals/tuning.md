@@ -54,3 +54,28 @@ Two things the gate canNOT do, by design / by limitation:
   "Stablebridge Dashboard" scores 0.77, indistinguishable from good names at the
   same level ("Mobile Support Enhancements" 0.76). No faithfulness threshold
   separates it without collateral. Accepted as a rare 0.6B limitation.
+
+## Dropping name_grounded — eval-REJECTED (kept it)
+
+Tried removing the unigram `name_grounded` gate (the self-cal embedding gate as
+sole faithfulness authority) + selfcal default + regenerate. Measured:
+names_fallback 26→19 (recovered ~7 good paraphrases name_grounded wrongly
+rejected) — the intended win. But eyeballing the regenerated set showed a worse
+regression: mashed-token garbage that name_grounded had been catching now
+survived — `Deckslide`, `Berlinbuzzwordscluster`, `Ocradaptercluster`,
+`Tlsmodecluster` (was the excellent "Migrate Ingress from Ingress-Nginx to
+Kubernetes Gateway API"), `Lorarouting`, `Commercialintent`.
+
+Why the embedding gate can't replace it: a mashed token like "lorarouting"
+embeds ON-theme (near the LoRA cluster), so name_score is high → not rejected.
+name_grounded rejects it because the mashed token equals no cluster c-TF-IDF
+*term*. That unigram check is doing real structural work (catching word
+concatenations) that no faithfulness threshold can, and replacing it with a
+"mashed-token detector" would be a worse, dictionary-needing heuristic.
+
+Decision: KEEP name_grounded. The self-cal gate stays as the default semantic
+backstop (validated 0 false positives), but clean_name + name_grounded remain
+the primary gates. The 26-topic fallback rate is acceptable — those fallbacks
+are good summary headings, not soup (names_kw_last_resort=0). This is the eval
+doing its job: it caught a regression that the proxy metrics (fallback down,
+dupes 0) alone would have green-lit.

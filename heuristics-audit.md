@@ -55,7 +55,7 @@ generalizing from a label; that habit is the actual fix for "unsystematic."
 | # | Problem (current heuristics) | Robust, simple replacement | Net | Status |
 |---|---|---|---|---|
 | 0.1 | **Bot/agent identity.** `is_bot` substring `"bot"` + hardcoded CI set; `BOT_AUTHORS`/`AGENT_MARKS` tables; `is_bot` runs even when org membership (authoritative) is known and can override it (`fleet.rs`). | Org membership authoritative when known (`is_bot` doesn't run on that path → no override); `is_bot` is the *members-unknown fallback only*. Service-account members (`slrelease`) → a user-owned `config.fleet_ignore` list, **not** a name in code. `__typename` (User vs Bot) noted as the no-members-path hardening. | −override bug | **done** (membership-authoritative + `fleet_ignore`; `__typename` deferred) |
-| 0.2 | **Topic-name gate stack.** Four stacked gates (`clean_name` shape, `name_grounded` unigram overlap, `repo_ban`, embedding gate) with no single authority; the unigram gate rejects good paraphrases; the proposed hyphen-count "mush" tweak is arbitrary. | The slug problem (`SIE-Server`) → one *structural* rule: a single mashed token with ≥2 word-parts is an identifier → reject to the summary fallback (not a hyphen count). Collapsing the gate stack onto the embedding gate (drop `name_grounded`) needs a name-quality eval first. | slug→summary | **partial** (structural slug rule done, `name_dupes` 2→0; `name_grounded` removal deferred — needs a name-quality eval, and it regressed once already) |
+| 0.2 | **Topic-name gate stack.** Four stacked gates (`clean_name` shape, `name_grounded` unigram overlap, `repo_ban`, embedding gate) with no single authority; the unigram gate rejects good paraphrases; the proposed hyphen-count "mush" tweak is arbitrary. | Built the missing **name-quality eval** (`synty eval --names`) — the keystone. Slug problem → one structural rule (mashed token → summary fallback): done, `name_dupes`→0. Made the **embedding gate self-calibrating** (each name vs its cluster's own coherence) and the default backstop. Tried dropping `name_grounded` — the eval **rejected it** (recovered 7 paraphrases but regressed via mashed-token garbage the embedding gate can't catch), so it stays. | eval + self-cal gate; `name_grounded` verified to earn its keep | **done** (eval built, slug rule + self-cal gate shipped; `name_grounded` kept — see `evals/tuning.md`) |
 | 0.3 | **`DUP=0.95`** near-duplicate cutoff — looked like an absolute, encoder-calibrated magnitude (`topics.rs:36`). | **Resolved on inspection: it's already a portable cosine cutoff, leave it.** pylate-rs L2-normalizes every token embedding, and `dup_groups` divides each direction's MaxSim by token count, so the symmetrized score is a *mean-best-match cosine* in [-1,1] — 0.95 means "tokens align at ≥0.95 cosine", near-identity on any normalized encoder, not a magnitude. Documented in `evals/tuning.md`. Revisit only if a non-ColBERT/coarser encoder lands. | no change | **done (leave + documented)** — another "verify before generalizing" win |
 
 `RES_SCALE=2.5` (Louvain, `topics.rs:32`) is the scariest single constant —
@@ -86,8 +86,10 @@ a modularity/coherence curve rather than a fixed multiplier. Tracked, not P0.
 
 ## Sequencing
 
-- 0.1 and 0.2 are independent, self-contained, and each delete code — best first,
-  and 0.2 closes out the topic-naming churn that prompted this.
+- 0.1 deleted code (the is_bot/membership override bug); 0.2 built the name-quality
+  eval and a self-calibrating gate, and — guided by that eval — KEPT `name_grounded`
+  (dropping it regressed via mashed-token garbage). Both closed out the churn that
+  prompted this, the second by measuring rather than guessing.
 - 0.3 turned out to need no change (L2-normalized → DUP is a cosine cutoff); the
   general lesson stands — for a real core-threshold change, gate behind the cluster eval so a
   threshold change is measured, not eyeballed (AGENTS.md metrics rule).

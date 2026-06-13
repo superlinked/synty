@@ -112,6 +112,15 @@ error-handling PRs and "Update Dependencies" on synty sessions, after generation
 - **Guardrail:** the fallback share stays bounded (not over-rejecting good
   names) — `names_fallback` tracks it (`names_kw_last_resort` the keyword-soup
   tail), `name_faithful_pct` the gate's pass share.
+- **Self-calibrating gate (`synty eval --names`):** the run-relative median
+  floor is a near no-op (a whole run of mediocre names floats the median), so
+  the embedding gate now judges each name against its OWN cluster's coherence —
+  reject below `max(ABS_FLOOR=0.5, 0.85 × p10(member leave-one-out coherences))`
+  — sound because vectors are L2-normalized (name_score is a bounded cosine).
+  The name eval (`evals/`) made this measurable and verified, on the live
+  corpus, that the unigram pre-check still earns its keep: dropping it recovered
+  a few paraphrases but regressed via mashed-token garbage ("Lorarouting") that
+  embeds on-theme, so no faithfulness threshold catches it. Kept.
 
 ### I3 — Ground the naming prompt · medium · shipped
 Addresses root cause #1 at the source, complementing I2's after-the-fact gate.

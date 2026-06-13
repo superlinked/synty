@@ -503,7 +503,7 @@ struct Job {
 /// s5: centrality-ordered examples + the embedding-faithfulness gate; isolates
 /// these names from machines still generating ungated s4 ones.
 const TOPIC_PROMPT_VERSION: &str = "t8";
-const TOPIC_NAME_VERSION: &str = "s9";
+const TOPIC_NAME_VERSION: &str = "s11";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -782,8 +782,14 @@ fn load_members(store: &crate::store::EmbStore, hashes: &[u64]) -> Result<Vec<Ar
     Ok(mem)
 }
 
+/// The self-calibrating gate is the default semantic backstop (each name judged
+/// against its own cluster's coherence); the old run-relative median floor — a
+/// near no-op — stays reachable as `SYNTY_NAME_GATE=median` for one release.
+/// This is a backstop AFTER clean_name + name_grounded, which the name eval
+/// showed still earn their keep (name_grounded catches mashed-token garbage the
+/// embedding gate can't — a mashed token embeds on-theme; see evals/tuning.md).
 fn selfcal_gate() -> bool {
-    std::env::var("SYNTY_NAME_GATE").as_deref() == Ok("selfcal")
+    std::env::var("SYNTY_NAME_GATE").as_deref() != Ok("median")
 }
 
 /// I2's embedding-faithfulness gate, over every valid LLM topic name — the
