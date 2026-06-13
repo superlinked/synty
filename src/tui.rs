@@ -435,9 +435,20 @@ impl App {
         while !self.quit {
             term.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(150))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
-                        self.on_key(k.code);
+                // Drain the whole input burst before the next redraw. Holding
+                // an arrow then scrolls at the terminal's key-repeat rate
+                // instead of once per (full) redraw — the old one-key-per-frame
+                // loop capped scrolling at the draw rate. `Repeat` events (the
+                // kitty keyboard protocol emits them for held keys) count like
+                // presses; only `Release` is ignored.
+                loop {
+                    if let Event::Key(k) = event::read()? {
+                        if k.kind != KeyEventKind::Release {
+                            self.on_key(k.code);
+                        }
+                    }
+                    if self.quit || !event::poll(Duration::from_millis(0))? {
+                        break;
                     }
                 }
             }
@@ -708,6 +719,9 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
+            // Fast jump for long lists; g/G still go all the way.
+            KeyCode::PageDown => self.move_sel(10),
+            KeyCode::PageUp => self.move_sel(-10),
             KeyCode::Char('g') => self.sel = 0,
             KeyCode::Char('G') => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -2170,6 +2184,24 @@ mod tests {
         assert!(matches!(a.view, View::Stats));
         a.on_key(KeyCode::Char('5'));
         assert!(matches!(a.view, View::Status));
+    }
+
+    // PageDown/PageUp jump by a page (clamped to the list); the arrows still
+    // step one row. (Responsiveness when holding an arrow is the run-loop's
+    // input-drain + Repeat handling, which a TestBackend can't exercise.)
+    #[test]
+    fn page_keys_jump_and_clamp() {
+        let mut a = app2();
+        a.view = View::Work;
+        let last = a.list_len() - 1;
+        assert!(last >= 1, "fixture needs a multi-row list");
+        a.sel = 0;
+        a.on_key(KeyCode::PageDown);
+        assert_eq!(a.sel, last, "PageDown jumps to the end of a short list (clamped)");
+        a.on_key(KeyCode::PageUp);
+        assert_eq!(a.sel, 0, "PageUp jumps back, clamped at the top");
+        a.on_key(KeyCode::Down);
+        assert_eq!(a.sel, 1, "a single arrow still steps one row");
     }
 
     // The topics list shows a per-day activity strip with week dividers.
