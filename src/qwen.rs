@@ -165,9 +165,16 @@ Key terms: {kw}\nItems:\n{items}Description: {summary}<|im_end|>\n<|im_start|>as
 /// vocabulary, and containing at least one letter (a bare issue number like
 /// "955" is cluster-unique by accident, not a topic term). Shared by the term
 /// scorer and the idf map so the two tokenizations cannot drift.
+///
+/// Hyphens are kept INSIDE a token, so a compound like "ad-hoc" or "sie-sdk"
+/// stays whole instead of fragmenting into a sub-word ("hoc") that then ranks
+/// as a distinctive term and gets handed to the naming prompt (the source of
+/// the bogus topic name "Hoc"). Compounds are also more distinctive c-TF-IDF
+/// terms than their fragments.
 fn content_words(s: &str) -> std::collections::HashSet<String> {
     s.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .map(|w| w.trim_matches('-'))
         .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w) && w.chars().any(|c| c.is_alphabetic()))
         .map(str::to_string)
         .collect()
@@ -506,7 +513,7 @@ struct Job {
 /// s5: centrality-ordered examples + the embedding-faithfulness gate; isolates
 /// these names from machines still generating ungated s4 ones.
 const TOPIC_PROMPT_VERSION: &str = "t8";
-const TOPIC_NAME_VERSION: &str = "s12";
+const TOPIC_NAME_VERSION: &str = "s13";
 
 /// Unit jobs: one per session and per PR/issue.
 fn unit_jobs() -> Result<Vec<Job>> {
@@ -997,19 +1004,29 @@ pub(crate) fn is_slug(name: &str) -> bool {
 /// the caller then drops to the keyword label.
 fn summary_heading(summary: &str) -> String {
     let clause = summary.trim().split(|c| matches!(c, ',' | ';' | ':' | '.')).next().unwrap_or("").trim();
-    let mut words: Vec<&str> = clause.split_whitespace().take(8).collect();
-    // Capping mid-clause can leave a dangling function word ("…Tracking
-    // Through", "…Exhaustion By"); trim any trailing preposition/conjunction/
-    // copula so the heading ends on a content word. (Content-word truncations
-    // like "…a Self-Contained" can't be detected here — that's the cap's edge.)
+    // Use the WHOLE first clause when it's heading-length; only a long clause is
+    // word-capped. The old hard 8-word cap chopped 9-10 word clauses mid-thought
+    // ("…SIE-SDK to Use", "…for Efficient Model") — completing the clause reads
+    // far better than a dangling fragment.
+    let mut words: Vec<&str> = clause.split_whitespace().collect();
+    if words.len() > 10 {
+        words.truncate(10);
+    }
+    // Trim a trailing preposition/conjunction/copula/quantifier so the heading
+    // ends on a content word (a mid-clause word-cap, or a clause that genuinely
+    // trails off). A content-word truncation ("…a Self-Contained") can't be
+    // caught here — that's the cap's residual edge.
     const TRAIL: &[&str] = &[
         "and", "or", "the", "a", "an", "to", "of", "for", "with", "in", "on", "at", "by", "via",
         "from", "into", "through", "then", "that", "which", "was", "were", "is", "are", "as", "using",
+        "more", "etc",
     ];
     while words.last().map(|w| TRAIL.contains(&w.to_lowercase().as_str())).unwrap_or(false) {
         words.pop();
     }
-    if words.len() < 2 {
+    // A coherent heading, not a run-on: 2-10 content-ish words. Outside that, the
+    // caller drops to the keyword label.
+    if !(2..=10).contains(&words.len()) {
         return String::new();
     }
     title_case(&words.join(" "))
@@ -1226,6 +1243,18 @@ mod tests {
         assert!(!cluster_terms(&nums, 12, &idf2).contains(&"955".to_string()));
     }
 
+    // A hyphenated compound stays one term — it must NOT fragment into a
+    // sub-word ("ad-hoc" → "hoc") that ranks as distinctive and seeds a bogus
+    // name like "Hoc".
+    #[test]
+    fn content_words_keep_hyphenated_compounds() {
+        let w = content_words("Auditing ad-hoc heuristics in the SIE-SDK");
+        assert!(w.contains("ad-hoc"), "compound kept whole: {w:?}");
+        assert!(!w.contains("hoc"), "no sub-word fragment: {w:?}");
+        assert!(w.contains("sie-sdk"), "{w:?}");
+        assert!(w.contains("heuristics"));
+    }
+
     // A name that fails the gate or cleans to nothing yields the extractive
     // keyword title when there's no usable summary — never an empty name.
     #[test]
@@ -1276,10 +1305,17 @@ mod tests {
             summary_heading("Updating Terraform configurations, migrating infrastructure to SIE."),
             "Updating Terraform Configurations"
         );
-        // Caps at 8 words and won't end on a dangling "and"/"to".
+        // The whole clause is kept (no longer a hard 8-word chop), and a trailing
+        // "and more" is trimmed so it ends on a content word.
         assert_eq!(
             summary_heading("Refactoring the adapter registry to support pluggable backends and more"),
             "Refactoring the Adapter Registry to Support Pluggable Backends"
+        );
+        // A 9-10 word clause now completes instead of cutting mid-thought
+        // ("…to Use" was the bug — the clause's last words survive).
+        assert_eq!(
+            summary_heading("Updating the SIE-Server and SIE-SDK to use the new API"),
+            "Updating the SIE-Server and SIE-SDK to Use the New API"
         );
         assert_eq!(summary_heading("Misc."), "", "too thin to title");
     }
