@@ -877,6 +877,109 @@ fn embed_gate_names(tjobs: &[Job], cache: &mut units::SummaryCache, bucket: &str
     Ok((scores.len(), rejects.len()))
 }
 
+/// One topic's row in the name-quality eval (`synty eval --names`): the data
+/// to eyeball/rate, plus the self-cal verdict. `rating` is human-filled.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub(crate) struct NameRow {
+    pub key: String,
+    pub name: String,
+    pub summary: String,
+    pub members: Vec<String>,
+    pub gate_terms: Vec<String>,
+    pub name_score: f32,
+    pub coh_p10: f32,
+    pub member_n: usize,
+    pub scored: bool,
+    pub is_fallback: bool,
+    pub would_reject: bool,
+    #[serde(default)]
+    pub rating: Option<String>,
+}
+
+/// Score every topic's cached name against its cluster's members — the
+/// read-only data behind `synty eval --names`. Mirrors `embed_gate_names`'
+/// loading and scoring exactly (shared `score_name`), so the report reflects
+/// what the gate would do.
+pub(crate) fn eval_names(bucket: &str) -> Result<Vec<NameRow>> {
+    let model = crate::model_id();
+    let store = crate::store::EmbStore::open(bucket, &model)?;
+    let member_hashes = units::topic_member_embed_hashes()?;
+    let cache = units::load_summary_cache();
+    let jobs = topic_jobs()?;
+
+    // Member summaries (for the eyeball dump), by stable cache key.
+    let mut member_sums: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for t in units::topic_units(12)? {
+        let sums: Vec<String> =
+            t.units.iter().filter(|u| !u.dup).filter_map(|u| u.summary.clone()).take(6).collect();
+        member_sums.insert(t.cache_key, sums);
+    }
+
+    // Candidate names (cached LLM names + fallbacks), embedded store-first with
+    // a single batched encode for any misses (same as the gate).
+    let cands: Vec<(&Job, String, bool)> = jobs
+        .iter()
+        .filter(|j| j.short)
+        .filter_map(|j| {
+            let c = cache.get(&j.key)?;
+            (!c.summary.is_empty()).then(|| (j, c.summary.clone(), c.summary == fallback_name(j)))
+        })
+        .collect();
+    let mut embs: Vec<Option<Array2<f32>>> = Vec::with_capacity(cands.len());
+    for (_, name, _) in &cands {
+        embs.push(store.get(crate::index::fnv1a(name.as_bytes()))?);
+    }
+    let miss: Vec<usize> = (0..cands.len()).filter(|&i| embs[i].is_none()).collect();
+    if !miss.is_empty() {
+        let mut enc = crate::encode::Encoder::load(&model)?;
+        let texts: Vec<String> = miss.iter().map(|&i| cands[i].1.clone()).collect();
+        for (&i, e) in miss.iter().zip(enc.encode_docs(&texts)?) {
+            store.put(crate::index::fnv1a(cands[i].1.as_bytes()), &e)?;
+            embs[i] = Some(e);
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (i, (j, name, is_fallback)) in cands.iter().enumerate() {
+        let stable = j.key.strip_prefix("topicname:").unwrap_or(&j.key).to_string();
+        let mem = member_hashes.get(&stable).map(|h| load_members(&store, h)).transpose()?.unwrap_or_default();
+        let (ns, p10, scored, would) = match (&embs[i], mem.is_empty()) {
+            (Some(e), false) => {
+                let v = score_name(e, &mem);
+                (v.name_score, v.coh_p10, true, v.reject)
+            }
+            _ => (0.0, 0.0, false, false),
+        };
+        rows.push(NameRow {
+            members: member_sums.get(&stable).cloned().unwrap_or_default(),
+            key: stable,
+            name: name.clone(),
+            summary: j.summary.clone().unwrap_or_default(),
+            gate_terms: j.gate.clone().unwrap_or_default(),
+            name_score: ns,
+            coh_p10: p10,
+            member_n: mem.len(),
+            scored,
+            is_fallback: *is_fallback,
+            would_reject: would,
+            rating: None,
+        });
+    }
+    Ok(rows)
+}
+
+/// Would this name be rejected at the given BETA (for the eval's sensitivity
+/// sweep)? Mirrors `score_name`'s floor with a variable BETA.
+pub(crate) fn rejects_at(name_score: f32, coh_p10: f32, members: usize, beta: f32) -> bool {
+    let floor = if members < MIN_MEMBERS_FOR_COH { ABS_FLOOR } else { ABS_FLOOR.max(beta * coh_p10) };
+    name_score < floor
+}
+
+/// Public for the name eval's slug-count aggregate.
+pub(crate) fn is_slug(name: &str) -> bool {
+    looks_like_slug(name)
+}
+
 /// A short heading distilled from a topic's one-line summary: the lead clause,
 /// title-cased. The fallback for a rejected name — the 0.6B writes a coherent
 /// summary even when its compressed-to-a-title attempt drifts or echoes a slug,

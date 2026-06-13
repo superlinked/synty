@@ -26,3 +26,31 @@ calibrated to one encoder. Per the normalization above it's a mean-best-match
 cosine on average" = near-identical text, portable to any normalized ColBERT.
 No change. Revisit only if a non-ColBERT or much coarser encoder lands (which
 could compress the cosine range enough to over-collapse).
+
+## Name gate: self-calibrating verdict — BETA=0.85, P=10, ABS_FLOOR=0.5
+
+`synty eval --names` on the live corpus (77 topics, 51 scored LLM names, 26
+fallbacks). name_score_med 0.82, coh_p10_med 0.80, ratio_med 1.016 — names are
+~as faithful as their cluster's least-aligned member. Sensitivity sweep:
+rej@0.7 = rej@0.8 = rej@0.9 = 0. The gate rejects nothing on the current set,
+i.e. **zero false positives on good names** — it's a lenient safety net, not an
+active filter, which is what we want now that the names are already clean.
+
+Chosen ABS_FLOOR=0.5 (a name averaging <0.5 cosine to its best member matches
+is off-theme on any normalized encoder), BETA=0.85 × p10, MIN_MEMBERS_FOR_COH=5
+(below that, ABS_FLOOR alone). Validated:
+- No good name is rejected (sweep above + eyeball of the 25 lowest-score names
+  in evals/names.md — all on-theme).
+- It still CATCHES off-theme: a name at 0.6 cosine on a cluster with coh_p10 0.8
+  → floor 0.68 → rejected; an orthogonal/hallucinated-token name → below
+  ABS_FLOOR → rejected (unit tests `score_name_*`).
+
+Two things the gate canNOT do, by design / by limitation:
+- It is NOT what rejects most bad names today — `name_grounded` (unigram
+  overlap) is, and it OVER-rejects: 34% fallback rate. Dropping name_grounded
+  (next) lets faithful paraphrases survive while the gate still catches the
+  genuinely off-theme (those have low cosine).
+- It can't catch an invented proper noun when the rest of the name is on-theme:
+  "Stablebridge Dashboard" scores 0.77, indistinguishable from good names at the
+  same level ("Mobile Support Enhancements" 0.76). No faithfulness threshold
+  separates it without collateral. Accepted as a rare 0.6B limitation.

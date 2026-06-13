@@ -265,8 +265,16 @@ enum Cmd {
         #[arg(long)]
         sample: Option<usize>,
     },
-    /// Run the probe query set and write evals/runs.md
-    Eval,
+    /// Run the probe query set and write evals/runs.md (retrieval). With
+    /// --names, score topic names against their clusters → evals/names.{json,md}
+    Eval {
+        /// Score topic-name faithfulness instead of retrieval (the name eval)
+        #[arg(long)]
+        names: bool,
+        /// Embedding store bucket (name eval; default: config, then .synty)
+        #[arg(long)]
+        bucket: Option<String>,
+    },
     /// Native tracker: parse local agent session files into canonical envelopes
     Track {
         /// Source to track: claudecode | codex | cowork | all
@@ -472,7 +480,13 @@ fn main() -> Result<()> {
                 summarize::run(sessions, topics)?;
             }
         }
-        Cmd::Eval => eval::run(&model_id())?,
+        Cmd::Eval { names, bucket } => {
+            if names {
+                eval::run_names(&config::resolve_bucket(bucket))?;
+            } else {
+                eval::run(&model_id())?;
+            }
+        }
         Cmd::Track { source, out, max_age_days, machine, watch, poll, install, cursors, bucket } => {
             track::run(track::Opts {
                 which: source,
