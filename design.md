@@ -212,6 +212,9 @@ builds/<build>.<rev>.json              manifest: filename → blob, per (build, 
 current.json                           the pointer, PUT last — readers never see
                                         a torn build; rev versions the clusters
 lease/build                            soft TTL lease electing one index builder
+bin/<version>/synty-<os>-<arch>        the binary itself: immutable, per-platform
+bin/latest.json                        release pointer (version + per-platform
+                                        sha256) — `publish` writes, `upgrade` reads
 ```
 
 A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
@@ -227,6 +230,17 @@ immutable-prefix + pointer-swap. The local layout mirrors this:
 incremental appends clone the previous build (CoW), so a reader's live mmap is
 never mutated under it. `synty up` loops locally; `synty build` is the
 one-shot fleet-aware build.
+
+The **binary distributes the same way**, because the bucket is the only shared
+infrastructure: `synty publish` uploads an immutable per-platform artifact under
+`bin/<version>/` and swaps the `bin/latest.json` pointer; `synty upgrade` reads
+the pointer through the same `Bucket` client, downloads its platform's build,
+verifies the sha256, and replaces the running binary in place. Each machine gets
+the fastest build for its platform (metal on Apple Silicon, CPU on Linux, each
+with runtime fallback) without choosing. Only the install bootstrap needs an
+HTTP-reachable `bin/` prefix (there's no synty yet to speak to the bucket);
+steady-state upgrades reuse the bucket client, and a passive nag (`status`,
+footer, `up`) flags when a machine is behind.
 
 ## Data compatibility
 

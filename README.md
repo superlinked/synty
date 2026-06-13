@@ -190,3 +190,40 @@ for f in tokenizer.json config.json config_sentence_transformers.json \
 done
 export SYNTY_MODEL="$PWD/models/mxbai"
 ```
+
+## Releasing & upgrades
+
+The binary ships through the **same bucket** as everything else — synty's only
+shared infrastructure. Artifacts are immutable and per-platform under
+`bin/<version>/synty-<os>-<arch>`, behind a `bin/latest.json` pointer (the same
+immutable-object + atomic-pointer shape the index uses). Each machine pulls the
+one build for its platform — **metal on Apple Silicon, plain CPU on Linux**,
+each with a runtime fallback — so nobody picks a build.
+
+**Cut a release** — build per platform with the cloud backend(s) your team's
+bucket needs, then run the freshly built binary to publish itself:
+
+```sh
+# on an Apple Silicon Mac
+cargo build --release --features metal,s3,gcs
+./target/release/synty publish --bucket gs://my-team        # → bin/<version>/synty-darwin-arm64
+
+# on a Linux x64 box
+cargo build --release --features s3,gcs
+./target/release/synty publish --bucket gs://my-team        # → bin/<version>/synty-linux-x64
+```
+
+`publish` uploads the artifact and merges it into `bin/latest.json` (same version
+accumulates platforms; a new version starts a fresh set). The version is the
+binary's own `CARGO_PKG_VERSION`, so it always matches the bytes.
+
+**Upgrade** — once a newer build is published, `synty status`, the TUI footer
+(`⬆ <v>`), and `synty up` show a nag; the actual swap stays explicit:
+
+```sh
+synty upgrade        # download this platform's build, verify sha256, replace in place, restart the tracker
+```
+
+`upgrade` uses synty's own bucket client (no URL needed — that's only the
+install bootstrap). It's a no-op when you're current and refuses on a checksum
+mismatch. `synty --version` reports the running build.
