@@ -27,13 +27,59 @@ fn manifest_key(build: &str, rev: u64) -> String {
     format!("builds/{build}.{rev}.json")
 }
 
+/// One `[metrics sync] phase=… objects=… bytes=…` line, emitted only when a
+/// transfer actually moved bytes — so an idle poll (the common case) stays
+/// quiet. The bytes figure is what tells a team whether sync is practical on
+/// their link; redirect stderr (`2>> sync.log`) to keep a history.
+fn sync_metric(phase: &str, objects: usize, bytes: u64) {
+    if objects == 0 && bytes == 0 {
+        return;
+    }
+    crate::metrics::Run::new("sync").set("phase", phase).set("objects", objects).set("bytes", bytes).emit();
+}
+
+/// Per-build copy of the bucket manifest (filename → blob), written into the
+/// build dir so a later `pull_if_stale` can map a wanted blob to a local file
+/// and reuse it by hardlink instead of re-downloading. Skipped by `publish`.
+const LOCAL_MANIFEST: &str = ".blobs.json";
+
+fn write_local_manifest(dir: &Path, files: &BTreeMap<String, String>) {
+    if let Ok(raw) = serde_json::to_vec(files) {
+        let _ = std::fs::write(dir.join(LOCAL_MANIFEST), raw);
+    }
+}
+
+/// {blob → a local file that already holds it}, gathered from the `.blobs.json`
+/// of every build dir on disk — so the unchanged bulk of a new build (the
+/// 500 MB residual segments) is hardlinked in, not pulled over the wire.
+fn local_blob_index() -> BTreeMap<String, std::path::PathBuf> {
+    local_blob_index_in(&Path::new("index").join("builds"))
+}
+
+fn local_blob_index_in(builds_root: &Path) -> BTreeMap<String, std::path::PathBuf> {
+    let mut map = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(builds_root) else { return map };
+    for e in entries.filter_map(|e| e.ok()) {
+        let dir = e.path();
+        let Ok(raw) = std::fs::read(dir.join(LOCAL_MANIFEST)) else { continue };
+        let Ok(files) = serde_json::from_slice::<BTreeMap<String, String>>(&raw) else { continue };
+        for (name, blob) in files {
+            let p = dir.join(&name);
+            if p.exists() {
+                map.entry(blob).or_insert(p);
+            }
+        }
+    }
+    map
+}
+
 /// Upload this device's event files to the bucket under `events/`, skipping any
 /// whose bucket copy is already the same size (append-only files only grow).
 /// With many trackers pointed at one bucket, each device's events converge here
 /// under its own stream path, ready for a single build to process them all.
 pub fn push_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
     let b = bucket::open(bucket_uri)?;
-    let mut n = 0;
+    let (mut n, mut bytes_up) = (0, 0u64);
     for entry in walkdir::WalkDir::new(local_dir).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl")
@@ -47,8 +93,10 @@ pub fn push_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
             continue;
         }
         b.put(&key, &bytes)?;
+        bytes_up += bytes.len() as u64;
         n += 1;
     }
+    sync_metric("events_up", n, bytes_up);
     Ok(n)
 }
 
@@ -57,7 +105,7 @@ pub fn push_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
 /// device's sessions, not just the local machine's.
 pub fn pull_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
     let b = bucket::open(bucket_uri)?;
-    let mut n = 0;
+    let (mut n, mut bytes_down) = (0, 0u64);
     for key in b.list(EVENTS)? {
         let rel = key.strip_prefix(&format!("{EVENTS}/")).unwrap_or(&key);
         let dest = Path::new(local_dir).join(rel);
@@ -69,9 +117,11 @@ pub fn pull_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p)?;
         }
+        bytes_down += bytes.len() as u64;
         std::fs::write(&dest, bytes)?;
         n += 1;
     }
+    sync_metric("events_down", n, bytes_down);
     Ok(n)
 }
 
@@ -172,7 +222,7 @@ pub fn publish(bucket_uri: &str) -> Result<usize> {
         return Ok(0);
     }
 
-    let mut n = 0;
+    let (mut n, mut bytes_up) = (0, 0u64);
     let mkey = manifest_key(&cur.build, cur.rev);
     if !b.exists(&mkey)? {
         // The manifest covers exactly the files this (build, rev) needs: the
@@ -184,22 +234,27 @@ pub fn publish(bucket_uri: &str) -> Result<usize> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("unit_clusters.") && name != cluster_name {
-                continue; // other revs' clusters
+            if name == LOCAL_MANIFEST || (name.starts_with("unit_clusters.") && name != cluster_name) {
+                continue; // the local blob index, and other revs' clusters
             }
             let bytes = std::fs::read(entry.path())?;
             let blob = format!("{:016x}", crate::index::fnv1a(&bytes));
             let bkey = format!("blobs/{blob}");
             if !b.exists(&bkey)? {
                 b.put(&bkey, &bytes)?;
+                bytes_up += bytes.len() as u64;
                 n += 1;
             }
             files.insert(name, blob);
         }
+        // Persist the name→blob map locally too, so a later `pull_if_stale` can
+        // reuse these blobs by hardlink instead of re-downloading them.
+        write_local_manifest(&cur.dir(), &files);
         b.put(&mkey, &serde_json::to_vec(&BuildManifest { files })?)?;
         n += 1;
     }
     b.put(POINTER_KEY, &serde_json::to_vec(&cur)?)?;
+    sync_metric("publish_up", n + 1, bytes_up);
     Ok(n + 1)
 }
 
@@ -232,20 +287,40 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
     let manifest: BuildManifest = serde_json::from_slice(&raw)?;
     let dir = readmodel::build_dir(&remote.build);
     std::fs::create_dir_all(&dir)?;
+    let have = local_blob_index();
+    let (mut fetched, mut reused, mut bytes_down) = (0usize, 0usize, 0u64);
     for (name, blob) in &manifest.files {
         let dest = dir.join(name);
         if dest.exists() {
             continue; // build files are immutable; present = complete (atomic writes)
         }
+        // Reuse a blob already on disk — the unchanged bulk of an incremental
+        // build — by hardlink (instant, no network, shared storage), copy as a
+        // cross-filesystem fallback; only genuinely-new blobs cross the wire.
+        if let Some(src) = have.get(blob) {
+            if std::fs::hard_link(src, &dest).is_ok() || std::fs::copy(src, &dest).is_ok() {
+                reused += 1;
+                continue;
+            }
+        }
         let bytes = b.get(&format!("blobs/{blob}"))?.ok_or_else(|| anyhow!("missing blob {blob} for {name}"))?;
+        bytes_down += bytes.len() as u64;
+        fetched += 1;
         crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
     }
     // Verify before repointing — a bad pull must never become current.
     next_plaid::MmapIndex::load(&dir.to_string_lossy())
         .map_err(|e| anyhow!("pulled build does not load: {e}"))?;
+    write_local_manifest(&dir, &manifest.files); // so the next pull can reuse these blobs
     let keep: Vec<String> = local.iter().map(|c| c.build.clone()).collect();
     readmodel::repoint(&remote.build, remote.rev)?;
     readmodel::gc(&keep);
+    crate::metrics::Run::new("sync")
+        .set("phase", "pull_down")
+        .set("blobs_fetched", fetched)
+        .set("blobs_reused", reused)
+        .set("bytes", bytes_down)
+        .emit();
     Ok(true)
 }
 
@@ -296,6 +371,46 @@ mod tests {
         pull_github(bu, b.to_str().unwrap()).unwrap();
         assert_eq!(std::fs::read(b.join("prs-web.json")).unwrap(), b"[\"web2\"]");
         assert!(!b.join("prs-api.json").exists(), "dropped repo removed on pull");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The delta-pull's reuse source: every build dir's .blobs.json contributes
+    // its files to a {blob → on-disk path} map, so an unchanged blob (the same
+    // hash across builds) is found locally and never re-downloaded.
+    #[test]
+    fn local_blob_index_maps_blobs_to_on_disk_files() {
+        let root = std::env::temp_dir().join(format!("synty-blobidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Build A: residuals (blob h1) + metadata (blob h2).
+        let a = root.join("buildA");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("residuals.npy"), b"big-vectors").unwrap();
+        std::fs::write(a.join("metadata.db"), b"meta-1").unwrap();
+        let files_a = BTreeMap::from([
+            ("residuals.npy".to_string(), "h1".to_string()),
+            ("metadata.db".to_string(), "h2".to_string()),
+        ]);
+        write_local_manifest(&a, &files_a);
+        // Build B reused the residuals (h1) and changed metadata (h3) — but B's
+        // dir need not exist for the index; A alone provides h1's location.
+        let idx = local_blob_index_in(&root);
+        assert_eq!(idx.get("h1"), Some(&a.join("residuals.npy")), "unchanged residual found locally");
+        assert_eq!(idx.get("h2"), Some(&a.join("metadata.db")));
+        assert_eq!(idx.get("h3"), None, "a never-seen blob is not on disk → must be fetched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A blob whose backing file was deleted (gc) must not be offered for reuse,
+    // or the pull would hardlink a phantom.
+    #[test]
+    fn local_blob_index_skips_missing_files() {
+        let root = std::env::temp_dir().join(format!("synty-blobidx2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = root.join("buildA");
+        std::fs::create_dir_all(&a).unwrap();
+        // Manifest claims a file that isn't actually on disk.
+        write_local_manifest(&a, &BTreeMap::from([("gone.npy".to_string(), "h9".to_string())]));
+        assert_eq!(local_blob_index_in(&root).get("h9"), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
