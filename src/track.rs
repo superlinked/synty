@@ -117,10 +117,11 @@ impl Tracker {
         let mut streams = Vec::new();
         for src in sources(&o.which)? {
             let name = format!("edge-{}-{}", machine, src.id());
-            let out = Path::new(&o.out).join(&name).join("track.jsonl");
-            if let Some(p) = out.parent() {
-                std::fs::create_dir_all(p)?;
-            }
+            // The stream is a DIR of per-day files (track.<YYYY-MM-DD>.jsonl);
+            // only the active day grows, so push_events re-uploads a day's events,
+            // not the whole append-only history (M9).
+            let out = Path::new(&o.out).join(&name);
+            std::fs::create_dir_all(&out)?;
             // Seed offsets from saved cursors so a restart resumes mid-file.
             let mut files = HashMap::new();
             let roots = default_roots(src.id(), &home);
@@ -332,7 +333,11 @@ impl Stream {
         if events.is_empty() {
             return Ok(());
         }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.out)?;
+        // Per-day file in the stream dir — the active day's file is the only one
+        // that grows (and re-uploads); prior days are final and sync once.
+        std::fs::create_dir_all(&self.out)?;
+        let path = self.out.join(format!("track.{}.jsonl", day_stamp(unix_ms(SystemTime::now()))));
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         let mut body = String::new();
         for e in events {
             body.push_str(&serde_json::to_string(e).map_err(|e| anyhow!("encode: {e}"))?);
@@ -485,6 +490,14 @@ fn loader(kind: &str, path: &str, on: bool) {
     }
 }
 
+/// UTC day (YYYY-MM-DD) for the per-day output file. Pure (takes the timestamp)
+/// so rotation is tested without a clock.
+fn day_stamp(unix_ms: i64) -> String {
+    chrono::DateTime::from_timestamp(unix_ms / 1000, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "0000-00-00".into())
+}
+
 /// Whether the GitHub sub-cadence is due: never-run (None) fires immediately,
 /// otherwise once `every` has elapsed since the last run. Pure so the cadence is
 /// tested without a clock or the network.
@@ -562,6 +575,28 @@ mod tests {
         assert!(github_due(Some(Duration::from_secs(3601)), every), "past the interval → fire");
     }
 
+    // The per-day output filename is the UTC date of the event-write time, so
+    // events bucket into track.<day>.jsonl and only today's file re-uploads.
+    #[test]
+    fn day_stamp_is_the_utc_date() {
+        assert_eq!(day_stamp(0), "1970-01-01");
+        assert_eq!(day_stamp(1_749_859_200_000), "2025-06-14"); // a fixed 2025-06-14 UTC ms
+    }
+
+    // Concatenate a stream dir's per-day files — the tracker now writes
+    // track.<day>.jsonl, so a test reads the dir, not a fixed filename.
+    fn read_stream(dir: &std::path::Path) -> String {
+        let mut s = String::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.filter_map(|e| e.ok()) {
+                if e.path().extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    s.push_str(&std::fs::read_to_string(e.path()).unwrap_or_default());
+                }
+            }
+        }
+        s
+    }
+
     // Two trackers seeing the same session must synthesize session_end under
     // the SAME deterministic id (minted from the last event ts, not file mtime
     // or batch order), so readers dedup the re-emission.
@@ -590,11 +625,11 @@ mod tests {
             };
             st.drain(0, &HashMap::new()).unwrap();
             st.flush_ends(i64::MAX - 1, true).unwrap();
-            let body = std::fs::read_to_string(dir.join(out)).unwrap();
+            let body = read_stream(&dir.join(out));
             let line = body.lines().find(|l| l.contains("session_end")).expect("session_end emitted");
             serde_json::from_str::<Event>(line).unwrap().event_id
         };
-        let (a, b) = (end_id("a.jsonl"), end_id("b.jsonl"));
+        let (a, b) = (end_id("a"), end_id("b"));
         assert_eq!(a, b, "session_end must mint the same id from the same last-event ts");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -617,7 +652,7 @@ mod tests {
             src: Box::new(ClaudeCode),
             roots: vec![root.to_string_lossy().into_owned()],
             name: "edge-t-claudecode".into(),
-            out: dir.join("out.jsonl"),
+            out: dir.join("outdir"),
             seq: Sequencer::new(),
             started,
             files: HashMap::new(),
@@ -643,7 +678,7 @@ mod tests {
         let mut s2 = stream(started);
         s2.drain(0, &cursors).unwrap();
 
-        let out = std::fs::read_to_string(dir.join("out.jsonl")).unwrap();
+        let out = read_stream(&dir.join("outdir"));
         let starts = out.lines().filter(|l| l.contains("\"session_start\"")).count();
         assert_eq!(starts, 1, "restart must not re-emit session_start:\n{out}");
         assert!(out.contains("second prompt"));
@@ -665,7 +700,7 @@ mod tests {
             src: Box::new(ClaudeCode),
             roots: vec![root.to_string_lossy().into_owned()],
             name: "edge-t-claudecode".into(),
-            out: dir.join("out.jsonl"),
+            out: dir.join("outdir"),
             seq: Sequencer::new(),
             started: HashSet::new(),
             files: HashMap::new(),
@@ -676,7 +711,7 @@ mod tests {
         };
         st.drain(0, &HashMap::new()).unwrap();
 
-        let out = std::fs::read_to_string(dir.join("out.jsonl")).unwrap();
+        let out = read_stream(&dir.join("outdir"));
         let line = out.lines().find(|l| l.contains("\"session_start\"")).expect("session_start emitted");
         let e: Event = serde_json::from_str(line).unwrap();
         assert_eq!(e.payload["actor"], "tester", "actor stamp must survive alongside the version");
