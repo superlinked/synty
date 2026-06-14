@@ -57,5 +57,20 @@ from the CLI and MCP.
 - Agent interface parity: `stats`, `tool <name>`, `show <unit|session>`, topic members on CLI and MCP; stable ids inline in Markdown; `--json` on every read command behind a versioned envelope.
 - Tracker binary version stamped into `session_start` (upgrade-rate monitoring); `init` pins GitHub-login so actors join to GitHub authors.
 
+## M9 — Fleet sync efficiency
+The fleet model is right (track-everywhere, build-once-share, write-once
+encode), but the *transfer* layer is unbalanced. Reconstructed for an active
+team (5 machines × 3 agents, fast GitHub pace): encode is deduped fleet-wide
+and `publish` is delta (~tens of MB), but on a ~1.1 GB index every new build is
+a **full ~1 GB pull per viewer** (`pull_if_stale` materializes a fresh build dir
+and never reuses locally-present blobs), and the append-only `track.jsonl`
+streams **re-upload whole on every append**. Net ~16 GB/hr of redundant
+read-model downloads fleet-wide — fine on a LAN, untenable on poor internet.
+- Delta pull (biggest win): a local content-addressed blob store; `pull_if_stale` hardlinks/reuses blobs it already has (from the prior build or the cache) and downloads only the changed ones — a pointer move drops from ~1 GB to ~tens of MB.
+- Debounce publishes: the index builder coalesces (publish on ≥N new docs or ≥T elapsed, not every freshen); a viewer can index its own un-indexed events locally for immediate freshness without forcing a fleet publish.
+- Event upload as delta: rotate `track.jsonl` (per day/session) or append-range upload, so only the small active file re-uploads, not the whole growing stream.
+- GitHub on the tracker: call the existing throttled `refresh_github` (pull-first, `github::stale` throttle, incremental floor, delta push, token-gated) from `track --watch` on a sub-cadence, so PR/issue freshness stops waiting on a viewer; the staleness throttle auto-coordinates multiple tokened machines (no new lease).
+- Measure it: a `[metrics sync]` block (bytes up/down, blobs reused vs fetched) so each change is verified against transfer volume, not eyeballed.
+
 ## Future work (after the milestones)
 - ~~MCP server exposing agent tools over stdio~~ — done (`synty mcp` serves the CLI's read surface as tools).
