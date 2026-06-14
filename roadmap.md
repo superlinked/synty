@@ -57,7 +57,7 @@ from the CLI and MCP.
 - Agent interface parity: `stats`, `tool <name>`, `show <unit|session>`, topic members on CLI and MCP; stable ids inline in Markdown; `--json` on every read command behind a versioned envelope.
 - Tracker binary version stamped into `session_start` (upgrade-rate monitoring); `init` pins GitHub-login so actors join to GitHub authors.
 
-## M9 — Fleet sync efficiency
+## M9 — Fleet sync efficiency · delta pull + event/github/metrics done; debounce deferred
 The fleet model is right (track-everywhere, build-once-share, write-once
 encode), but the *transfer* layer is unbalanced. Reconstructed for an active
 team (5 machines × 3 agents, fast GitHub pace): encode is deduped fleet-wide
@@ -66,11 +66,11 @@ a **full ~1 GB pull per viewer** (`pull_if_stale` materializes a fresh build dir
 and never reuses locally-present blobs), and the append-only `track.jsonl`
 streams **re-upload whole on every append**. Net ~16 GB/hr of redundant
 read-model downloads fleet-wide — fine on a LAN, untenable on poor internet.
-- Delta pull (biggest win): a local content-addressed blob store; `pull_if_stale` hardlinks/reuses blobs it already has (from the prior build or the cache) and downloads only the changed ones — a pointer move drops from ~1 GB to ~tens of MB.
-- Debounce publishes: the index builder coalesces (publish on ≥N new docs or ≥T elapsed, not every freshen); a viewer can index its own un-indexed events locally for immediate freshness without forcing a fleet publish.
-- Event upload as delta: rotate `track.jsonl` (per day/session) or append-range upload, so only the small active file re-uploads, not the whole growing stream.
-- GitHub on the tracker: call the existing throttled `refresh_github` (pull-first, `github::stale` throttle, incremental floor, delta push, token-gated) from `track --watch` on a sub-cadence, so PR/issue freshness stops waiting on a viewer; the staleness throttle auto-coordinates multiple tokened machines (no new lease).
-- Measure it: a `[metrics sync]` block (bytes up/down, blobs reused vs fetched) so each change is verified against transfer volume, not eyeballed.
+- Delta pull (done, the big win): `pull_if_stale` persists each build's name→blob map locally (`.blobs.json`), hardlink-reuses on-disk blobs, and downloads only changed ones — measured a new build sharing all blobs at 0 bytes (was 1.2 GB).
+- Event upload as delta (done): the tracker writes per-day files (`track.<YYYY-MM-DD>.jsonl`), so only the active day's file re-uploads, not the whole growing stream.
+- GitHub on the tracker (done): `refresh_github` (pull-first, `github::stale`-throttled, incremental, delta-pushed, token-gated) now runs from `track --watch` on a sub-cadence, so PR/issue freshness stops waiting on a viewer; the throttle auto-coordinates tokened machines (no new lease).
+- `[metrics sync]` (done): every transfer self-emits objects/bytes (+ blobs_reused/fetched on pull), so sync cost is measured, not eyeballed.
+- Debounce publishes (DEFERRED): delta pull already removed the dominant cost, and debouncing has a real interaction — an unpublished local build would be reverted by the next `pull_if_stale` of the older remote pointer, since builds aren't time-ordered. Needs `published_ms`-ordered pulls (pull only when the remote is genuinely newer) before gating publish frequency; land it as its own change.
 
 ## Future work (after the milestones)
 - ~~MCP server exposing agent tools over stdio~~ — done (`synty mcp` serves the CLI's read surface as tools).
