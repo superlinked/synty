@@ -171,6 +171,12 @@ impl Tracker {
             self.streams.len(),
             IDLE_MS / 60000
         );
+        // GitHub runs on a slow sub-cadence of the session poll: the tracker is
+        // model-free, so refreshing the org's PRs/issues here means freshness
+        // no longer waits on someone opening a viewer. `refresh_github` itself
+        // is throttled + token-gated, so untokened machines just pull.
+        let gh_every = Duration::from_secs(crate::up::GITHUB_STALE_MIN.max(1) as u64 * 60);
+        let mut gh_last: Option<std::time::Instant> = None;
         loop {
             let n = self.drain()?;
             let now = unix_ms(SystemTime::now());
@@ -183,6 +189,12 @@ impl Tracker {
                     eprintln!("track: +{n} events, {ended} ended, {pushed} files pushed, {skipped} malformed lines skipped (total)");
                 } else {
                     eprintln!("track: +{n} events, {ended} ended, {pushed} files pushed");
+                }
+            }
+            if let Some(bucket) = self.bucket.clone() {
+                if github_due(gh_last.map(|t| t.elapsed()), gh_every) {
+                    crate::up::refresh_github(&bucket);
+                    gh_last = Some(std::time::Instant::now());
                 }
             }
             std::thread::sleep(Duration::from_secs(poll_secs));
@@ -473,6 +485,13 @@ fn loader(kind: &str, path: &str, on: bool) {
     }
 }
 
+/// Whether the GitHub sub-cadence is due: never-run (None) fires immediately,
+/// otherwise once `every` has elapsed since the last run. Pure so the cadence is
+/// tested without a clock or the network.
+fn github_due(elapsed_since_last: Option<Duration>, every: Duration) -> bool {
+    elapsed_since_last.map(|e| e >= every).unwrap_or(true)
+}
+
 /// Write the autostart unit file for `kind` (no output) — runs `synty track
 /// --watch` at login, from a stable home, pushing to the configured fleet
 /// bucket when one is set.
@@ -531,6 +550,17 @@ fn install(kind: &str, o: &Opts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The tracker scrapes GitHub on a slow sub-cadence: immediately on first
+    // pass, then only once the interval has elapsed (so the 30s session poll
+    // doesn't hammer the API or re-pull the corpus every tick).
+    #[test]
+    fn github_cadence_fires_first_then_after_interval() {
+        let every = Duration::from_secs(3600);
+        assert!(github_due(None, every), "never-run → fire now");
+        assert!(!github_due(Some(Duration::from_secs(30)), every), "30s in → not yet");
+        assert!(github_due(Some(Duration::from_secs(3601)), every), "past the interval → fire");
+    }
 
     // Two trackers seeing the same session must synthesize session_end under
     // the SAME deterministic id (minted from the last event ts, not file mtime

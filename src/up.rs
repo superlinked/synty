@@ -111,14 +111,15 @@ pub fn build(bucket: &str, machine: &str, resolution: f64, no_track: bool) -> Re
 }
 
 /// Stale GitHub corpus older than this triggers a refresh during a build.
-const GITHUB_STALE_MIN: i64 = 60;
+pub(crate) const GITHUB_STALE_MIN: i64 = 60;
 
 /// The fleet's GitHub corpus: pull the bucket's copy, and when it's stale and
 /// this machine has an org + token, refresh it incrementally and push — one
 /// tokened machine keeps everyone's PRs/issues fresh; the rest just pull. This
 /// is also what stops a token-less builder from publishing a read-model with
-/// the org's GitHub docs missing.
-fn refresh_github(bucket: &str) {
+/// the org's GitHub docs missing. Called from a build, and (M9) from the
+/// login-time tracker on a slow sub-cadence so freshness doesn't wait on a viewer.
+pub(crate) fn refresh_github(bucket: &str) {
     let dir = format!("{CORPUS_DIR}/github");
     match crate::sync::pull_github(bucket, &dir) {
         Ok(n) if n > 0 => eprintln!("github: pulled {n} corpus files from {bucket}"),
