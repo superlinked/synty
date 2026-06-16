@@ -181,6 +181,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The backend contract the read-model + lease rely on: overwrite, size,
+    // delete-missing, and that half-written `.part` temp files never read as
+    // real objects (a killed writer must not corrupt a `list`).
+    #[test]
+    fn local_fs_backend_contract() {
+        let dir = std::env::temp_dir().join(format!("synty-bucket-contract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let b = LocalFs::new(&dir);
+
+        // put overwrites; size tracks the latest bytes.
+        b.put("k", b"v1").unwrap();
+        assert_eq!(b.size("k").unwrap(), Some(2));
+        b.put("k", b"v-longer").unwrap();
+        assert_eq!(b.get("k").unwrap().as_deref(), Some(&b"v-longer"[..]), "put overwrites");
+        assert_eq!(b.size("k").unwrap(), Some(8), "size reflects the overwrite");
+        assert_eq!(b.size("absent").unwrap(), None);
+
+        // delete is idempotent; a missing key is not an error.
+        b.delete("k").unwrap();
+        assert!(!b.exists("k").unwrap());
+        b.delete("k").unwrap();
+
+        // put_if_absent creates once, then refuses.
+        assert!(b.put_if_absent("once", b"a").unwrap());
+        assert!(!b.put_if_absent("once", b"b").unwrap(), "second creation refused");
+        assert_eq!(b.get("once").unwrap().as_deref(), Some(&b"a"[..]), "first writer's bytes win");
+
+        // A leftover `.part` temp file is invisible to list (and get).
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        std::fs::write(dir.join("blobs/real"), b"x").unwrap();
+        std::fs::write(dir.join("blobs/real.part.123-0"), b"half").unwrap();
+        assert_eq!(b.list("blobs").unwrap(), vec!["blobs/real"], "part files never read as objects");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn uri_scheme_picks_backend() {
         assert!(open("/tmp/x").is_ok());
