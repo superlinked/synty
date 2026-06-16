@@ -52,10 +52,6 @@ fn write_local_manifest(dir: &Path, files: &BTreeMap<String, String>) {
 /// {blob → a local file that already holds it}, gathered from the `.blobs.json`
 /// of every build dir on disk — so the unchanged bulk of a new build (the
 /// 500 MB residual segments) is hardlinked in, not pulled over the wire.
-fn local_blob_index() -> BTreeMap<String, std::path::PathBuf> {
-    local_blob_index_in(&Path::new("index").join("builds"))
-}
-
 fn local_blob_index_in(builds_root: &Path) -> BTreeMap<String, std::path::PathBuf> {
     let mut map = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(builds_root) else { return map };
@@ -71,6 +67,39 @@ fn local_blob_index_in(builds_root: &Path) -> BTreeMap<String, std::path::PathBu
         }
     }
     map
+}
+
+/// Materialize a build's files into `dir`: hardlink-reuse blobs already on disk
+/// (the unchanged bulk of an incremental build, found among sibling build dirs),
+/// fetch only the rest from the bucket, and record the name→blob map locally so
+/// the next pull can reuse these too. Returns (reused, fetched, bytes_down).
+/// The blob-transfer core of `pull_if_stale`, factored out so the delta logic is
+/// testable without a pointer, an index to verify, or a chdir.
+fn fetch_build(b: &dyn bucket::Bucket, dir: &Path, files: &BTreeMap<String, String>) -> Result<(usize, usize, u64)> {
+    std::fs::create_dir_all(dir)?;
+    let have = local_blob_index_in(dir.parent().unwrap_or(dir));
+    let (mut reused, mut fetched, mut bytes_down) = (0usize, 0usize, 0u64);
+    for (name, blob) in files {
+        let dest = dir.join(name);
+        if dest.exists() {
+            continue; // build files are immutable; present = complete (atomic writes)
+        }
+        // Reuse a blob already on disk — the unchanged bulk of an incremental
+        // build — by hardlink (instant, no network, shared storage), copy as a
+        // cross-filesystem fallback; only genuinely-new blobs cross the wire.
+        if let Some(src) = have.get(blob) {
+            if std::fs::hard_link(src, &dest).is_ok() || std::fs::copy(src, &dest).is_ok() {
+                reused += 1;
+                continue;
+            }
+        }
+        let bytes = b.get(&format!("blobs/{blob}"))?.ok_or_else(|| anyhow!("missing blob {blob} for {name}"))?;
+        bytes_down += bytes.len() as u64;
+        fetched += 1;
+        crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
+    }
+    write_local_manifest(dir, files); // so the next pull can reuse these blobs
+    Ok((reused, fetched, bytes_down))
 }
 
 /// Upload this device's event files to the bucket under `events/`, skipping any
@@ -286,32 +315,12 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
         .ok_or_else(|| anyhow!("bucket pointer names a missing manifest (publish in flight?)"))?;
     let manifest: BuildManifest = serde_json::from_slice(&raw)?;
     let dir = readmodel::build_dir(&remote.build);
-    std::fs::create_dir_all(&dir)?;
-    let have = local_blob_index();
-    let (mut fetched, mut reused, mut bytes_down) = (0usize, 0usize, 0u64);
-    for (name, blob) in &manifest.files {
-        let dest = dir.join(name);
-        if dest.exists() {
-            continue; // build files are immutable; present = complete (atomic writes)
-        }
-        // Reuse a blob already on disk — the unchanged bulk of an incremental
-        // build — by hardlink (instant, no network, shared storage), copy as a
-        // cross-filesystem fallback; only genuinely-new blobs cross the wire.
-        if let Some(src) = have.get(blob) {
-            if std::fs::hard_link(src, &dest).is_ok() || std::fs::copy(src, &dest).is_ok() {
-                reused += 1;
-                continue;
-            }
-        }
-        let bytes = b.get(&format!("blobs/{blob}"))?.ok_or_else(|| anyhow!("missing blob {blob} for {name}"))?;
-        bytes_down += bytes.len() as u64;
-        fetched += 1;
-        crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
-    }
+    // Transfer the build — hardlink-reuse on-disk blobs, fetch only the changed
+    // ones (and record the local manifest for the next pull).
+    let (reused, fetched, bytes_down) = fetch_build(&*b, &dir, &manifest.files)?;
     // Verify before repointing — a bad pull must never become current.
     next_plaid::MmapIndex::load(&dir.to_string_lossy())
         .map_err(|e| anyhow!("pulled build does not load: {e}"))?;
-    write_local_manifest(&dir, &manifest.files); // so the next pull can reuse these blobs
     let keep: Vec<String> = local.iter().map(|c| c.build.clone()).collect();
     readmodel::repoint(&remote.build, remote.rev)?;
     readmodel::gc(&keep);
@@ -327,6 +336,7 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::Bucket; // trait methods (put/get) on LocalFs in tests
 
     // The GitHub corpus travels through the bucket by manifest: a scraping
     // machine pushes changed files; a token-less machine pulls them (and drops
@@ -411,6 +421,46 @@ mod tests {
         // Manifest claims a file that isn't actually on disk.
         write_local_manifest(&a, &BTreeMap::from([("gone.npy".to_string(), "h9".to_string())]));
         assert_eq!(local_blob_index_in(&root).get("h9"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Scenario: a teammate's incremental update propagates as a DELTA. A new
+    // machine joins cold (fetches the whole build), then a second build that
+    // shares the heavy residual blob and changes only metadata reuses the
+    // unchanged blob by hardlink and pulls only the changed one over the wire.
+    #[test]
+    fn fetch_build_cold_then_delta_reuses_unchanged_blobs() {
+        let root = std::env::temp_dir().join(format!("synty-fetchbuild-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let b = crate::bucket::LocalFs::new(root.join("bucket"));
+        let builds = root.join("builds");
+        // Content-addressed blobs in the bucket (keyed by fnv1a, like publish).
+        let put = |bytes: &[u8]| -> String {
+            let h = format!("{:016x}", crate::index::fnv1a(bytes));
+            b.put(&format!("blobs/{h}"), bytes).unwrap();
+            h
+        };
+        let residual = put(b"the-heavy-residual-vectors"); // unchanged across builds
+        let meta_v1 = put(b"metadata-v1");
+
+        // Cold join: build A, nothing on disk → fetch everything.
+        let files_a =
+            BTreeMap::from([("residuals.npy".into(), residual.clone()), ("metadata.db".into(), meta_v1)]);
+        let (reused, fetched, _) = fetch_build(&b, &builds.join("buildA"), &files_a).unwrap();
+        assert_eq!((reused, fetched), (0, 2), "cold join fetches the whole build");
+        assert!(builds.join("buildA").join(LOCAL_MANIFEST).exists(), "records blobs for the next pull");
+
+        // Delta: build B keeps the residual, changes only the metadata.
+        let meta_v2 = put(b"metadata-v2-after-an-incremental-build");
+        let files_b = BTreeMap::from([
+            ("residuals.npy".into(), residual),
+            ("metadata.db".into(), meta_v2),
+        ]);
+        let (reused, fetched, bytes) = fetch_build(&b, &builds.join("buildB"), &files_b).unwrap();
+        assert_eq!((reused, fetched), (1, 1), "the heavy blob is reused; only the changed one is fetched");
+        assert_eq!(bytes, b"metadata-v2-after-an-incremental-build".len() as u64, "only the delta crossed the wire");
+        // And the reused file is byte-identical (hardlinked from build A).
+        assert_eq!(std::fs::read(builds.join("buildB").join("residuals.npy")).unwrap(), b"the-heavy-residual-vectors");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
