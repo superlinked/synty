@@ -119,7 +119,9 @@ other. Three roles, one binary:
   pointer swap.
 
 The configured bucket is the default everywhere; `--bucket` overrides. Cloud
-buckets need `--features s3` / `gcs`.
+buckets need `--features s3` / `gcs`. To exercise the whole sync path locally
+(no cloud account): `scripts/fleet-smoke.sh` runs publish → cold pull → delta
+pull against a temp local-dir bucket and checks the `[metrics sync]` numbers.
 
 > **Caveat:** every fleet member has raw bucket access and can read everyone's
 > sessions. Fine for high-trust teams; the mediated-frontend tier (publication

@@ -23,7 +23,10 @@ Rust binary.
 ## Build / test / run
 
 - `cargo test` runs the scenario suite. It is pure: no model, corpus, or
-  network needed.
+  network needed — including the fleet/bucket integration scenarios (multi-writer
+  convergence, delta read-model pull, lease, bucket contract), which use temp
+  local-dir buckets. The model-heavy end-to-end fleet check lives in
+  `scripts/fleet-smoke.sh` (run on demand; needs a prior local build).
 - `cargo build --release` is the shipped build: plain CPU, portable,
   dependency-light. Keep it that way.
 - On Apple Silicon, develop with `cargo build --release --features metal` (GPU
