@@ -718,4 +718,66 @@ mod tests {
         assert_eq!(e.payload["tracker_version"], env!("CARGO_PKG_VERSION"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // Scenario: two teammates each run an agent on their own machine, tracking
+    // to one shared bucket; whoever builds sees BOTH machines' sessions. This is
+    // the core fleet promise (track everywhere, build once), exercised
+    // end-to-end through the real tailer → push_events → ingest path.
+    #[test]
+    fn two_machines_converge_through_one_bucket() {
+        let root = std::env::temp_dir().join(format!("synty-fleet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bucket = root.join("bucket");
+        let bu = bucket.to_str().unwrap();
+
+        // A synthetic Claude session per machine — distinct work.
+        let session = |sessions: &std::path::Path, sid: &str, prompt: &str| {
+            std::fs::create_dir_all(sessions).unwrap();
+            let line = format!(
+                r#"{{"type":"user","sessionId":"{sid}","version":"2.1.30","timestamp":"2026-05-31T20:00:00Z","message":{{"content":"{prompt}"}}}}"#
+            );
+            std::fs::write(sessions.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
+        };
+        session(&root.join("mA/sessions"), "SESSA", "machine A refactored the auth flow");
+        session(&root.join("mB/sessions"), "SESSB", "machine B fixed the rate limiter");
+
+        // Each machine tails its own sessions into its own corpus/local, then
+        // pushes raw events to the shared bucket.
+        let track_one = |machine: &str, sessions: &std::path::Path, local: &std::path::Path| {
+            let mut st = Stream {
+                src: Box::new(ClaudeCode),
+                roots: vec![sessions.to_string_lossy().into_owned()],
+                name: format!("edge-{machine}-claudecode"),
+                out: local.join(format!("edge-{machine}-claudecode")),
+                seq: Sequencer::new(),
+                started: HashSet::new(),
+                files: HashMap::new(),
+                open: HashMap::new(),
+                n_sessions: 0,
+                n_skipped: 0,
+                actor: machine.into(),
+            };
+            st.drain(0, &HashMap::new()).unwrap();
+            st.flush_ends(i64::MAX - 1, true).unwrap(); // close the session so it becomes a unit
+        };
+        track_one("mA", &root.join("mA/sessions"), &root.join("mA/local"));
+        track_one("mB", &root.join("mB/sessions"), &root.join("mB/local"));
+        assert!(crate::sync::push_events(bu, root.join("mA/local").to_str().unwrap()).unwrap() > 0);
+        assert!(crate::sync::push_events(bu, root.join("mB/local").to_str().unwrap()).unwrap() > 0);
+
+        // A third machine builds: ingest pulls every device's events from the
+        // bucket and turns them into docs — so the build sees both teammates.
+        let docs = root.join("docs.jsonl");
+        let builder = root.join("builder");
+        crate::ingest::run(builder.to_str().unwrap(), docs.to_str().unwrap(), Some(bu)).unwrap();
+        let text = std::fs::read_to_string(&docs).unwrap();
+        assert!(text.contains("SESSA") && text.contains("SESSB"), "build sees both machines' sessions");
+        assert!(text.contains("auth flow") && text.contains("rate limiter"), "both machines' work is present");
+
+        // Re-running the build is idempotent — events skip by size, same docs.
+        let before = std::fs::read_to_string(&docs).unwrap().len();
+        crate::ingest::run(builder.to_str().unwrap(), docs.to_str().unwrap(), Some(bu)).unwrap();
+        assert_eq!(std::fs::read_to_string(&docs).unwrap().len(), before, "re-build is stable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
