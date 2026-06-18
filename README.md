@@ -11,6 +11,9 @@ not even the summaries, which a small model writes locally. Retrieval is
 late-interaction embeddings (ColBERT) plus deterministic logic — no LLM in the
 loop. For a tool that ingests your dev transcripts, that privacy *is* the point.
 
+**See it in action →** animated walkthroughs of onboarding, the TUI, and the
+agent CLI live in [`docs/demos.md`](docs/demos.md).
+
 ## Install
 
 One paste from nothing to "tracking + a viewer". The bucket is optional — omit
@@ -86,6 +89,20 @@ synty topic                    # emergent topics (or `topic auth` to filter)
 synty status                   # health: what's indexed, freshness, activation, the fleet roster
 synty stats                    # usage: tokens/tools/sessions vs LOC/PRs/issues per week
 synty show a1b2c3d4            # drill into a session, PR/issue (repo#123), or topic key
+```
+
+Each result is a ranked Markdown card — PRs/issues and session moments together
+(illustrative output):
+
+```text
+## rate limiting middleware
+
+1. [24.3] **pull_request api#1487** — Add a token-bucket limiter to the gateway
+   merged · https://github.com/acme/api/pull/1487
+2. [21.8] _user_prompt · api · a3f1c2d9_
+   how do we share the per-tenant limiter's state across pods? settled on Redis…
+3. [19.0] **issue api#1502** — 429s under burst load on the search endpoint
+   open · https://github.com/acme/api/issues/1502
 ```
 
 Output is built to be drilled: `search`, `related`, `recent`, and `topic` print
