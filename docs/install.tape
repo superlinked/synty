@@ -20,6 +20,6 @@ Type "# start local (no bucket) to see what's in there:"  Enter
 Type "synty status | head -3"  Enter
 Sleep 2800ms
 Type "# ready to join the team — point at the bucket, and you're activated:"  Enter
-Type "printf '{\"bucket\":\"gs://acme-synty\"}' > $SYNTY_HOME/.synty/config.json"  Enter
+Type `printf '{"bucket":"gs://acme-synty"}' > $SYNTY_HOME/.synty/config.json`  Enter
 Type "synty status | head -3"  Enter
 Sleep 3s

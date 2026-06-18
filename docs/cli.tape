@@ -13,10 +13,10 @@ Set Padding 16
 Type "# prior work related to what I'm doing right now — no query:"  Enter
 Sleep 1200ms
 Type "synty related"  Enter
-Sleep 4s
+Sleep 8s
 
 Type "synty search 'rate limiting middleware' --filter kind=pull_request"  Enter
-Sleep 4s
+Sleep 8s
 
 Type "synty status"  Enter
-Sleep 4s
+Sleep 8s
