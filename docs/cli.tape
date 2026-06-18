@@ -10,8 +10,6 @@ Set Width 1240
 Set Height 820
 Set Padding 16
 
-Type "# prior work related to what I'm doing right now — no query:"  Enter
-Sleep 1200ms
 Type "synty related"  Enter
 Sleep 8s
 
