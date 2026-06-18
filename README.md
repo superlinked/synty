@@ -11,8 +11,23 @@ not even the summaries, which a small model writes locally. Retrieval is
 late-interaction embeddings (ColBERT) plus deterministic logic — no LLM in the
 loop. For a tool that ingests your dev transcripts, that privacy *is* the point.
 
-**See it in action →** animated walkthroughs of onboarding, the TUI, and the
-agent CLI live in [`docs/demos.md`](docs/demos.md).
+## See it in action
+
+Browse your work memory in the terminal UI — topics, drill-down, search, stats,
+the fleet roster:
+
+![synty's TUI: topics, drill-down, search, stats, status](docs/tui.gif)
+
+One command from nothing to tracking + a viewer — a local trial, then join the
+team (`◐ local` → `✓ on the team`):
+
+![synty init onboarding: local trial, then join the team](docs/install.gif)
+
+The agent surface — `related` / `search` / `status` printing Markdown to stdout:
+
+![synty CLI: related, search, status](docs/cli.gif)
+
+<sub>Rendered from [`docs/*.tape`](docs/demos.md) with [vhs](https://github.com/charmbracelet/vhs); re-render when the UI changes.</sub>
 
 ## Install
 
