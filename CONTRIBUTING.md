@@ -38,6 +38,24 @@ and PR ids, dates) over adjectives. When you change a command, flag, default, or
 metric, grep `README.md` / `docs/design.md` / `AGENTS.md` and reconcile them in the
 same commit; stale docs drift one sentence at a time.
 
+## Releasing
+
+Binaries ship as GitHub Release assets, built by CI. Cut a release by bumping
+the `Cargo.toml` version and pushing a matching tag; `.github/workflows/release.yml`
+runs the test suite, builds each platform, and attaches `synty-<os>-<arch>`
+(plus a `.sha256`) to the release:
+
+```sh
+# bump the Cargo.toml version, commit, then:
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The matrix builds `macos-14` (`--features metal,s3,gcs`, Apple Silicon) and
+`ubuntu-latest` (`--features s3,gcs`, Linux x64); the `s3`/`gcs` features read
+the team's data bucket and are independent of where the binary ships. Add rows
+for more platforms (Intel Mac `macos-13`, `ubuntu-24.04-arm`) as needed. Users
+then update with `synty upgrade`, which reads the same release.
+
 ## Writing style
 
 Prose in this repo (README, design docs, this file) avoids the usual AI tells:

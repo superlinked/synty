@@ -30,7 +30,7 @@ The agent surface: `related` / `search` / `status` printing Markdown to stdout:
 
 <sub>Rendered from `docs/*.tape` with [vhs](https://github.com/charmbracelet/vhs); see [CONTRIBUTING](CONTRIBUTING.md#rendering-the-demo-gifs) to re-render.</sub>
 
-## Install
+## Install & update
 
 One paste from nothing to "tracking + a viewer". The bucket is optional: omit
 it to trial synty against your own sessions first, add it later to join your
@@ -43,11 +43,14 @@ curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh |
 
 The installer puts the binary on PATH, runs `synty init [bucket]` (pins your
 GitHub identity, enables the login-time tracker, runs the first build), then
-opens the viewer. It pulls the prebuilt binary from the latest [GitHub
-Release](https://github.com/superlinked/synty/releases); `synty upgrade`
-self-updates from the same place. *Building from source? See [Build &
-offline](#build--offline); replace `synty` with `cargo run --release --` in any
-command below.*
+opens the viewer. The binary is the prebuilt asset from the latest [GitHub
+Release](https://github.com/superlinked/synty/releases).
+
+Update in place with `synty upgrade`: it pulls the latest release, verifies the
+sha256, replaces the binary, and restarts the tracker. It's a no-op when you're
+current, and `synty status` (plus the TUI footer) nags when a newer build
+exists. *Building from source? See [Build & offline](#build--offline); replace
+`synty` with `cargo run --release --` in any command below.*
 
 ## Start local, then join your team
 
@@ -229,36 +232,5 @@ done
 export SYNTY_MODEL="$PWD/models/mxbai"
 ```
 
-## Releasing & upgrades
-
-Binaries ship as **GitHub Release** assets, built by CI. Each platform gets the
-fastest build for it (**metal on Apple Silicon, plain CPU on Linux**, each with
-a runtime fallback), so nobody picks a build.
-
-**Cut a release:** bump the version and push a tag; `.github/workflows/release.yml`
-runs the test suite, builds each platform, and attaches `synty-<os>-<arch>` (plus
-a `.sha256`) to the release:
-
-```sh
-# edit Cargo.toml version → e.g. 0.2.0, commit
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-The matrix builds `macos-14` (`--features metal,s3,gcs`) and `ubuntu-latest`
-(`--features s3,gcs`); the `s3`/`gcs` features are for reading the team's *data*
-bucket and are independent of where the binary ships. Add matrix rows for more
-platforms (Intel Mac `macos-13`, `ubuntu-24.04-arm`) as needed.
-
-**Upgrade:** once a newer release exists, `synty status`, the TUI footer
-(`⬆ <v>`), and `synty up` show a nag; the swap stays explicit:
-
-```sh
-synty upgrade        # download this platform's asset, verify sha256, replace in place, restart the tracker
-```
-
-`upgrade` fetches the release directly, with no extra credential (a private repo
-reuses the GitHub token synty already has for PRs/issues; override the source
-repo with `$SYNTY_RELEASE_REPO`). It's a no-op when you're current and refuses
-on a checksum mismatch. `synty --version` reports the running build. The install
-one-liner pulls the same assets: a public download, or `gh` when the repo is
-private.
+Cutting a release (the CI matrix, version tags) is a maintainer task: see
+[CONTRIBUTING](CONTRIBUTING.md#releasing).
