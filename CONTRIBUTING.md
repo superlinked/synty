@@ -3,7 +3,7 @@
 synty is one self-contained Rust binary. No build server, no services; you
 develop and test it entirely offline. This file covers the day-to-day. The full
 working rules live in [`AGENTS.md`](AGENTS.md), and the architecture lives in
-[`design.md`](design.md).
+[`docs/design.md`](docs/design.md).
 
 ## Build, test, run
 
@@ -20,7 +20,7 @@ suite. `accelerate` (macOS CPU BLAS) and `mkl` (Linux) are the other opt-in
 backends; none of the three is ever the default.
 
 Run the pipeline end to end with `synty build`, or step through it: `ingest →
-index → summarize → cluster → summarize`. `design.md` explains why each stage
+index → summarize → cluster → summarize`. `docs/design.md` explains why each stage
 exists.
 
 ## Tests
@@ -35,7 +35,7 @@ emits (a `[metrics <op>]` block on stderr) instead of eyeballing the output.
 Write the subject in the imperative, scoped to the area (`M1: Louvain topics
 ...`). The body explains why, and prefers numbers (docs/s, cluster counts, repo
 and PR ids, dates) over adjectives. When you change a command, flag, default, or
-metric, grep `README.md` / `design.md` / `AGENTS.md` and reconcile them in the
+metric, grep `README.md` / `docs/design.md` / `AGENTS.md` and reconcile them in the
 same commit; stale docs drift one sentence at a time.
 
 ## Writing style

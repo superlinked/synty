@@ -201,7 +201,7 @@ synty summarize                  # again: reduce each topic from its members
 - **Activation = a bucket.** A machine is a fleet member exactly when a bucket is
   set; that single fact is what the status surface tracks.
 
-Architecture and rationale live in `design.md`; validation on real data in
+Architecture and rationale live in `docs/design.md`; validation on real data in
 `evals/`.
 
 ## Build & offline

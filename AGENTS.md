@@ -1,6 +1,6 @@
 # AGENTS.md — synty
 
-Working rules for changing code in this repo. Read `design.md` for the
+Working rules for changing code in this repo. Read `docs/design.md` for the
 architecture and target end-state, and `evals/` for the kernel validation
 before making changes. This file does not restate them.
 
@@ -71,7 +71,7 @@ recompute in a throwaway script.
   expectations, not from the implementation (see the existing `#[cfg(test)]`
   blocks).
 - A change to a command, flag, default, path, model, or metric also greps
-  `README.md` / `design.md` / `AGENTS.md` for the old behavior and reconciles —
+  `README.md` / `docs/design.md` / `AGENTS.md` for the old behavior and reconciles —
   docs drift one stale sentence at a time. Prefer claim-free phrasing for
   anything that moves (test counts, corpus sizes) over numbers that rot.
 - The core derivations — retrieval, clustering, keyphrases — stay LLM-free:
