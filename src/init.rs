@@ -6,8 +6,8 @@
 // "tracking + a viewer". Re-running with a bucket is the local→bucket switch
 // (the build's event sync does the rest).
 //
-// This is the single onboarding path: synty isn't released yet, so there is one
-// command, not the old interactive `setup` plus something else.
+// This is the single onboarding path: one command, not the old interactive
+// `setup` plus something else.
 
 use crate::{config, github, identity, track, up};
 use anyhow::Result;

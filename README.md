@@ -33,8 +33,8 @@ The agent surface: `related` / `search` / `status` printing Markdown to stdout:
 ## Install & update
 
 One paste from nothing to "tracking + a viewer". The bucket is optional: omit
-it to trial synty against your own sessions first, add it later to join your
-team:
+it to trial synty against your own sessions first, add it later to share memory
+across your machines or your team:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh                      # local trial
@@ -52,9 +52,9 @@ current, and `synty status` (plus the TUI footer) nags when a newer build
 exists. *Building from source? See [Build & offline](#build--offline); replace
 `synty` with `cargo run --release --` in any command below.*
 
-## Start local, then join your team
+## Start local, then connect your machines or team
 
-**1 · Local-first (recommended): see the value, then join.**
+**1 · Local-first (recommended): see the value, then connect.**
 
 1. **Install with no bucket.** `synty init` pins your identity, turns on the
    login-time tracker, and builds an index from your local sessions (+ your
@@ -62,11 +62,13 @@ exists. *Building from source? See [Build & offline](#build--offline); replace
 2. **Use it.** The tracker runs at login; you browse in `synty tui` and run
    `synty related` / `synty search` before tasks. Everything stays on your
    machine; you push nothing, and the fleet can't see you.
-3. **Join the team** when you're ready: `synty init gs://my-team`. That sets the
-   bucket; the next build pulls the fleet's shared memory and your tracker starts
-   contributing. Status flips to **`✓ my-team`**, and you're an activated member.
+3. **Add a bucket** when you want synty to span machines: `synty init gs://my-team`.
+   The bucket is the shared memory, whether that's your own laptop and desktop or
+   your whole team. The next build pulls what's already there, and your tracker
+   starts contributing. Status flips to **`✓ my-team`**, and you're an activated
+   member.
 
-**2 · Straight to the team.** If you already trust it, install with the bucket
+**2 · Straight to a bucket.** If you already trust it, install with the bucket
 (journey 1, but the one-liner carries `gs://my-team`). You land directly at
 `✓ my-team`.
 
@@ -139,8 +141,9 @@ needs no query; ids in any tool's output feed `synty_show`.
 
 ## Fleet mode (teams)
 
-Solo, the "bucket" is a local directory. For a team it's one shared S3/GCS
-bucket, and the bucket is the *only* shared infrastructure: no build server, no
+Solo, the "bucket" is a local directory. For a team, or just your own laptop and
+desktop, it's one shared S3/GCS bucket, and the bucket is the *only* shared
+infrastructure: no build server, no
 cron, no coordination service. That works because everything in it is
 append-only (events), write-once (embeddings, summaries), or swapped atomically
 behind a pointer (the index), so machines cooperate without ever talking to each
