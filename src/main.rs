@@ -1,8 +1,10 @@
-// synty — passive cross-agent + GitHub work memory. Local-first, no generative
-// model: pylate-rs (ColBERT) encodes, next-plaid (PLAID) indexes; search prints
-// Markdown to stdout for coding agents.
+// synty — passive cross-agent + GitHub work memory. Local-first, nothing leaves
+// the machine: pylate-rs (ColBERT) encodes, next-plaid (PLAID) indexes, and a
+// small local model (Qwen) writes the one-line summaries; search prints Markdown
+// to stdout for coding agents.
 //
-// Subcommands: ingest, index, search, cluster, summarize, eval.
+// Subcommands span the pipeline, the tracker and GitHub backfill, and the read
+// surfaces (CLI + TUI + MCP).
 
 mod blocks;
 mod bucket;

@@ -204,14 +204,15 @@ synty cluster --resolution 2.0   # group units by summary embedding → topics
 
 ## How it works
 
-- **Retrieval, no LLM.** `pylate-rs` runs a small ColBERT model (ModernBERT,
-  32 M params) that encodes each document as one vector *per token*; `next-plaid`
-  (PLAID) scores queries with MaxSim over a SQLite-backed metadata filter. Late
-  interaction beats single-vector embeddings on short, code-adjacent text.
-- **Summaries, local.** The one-line unit and topic summaries come from a small
-  model (Qwen3-0.6B) on your CPU, never a remote API. A topic name has to share a
-  distinctive cluster term and embed close to its members, or an extractive title
-  wins.
+- **Late-interaction retrieval.** `pylate-rs` runs a small ColBERT model
+  (ModernBERT, 32 M params) that encodes each document as one vector *per
+  token*; `next-plaid` (PLAID) scores queries with MaxSim, backed by SQLite for
+  exact metadata filters. Late interaction beats single-vector embeddings on
+  short, code-adjacent text.
+- **Summaries and names from a small local model.** The one-line session and
+  topic summaries, and the gated topic names, come from Qwen3-0.6B on your CPU,
+  never a remote API. A name has to share a distinctive cluster term and embed
+  close to its members, or an extractive title wins.
 - **Events are the source of truth.** Sessions and GitHub items become
   append-only envelopes; the index and metadata are derived projections,
   rebuildable any time and shareable through a bucket.
