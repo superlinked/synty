@@ -783,7 +783,7 @@ const GATE_MEMBERS: usize = 20;
 /// Run-relative faithfulness floor: an LLM name scoring below this fraction of
 /// the run's median is rejected (mirrors the clustering FLOOR). Run-relative
 /// because MaxSim is non-metric — absolute thresholds don't transfer across
-/// corpora or models (see quality-roadmap, cross-cutting tradeoffs).
+/// corpora or models.
 const EMBED_FLOOR: f32 = 0.6;
 /// Below this many scored names the median is noise — apply no rejections.
 const EMBED_MIN_SCORED: usize = 8;

@@ -1,9 +1,8 @@
 # AGENTS.md — synty
 
 Working rules for changing code in this repo. Read `design.md` for the
-architecture and target end-state, `roadmap.md` for the milestone sequence, and
-`eval_report.md` for the kernel validation before making changes. This file
-does not restate them.
+architecture and target end-state, and `evals/` for the kernel validation
+before making changes. This file does not restate them.
 
 Parsing of coding-agent session logs and GitHub ingestion are ported from the
 v1 implementation in `../synty-legacy` (Go tailers under

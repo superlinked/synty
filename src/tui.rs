@@ -1,4 +1,4 @@
-// The human surface, built to design_tui.md: a header breadcrumb, a
+// The human surface: a header breadcrumb, a
 // master/detail body, and a context footer; four views (Topics, Work, Search,
 // Status) over units of work, with a comparable activity column and the brand
 // palette. Session rows are two lines tall: the one-line summary on top, context
