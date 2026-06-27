@@ -2,6 +2,13 @@
 name = "synty"
 version = "0.1.0"
 edition = "2024"
+description = "A passive, local memory of your coding-agent sessions and GitHub activity — query-free recall for you and the agents you work with. ColBERT retrieval, local summaries, nothing leaves your machine."
+license = "Apache-2.0"
+repository = "https://github.com/superlinked/synty"
+homepage = "https://github.com/superlinked/synty"
+readme = "README.md"
+keywords = ["colbert", "retrieval", "coding-agents", "embeddings", "search"]
+categories = ["command-line-utilities", "development-tools"]
 
 [features]
 default = ["llm"]

@@ -36,16 +36,17 @@ it to trial synty against your own sessions first, add it later to join your
 team:
 
 ```sh
-curl -fsSL <internal-url>/install.sh | sh                      # local trial
-curl -fsSL <internal-url>/install.sh | sh -s -- gs://my-team   # join the team
+curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh                      # local trial
+curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh -s -- gs://my-team   # join the team
 ```
 
 The installer puts the binary on PATH, runs `synty init [bucket]` (pins your
 GitHub identity, enables the login-time tracker, runs the first build), then
-opens the viewer. Distribution is internal for now (binary from
-`$SYNTY_BINARY_URL`) — no public package or Homebrew tap while the team rolls
-out. *Building from source? See [Build & offline](#build--offline); replace
-`synty` with `cargo run --release --` in any command below.*
+opens the viewer. It pulls the prebuilt binary from the latest [GitHub
+Release](https://github.com/superlinked/synty/releases); `synty upgrade`
+self-updates from the same place. *Building from source? See [Build &
+offline](#build--offline); replace `synty` with `cargo run --release --` in any
+command below.*
 
 ## Start local, then join your team
 
@@ -252,8 +253,9 @@ platforms (Intel Mac `macos-13`, `ubuntu-24.04-arm`) as needed.
 synty upgrade        # download this platform's asset, verify sha256, replace in place, restart the tracker
 ```
 
-`upgrade` fetches the release with the same GitHub token synty already uses for
-PRs/issues (no extra credential; override the source repo with
-`$SYNTY_RELEASE_REPO`). It's a no-op when you're current and refuses on a
-checksum mismatch. `synty --version` reports the running build. The install
-one-liner pulls the same assets via `gh release download`.
+`upgrade` fetches the release directly — no extra credential (a private repo
+reuses the GitHub token synty already has for PRs/issues; override the source
+repo with `$SYNTY_RELEASE_REPO`). It's a no-op when you're current and refuses
+on a checksum mismatch. `synty --version` reports the running build. The install
+one-liner pulls the same assets — public download, or `gh` when the repo is
+private.

@@ -1,8 +1,8 @@
 #!/bin/sh
 # synty installer — one paste from nothing to "tracking + a viewer":
 #
-#   curl -fsSL <internal-url>/install.sh | sh                      # local trial
-#   curl -fsSL <internal-url>/install.sh | sh -s -- gs://my-team   # join the team
+#   curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh                      # local trial
+#   curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh -s -- gs://my-team   # join the team
 #
 # It puts the binary on PATH, runs `synty init [bucket]` (pins your GitHub
 # identity, enables the login-time tracker, runs the first build), then opens
@@ -10,12 +10,12 @@
 # re-paste with a bucket later and that same `init` switches you onto the team.
 # Idempotent — safe to bake into dev-VM / sandbox images.
 #
-# Binary source, in order: $SYNTY_BINARY_URL (a direct artifact URL — a public
-# mirror or presigned link), else the latest GitHub Release of
-# $SYNTY_RELEASE_REPO (default superlinked/synty) via `gh` (which authenticates
-# to the private repo for you), else $SYNTY_BINARY / ./target/release/synty (a
-# local build). Distribution is internal for now — no public package or Homebrew
-# tap. After install, `synty upgrade` self-updates from the same releases.
+# Binary source, in order: $SYNTY_BINARY_URL (a direct artifact URL — a mirror
+# or presigned link), else the latest GitHub Release of $SYNTY_RELEASE_REPO
+# (default superlinked/synty) — the public release asset over plain curl, or
+# `gh` when the repo is private — else $SYNTY_BINARY / ./target/release/synty
+# (a local build). After install, `synty upgrade` self-updates from the same
+# releases.
 set -eu
 
 BUCKET="${1:-}"
@@ -29,12 +29,16 @@ PLAT="synty-$os-$arch"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+REL_URL="https://github.com/$RELEASE_REPO/releases/latest/download/$PLAT"
 if [ -n "${SYNTY_BINARY_URL:-}" ]; then
   echo "downloading $PLAT from $SYNTY_BINARY_URL"
   curl -fsSL "$SYNTY_BINARY_URL" -o "$WORK/$PLAT"
   BIN="$WORK/$PLAT"
+elif curl -fsSL "$REL_URL" -o "$WORK/$PLAT" 2>/dev/null; then
+  echo "downloaded $PLAT from the latest $RELEASE_REPO release"
+  BIN="$WORK/$PLAT"
 elif command -v gh >/dev/null 2>&1; then
-  echo "downloading $PLAT from the latest $RELEASE_REPO release"
+  echo "downloading $PLAT from the latest $RELEASE_REPO release (via gh — private repo)"
   gh release download --repo "$RELEASE_REPO" --pattern "$PLAT" --dir "$WORK" --clobber \
     || { echo "no $PLAT in the latest $RELEASE_REPO release (is one published for your platform?)"; exit 1; }
   BIN="$WORK/$PLAT"
