@@ -12,11 +12,25 @@ models/
 # Derived projections + run outputs (rebuildable).
 index/
 clusters.json
+unit_clusters.json
 clusters.md
 summary.md
-eval_runs.md
 cluster.err
+runs.log
+# Eval/tuning: gold sets (per-corpus) + rebuildable reports. evals/README.md
+# and evals/tuning.md ARE tracked.
+evals/queries.json
+evals/names.json
+evals/runs.md
+evals/names.md
 
 .synty/
 tmp/
 .DS_Store
+
+# Local-only agent-harness state (not committed). AGENTS.md / CLAUDE.md live at
+# the repo root and are tracked; only the per-machine state under .claude/ is ignored.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+.*.swp

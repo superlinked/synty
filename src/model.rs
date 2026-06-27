@@ -16,19 +16,25 @@ const FILES: &[&str] = &[
     "model.safetensors",
 ];
 
-/// A directory spec is used verbatim; an HF repo id is cached under
-/// `SYNTY_MODEL_DIR` (default `~/.cache/synty/models`) and downloaded if absent.
+/// The ColBERT encoder model (the retrieval model).
 pub fn ensure_model(spec: &str) -> Result<PathBuf> {
+    ensure_repo(spec, FILES)
+}
+
+/// A directory spec is used verbatim; an HF repo id is cached under
+/// `SYNTY_MODEL_DIR` (default `~/.cache/synty/models`) and the listed files are
+/// downloaded if absent. Shared by the encoder and the Qwen summarizer.
+pub fn ensure_repo(spec: &str, files: &[&str]) -> Result<PathBuf> {
     if Path::new(spec).is_dir() {
         return Ok(PathBuf::from(spec));
     }
     let dir = cache_path(&cache_root(), spec);
-    let missing: Vec<&str> = FILES.iter().copied().filter(|f| !dir.join(f).exists()).collect();
+    let missing: Vec<&str> = files.iter().copied().filter(|f| !dir.join(f).exists()).collect();
     if !missing.is_empty() {
         eprintln!("fetching {spec} → {} ({} files)", dir.display(), missing.len());
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(20))
-            .timeout_read(Duration::from_secs(120))
+            .timeout_read(Duration::from_secs(300))
             .build();
         for f in missing {
             download(&agent, spec, f, &dir.join(f)).with_context(|| format!("download {f}"))?;

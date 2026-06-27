@@ -1,0 +1,348 @@
+// Claude Code session JSONL → canonical envelopes. Each
+// ~/.claude/projects/<slug>/<uuid>.jsonl line is one JSON record discriminated
+// by `type` (user, assistant, attachment, system, …). The Claude message shape
+// (user/assistant content) is decoded in `blocks`, shared with Cowork.
+
+use crate::event::{kind, source, Event};
+use crate::tail::{resolve_ts, EmitCtx, FileParser, Source};
+use anyhow::{anyhow, Result};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+pub struct ClaudeCode;
+
+impl Source for ClaudeCode {
+    fn id(&self) -> &'static str {
+        "claudecode"
+    }
+    fn envelope_source(&self) -> &'static str {
+        source::CLAUDE_CODE
+    }
+    /// Scan up to 50 lines for the first `version` stamp (the first record is
+    /// often a metadata stub without one).
+    fn detect_version(&self, head: &[u8]) -> String {
+        for line in head.split(|&b| b == b'\n').take(50) {
+            if line.is_empty() {
+                continue;
+            }
+            #[derive(Deserialize)]
+            struct Probe {
+                version: Option<String>,
+            }
+            if let Ok(p) = serde_json::from_slice::<Probe>(line) {
+                if let Some(v) = p.version {
+                    if !v.is_empty() {
+                        return v;
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+    fn new_parser(&self, version: &str, _head: &[u8]) -> Option<Box<dyn FileParser>> {
+        if version.starts_with("2.1.") || version == "2.1" {
+            Some(Box::new(ParserV21::default()))
+        } else {
+            None
+        }
+    }
+}
+
+/// Per-file state: the first sidechain record emits one subagent_parent edge.
+#[derive(Default)]
+struct ParserV21 {
+    subagent_edge_emitted: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct RawRecord {
+    #[serde(rename = "type", default)]
+    rtype: String,
+    #[serde(rename = "sessionId", default)]
+    session_id: String,
+    #[serde(default)]
+    uuid: String,
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(rename = "gitBranch", default)]
+    git_branch: String,
+    #[serde(default)]
+    entrypoint: String,
+    #[serde(rename = "isMeta", default)]
+    is_meta: bool,
+    #[serde(rename = "isSidechain", default)]
+    is_sidechain: bool,
+    #[serde(rename = "agentId", default)]
+    agent_id: String,
+    #[serde(default)]
+    message: Value,
+    #[serde(default)]
+    subtype: String,
+    #[serde(rename = "permissionMode", default)]
+    permission_mode: String,
+    #[serde(rename = "lastPrompt", default)]
+    last_prompt: String,
+    #[serde(default)]
+    attachment: Value,
+    #[serde(rename = "prNumber", default)]
+    pr_number: i64,
+    #[serde(rename = "prRepository", default)]
+    pr_repository: String,
+    #[serde(rename = "prUrl", default)]
+    pr_url: String,
+    #[serde(rename = "messageCount", default)]
+    message_count: i64,
+    #[serde(rename = "durationMs", default)]
+    duration_ms: i64,
+    #[serde(rename = "messageId", default)]
+    message_id: String,
+    #[serde(rename = "isSnapshotUpdate", default)]
+    is_snapshot_update: bool,
+}
+
+impl FileParser for ParserV21 {
+    fn parse_line(&mut self, line: &[u8], ec: &mut EmitCtx) -> Result<Vec<Event>> {
+        let mut r: RawRecord =
+            serde_json::from_slice(line).map_err(|e| anyhow!("claudecode: unmarshal: {e}"))?;
+        if r.rtype.is_empty() {
+            return Err(anyhow!("claudecode: missing type"));
+        }
+        let (ts_ms, ts) = resolve_ts(&r.timestamp, ec.fallback_ms());
+        let mut out = Vec::new();
+
+        // Subagent transcripts: rewrite SessionID to a synthetic child id and
+        // emit one subagent_parent edge per file.
+        if r.is_sidechain && !r.agent_id.is_empty() {
+            let parent = r.session_id.clone();
+            let child = format!("agent-{}", r.agent_id);
+            r.session_id = child.clone();
+            if !self.subagent_edge_emitted {
+                self.subagent_edge_emitted = true;
+                out.push(ec.event(
+                    ts_ms,
+                    &ts,
+                    kind::AGENT_META,
+                    &child,
+                    json!({
+                        "subtype": "subagent_parent",
+                        "parent_session_id": parent,
+                        "child_session_id": child,
+                        "agent_id": r.agent_id,
+                    }),
+                ));
+            }
+        }
+
+        if !r.session_id.is_empty() && ec.first_seen(&r.session_id) {
+            out.push(ec.event(
+                ts_ms,
+                &ts,
+                kind::SESSION_START,
+                &r.session_id,
+                json!({
+                    "session_id": r.session_id,
+                    "version": r.version,
+                    "cwd": r.cwd,
+                    "git_branch": r.git_branch,
+                    "entrypoint": r.entrypoint,
+                }),
+            ));
+        }
+
+        match r.rtype.as_str() {
+            "user" => {
+                let content = r.message.get("content").cloned().unwrap_or(Value::Null);
+                out.extend(crate::blocks::user_content(&content, r.is_meta, ts_ms, &ts, &r.session_id, ec));
+            }
+            "assistant" => {
+                let model = r.message.get("model").and_then(Value::as_str).unwrap_or("");
+                let content = r.message.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
+                out.extend(crate::blocks::assistant_content(&content, model, "claudecode", ts_ms, &ts, &r.session_id, ec));
+                // The API's own token accounting, as its own envelope — NOT on
+                // the assistant_message payload, which is only emitted for text
+                // chunks and would silently drop usage for tool-use-only turns
+                // (the dominant, token-heaviest shape). Streamed turns repeat
+                // the identical usage on every line of one message id; the
+                // aggregator dedups by msg_id. Mapping: in = input_tokens
+                // (uncached), out = output_tokens, cache_read/cache_create =
+                // the prompt-cache classes — kept separate, they price ~10x
+                // apart. Emitted after the sidechain rewrite, so subagent
+                // usage lands on the child session.
+                if let Some(u) = r.message.get("usage").filter(|u| u.is_object()) {
+                    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    out.push(ec.event(
+                        ts_ms,
+                        &ts,
+                        kind::AGENT_META,
+                        &r.session_id,
+                        json!({
+                            "subtype": "usage",
+                            "msg_id": r.message.get("id").and_then(Value::as_str).unwrap_or(""),
+                            "model": model,
+                            "usage": {
+                                "in": n("input_tokens"),
+                                "out": n("output_tokens"),
+                                "cache_read": n("cache_read_input_tokens"),
+                                "cache_create": n("cache_creation_input_tokens"),
+                            },
+                        }),
+                    ));
+                }
+            }
+            "attachment" => out.push(ec.event(
+                ts_ms,
+                &ts,
+                kind::ATTACHMENT_REF,
+                &r.session_id,
+                json!({"attachment": r.attachment, "uuid": r.uuid, "cwd": r.cwd}),
+            )),
+            "permission-mode" => out.push(ec.event(
+                ts_ms,
+                &ts,
+                kind::AGENT_META,
+                &r.session_id,
+                json!({"subtype": "permission_mode", "permission_mode": r.permission_mode}),
+            )),
+            "last-prompt" => out.push(ec.event(
+                ts_ms,
+                &ts,
+                kind::AGENT_META,
+                &r.session_id,
+                json!({"subtype": "last_prompt", "last_prompt": r.last_prompt}),
+            )),
+            "file-history-snapshot" => out.push(ec.event(
+                ts_ms,
+                &ts,
+                kind::AGENT_META,
+                &r.session_id,
+                json!({
+                    "subtype": "file_history_snapshot",
+                    "message_id": r.message_id,
+                    "is_snapshot_update": r.is_snapshot_update,
+                }),
+            )),
+            "system" => out.push(ec.event(
+                ts_ms,
+                &ts,
+                kind::AGENT_META,
+                &r.session_id,
+                json!({"subtype": r.subtype, "message_count": r.message_count, "duration_ms": r.duration_ms}),
+            )),
+            "pr-link" => out.push(ec.event(
+                ts_ms,
+                &ts,
+                kind::AGENT_META,
+                &r.session_id,
+                json!({
+                    "subtype": "pr_link",
+                    "pr_number": r.pr_number,
+                    "pr_repository": r.pr_repository,
+                    "pr_url": r.pr_url,
+                }),
+            )),
+            other => out.push(ec.event(ts_ms, &ts, kind::AGENT_META, &r.session_id, json!({"subtype": other}))),
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Sequencer;
+    use crate::tail::{drive, EmitCtx};
+    use std::collections::HashSet;
+
+    fn run(lines: &str) -> Vec<Event> {
+        let src = ClaudeCode;
+        let mut parser = src.new_parser("2.1.119", b"").expect("parser");
+        let mut seq = Sequencer::new();
+        let mut started = HashSet::new();
+        let mut ec = EmitCtx::new("edge-x-claudecode".into(), &src, &mut seq, &mut started);
+        drive(&mut *parser, lines.as_bytes(), "f.jsonl", 0, 1_700_000_000_000, &mut ec).0
+    }
+
+    // Every assistant line carrying the API's usage object yields one usage
+    // meta — INCLUDING tool-use-only lines, which emit no assistant_message
+    // (usage embedded there would be silently lost). Streamed lines of one
+    // turn repeat the same msg_id; the aggregator dedups on it. A line
+    // without usage yields none.
+    #[test]
+    fn assistant_usage_meta_per_line_with_msg_id() {
+        let text = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-05-31T20:01:00Z","message":{"role":"assistant","id":"m1","model":"claude-fable-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":7},"content":[{"type":"text","text":"editing auth.ts now"}]}}"#;
+        let tool_only = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-05-31T20:01:01Z","message":{"role":"assistant","id":"m1","model":"claude-fable-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":7},"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/c/sie/a.ts"}}]}}"#;
+        let no_usage = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-05-31T20:01:02Z","message":{"role":"assistant","model":"claude-fable-5","content":[{"type":"text","text":"done with the edit"}]}}"#;
+        let evts = run(&[text, tool_only, no_usage].join("\n"));
+        let usage: Vec<&Event> = evts
+            .iter()
+            .filter(|e| e.kind == "agent_meta" && e.payload["subtype"] == "usage")
+            .collect();
+        assert_eq!(usage.len(), 2, "one usage meta per usage-bearing line: {evts:?}");
+        for u in &usage {
+            assert_eq!(u.payload["msg_id"], "m1");
+            assert_eq!(u.payload["usage"]["in"], 10);
+            assert_eq!(u.payload["usage"]["cache_read"], 100);
+        }
+    }
+
+    #[test]
+    fn version_detection_skips_stub_first_line() {
+        let head = b"{\"type\":\"permission-mode\",\"permissionMode\":\"default\"}\n{\"type\":\"user\",\"version\":\"2.1.119\"}";
+        assert_eq!(ClaudeCode.detect_version(head), "2.1.119");
+        assert!(ClaudeCode.new_parser("2.1.119", b"").is_some());
+        assert!(ClaudeCode.new_parser("1.0.0", b"").is_none());
+    }
+
+    #[test]
+    fn user_string_prompt_yields_session_start_then_prompt() {
+        let evts = run(r#"{"type":"user","sessionId":"S1","timestamp":"2026-05-31T20:00:00Z","version":"2.1.119","cwd":"/c/sie-internal","message":{"role":"user","content":"fix the login redirect"}}"#);
+        assert_eq!(evts.len(), 2);
+        assert_eq!(evts[0].kind, "session_start");
+        assert_eq!(evts[0].session_id, "S1");
+        assert_eq!(evts[1].kind, "user_prompt");
+        assert_eq!(evts[1].payload["text"], "fix the login redirect");
+        assert_eq!(evts[1].source, "claude_code");
+    }
+
+    #[test]
+    fn assistant_text_and_file_tool_emit_message_call_and_attachment() {
+        let line = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-05-31T20:01:00Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"editing auth.ts"},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/c/sie/auth.ts"}}]}}"#;
+        let evts = run(&format!(
+            "{}\n{}",
+            r#"{"type":"user","sessionId":"S1","timestamp":"2026-05-31T20:00:00Z","message":{"content":"go"}}"#,
+            line
+        ));
+        let kinds: Vec<&str> = evts.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"tool_call"));
+        assert!(kinds.contains(&"attachment_ref"));
+        assert!(kinds.contains(&"assistant_message"));
+        let att = evts.iter().find(|e| e.kind == "attachment_ref").unwrap();
+        assert_eq!(att.payload["local_path"], "/c/sie/auth.ts");
+        assert_eq!(att.payload["source_system"], "claudecode_edit");
+        let msg = evts.iter().find(|e| e.kind == "assistant_message").unwrap();
+        assert_eq!(msg.payload["model"], "claude-opus-4-8");
+    }
+
+    #[test]
+    fn session_start_emitted_once() {
+        let evts = run(&format!(
+            "{}\n{}",
+            r#"{"type":"user","sessionId":"S2","timestamp":"2026-05-31T20:00:00Z","message":{"content":"a"}}"#,
+            r#"{"type":"user","sessionId":"S2","timestamp":"2026-05-31T20:00:01Z","message":{"content":"b"}}"#
+        ));
+        assert_eq!(evts.iter().filter(|e| e.kind == "session_start").count(), 1);
+    }
+
+    #[test]
+    fn sidechain_emits_subagent_parent_edge() {
+        let evts = run(r#"{"type":"user","sessionId":"PARENT","isSidechain":true,"agentId":"a2","timestamp":"2026-05-31T20:00:00Z","message":{"content":"sub task"}}"#);
+        let edge = evts.iter().find(|e| e.payload.get("subtype").and_then(|v| v.as_str()) == Some("subagent_parent")).unwrap();
+        assert_eq!(edge.payload["parent_session_id"], "PARENT");
+        assert_eq!(edge.payload["child_session_id"], "agent-a2");
+        assert!(evts.iter().all(|e| e.session_id == "agent-a2"));
+    }
+}

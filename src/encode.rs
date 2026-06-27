@@ -15,7 +15,7 @@ impl Encoder {
     pub fn load(model_id: &str) -> Result<Self> {
         let dir = crate::model::ensure_model(model_id)?;
         let path = dir.to_str().ok_or_else(|| anyhow::anyhow!("non-utf8 model path"))?;
-        let builder = ColBERT::from(path).with_device(Device::Cpu);
+        let builder = ColBERT::from(path).with_device(select_device());
         let model = ColBERT::try_from(builder).map_err(|e| anyhow::anyhow!("load colbert: {e}"))?;
         Ok(Self { model })
     }
@@ -44,6 +44,27 @@ impl Encoder {
         }
         Ok(out)
     }
+}
+
+/// Pick the encode device. With `--features metal` we try the Apple GPU and
+/// fall back to CPU if it can't initialize; otherwise CPU (optionally with an
+/// Accelerate/MKL BLAS backend compiled in). The choice is logged once.
+fn select_device() -> Device {
+    #[cfg(feature = "metal")]
+    {
+        match Device::new_metal(0) {
+            Ok(d) => {
+                eprintln!("encode: device = Metal (Apple GPU)");
+                return d;
+            }
+            Err(e) => eprintln!("encode: Metal unavailable ({e}); using CPU"),
+        }
+    }
+    #[cfg(all(not(feature = "metal"), any(feature = "accelerate", feature = "mkl")))]
+    eprintln!("encode: device = CPU (BLAS backend enabled)");
+    #[cfg(all(not(feature = "metal"), not(feature = "accelerate"), not(feature = "mkl")))]
+    eprintln!("encode: device = CPU (plain; build with --features metal|accelerate for speed)");
+    Device::Cpu
 }
 
 fn doc_array(doc: Vec<Vec<f32>>, dim: usize) -> Result<Array2<f32>> {

@@ -1,0 +1,57 @@
+# Cut a release on a version tag: run the (pure) test suite, then build the
+# per-platform artifacts and attach them to a GitHub Release. `synty upgrade`
+# and install.sh read from this release. Tag with the Cargo.toml version, e.g.
+# `git tag v0.2.0 && git push --tags`.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload assets (uses GITHUB_TOKEN)
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked # pure: no model, corpus, or network
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false # one platform failing shouldn't drop the other's artifact
+      matrix:
+        include:
+          # Apple Silicon: GPU encode via metal, with runtime CPU fallback.
+          - os: macos-14
+            asset: synty-darwin-arm64
+            features: metal,s3,gcs
+          # Linux x64: plain CPU, portable.
+          - os: ubuntu-latest
+            asset: synty-linux-x64
+            features: s3,gcs
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --features ${{ matrix.features }}
+      - name: Package + checksum
+        run: |
+          cp target/release/synty "${{ matrix.asset }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256

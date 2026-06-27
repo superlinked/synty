@@ -3,7 +3,7 @@
 // resolved to a doc-id subset via next-plaid's filtering module, then passed
 // to MaxSim search. Renders Markdown to stdout — the agent-facing surface.
 
-use crate::{encode::Encoder, excerpt, first_line, load_docs, short, Doc, DOCS_PATH, INDEX_PATH};
+use crate::{encode::Encoder, excerpt, first_line, load_docs, readmodel, short, Doc};
 use anyhow::{anyhow, Result};
 use next_plaid::{MmapIndex, QueryResult, SearchParameters};
 
@@ -13,7 +13,7 @@ pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
     let Some(f) = filter else { return Ok(None) };
     let (col, val) = f.split_once('=').ok_or_else(|| anyhow!("filter must be col=value: {f}"))?;
     let ids = next_plaid::filtering::where_condition(
-        INDEX_PATH,
+        &readmodel::index_dir().to_string_lossy(),
         &format!("{} = ?", col.trim()),
         &[serde_json::json!(val.trim())],
     )
@@ -21,9 +21,15 @@ pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
     Ok(Some(ids))
 }
 
-pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str) -> Result<()> {
-    let docs = load_docs(DOCS_PATH)?;
-    let idx = MmapIndex::load(INDEX_PATH)
+pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str, bucket: &str, json: bool) -> Result<()> {
+    if crate::sync::pull_if_stale(bucket).unwrap_or(false) {
+        eprintln!("pulled published read-model from {bucket}");
+    }
+    if let Some(note) = crate::view::stale_note() {
+        eprintln!("{note}");
+    }
+    let docs = load_docs(readmodel::docs_path())?;
+    let idx = MmapIndex::load(&readmodel::index_dir().to_string_lossy())
         .map_err(|e| anyhow!("load index: {e} (run `index` first)"))?;
     let mut enc = Encoder::load(model_id)?;
     let q = enc.encode_query(query)?;
@@ -32,8 +38,38 @@ pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str) -> Resul
     let res = idx
         .search(&q, &params, subset.as_deref())
         .map_err(|e| anyhow!("search: {e}"))?;
-    print!("{}", render(&docs, query, filter, &res));
+    if json {
+        println!("{}", render_json(&docs, &res));
+    } else {
+        print!("{}", render(&docs, query, filter, &res));
+    }
     Ok(())
+}
+
+/// Results as a JSON array (`--json`), for scripts and agents.
+pub fn render_json(docs: &[Doc], res: &QueryResult) -> String {
+    let arr: Vec<serde_json::Value> = res
+        .passage_ids
+        .iter()
+        .zip(res.scores.iter())
+        .filter_map(|(id, score)| {
+            let d = docs.get(*id as usize)?;
+            Some(serde_json::json!({
+                "score": score,
+                "id": d.id,
+                "kind": d.meta.kind,
+                "repo": d.meta.repo,
+                "author": d.meta.author,
+                "session_id": d.meta.session_id,
+                "ts": d.meta.ts,
+                "number": d.meta.number,
+                "url": d.meta.url,
+                "state": d.meta.state,
+                "text": excerpt(&d.text, 400),
+            }))
+        })
+        .collect();
+    crate::view::envelope("search", serde_json::Value::Array(arr))
 }
 
 /// Render a result set as Markdown. Shared with the eval harness.
@@ -72,7 +108,7 @@ fn card(d: &Doc, rank: usize, score: f32) -> String {
         _ => format!(
             "{rank}. [{score:.1}] _{} · {} · {}_\n   {}\n",
             d.meta.kind,
-            if d.meta.repo.is_empty() { "local" } else { &d.meta.repo },
+            if d.meta.repo.is_empty() { "—" } else { &d.meta.repo },
             short(&d.meta.session_id),
             excerpt(&d.text, 160)
         ),

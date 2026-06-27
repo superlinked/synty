@@ -1,17 +1,10 @@
-// Extractive summaries, no LLM.
-//  - Sessions: re-parse corpus/local; per session report repo, prompt count,
-//    files touched (Write/Edit attachment_refs), the opening ask, linked PRs.
-//  - Topics: read clusters.json + docs.jsonl; per cluster report repos,
-//    kind counts, and notable titles. Falls back to per-repo GitHub digests.
+// CLI summaries over the shared `units` view-model (parity with the TUI):
+//  - Sessions: repo, counts, opening ask, the one-line summary, files touched,
+//    effort, linked PR.
+//  - Topics: the unit-level topic digest, same as `topic`, top N by recency.
 
-use crate::{excerpt, first_line, load_docs, short, Doc};
+use crate::short;
 use anyhow::Result;
-use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
-
-const LOCAL_DIR: &str = "corpus/local";
-const FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 pub fn run(sessions: usize, topics: usize) -> Result<()> {
     session_summaries(sessions)?;
@@ -20,102 +13,60 @@ pub fn run(sessions: usize, topics: usize) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
-struct Session {
-    repo: String,
-    first_ts: String,
-    last_ts: String,
-    prompts: Vec<String>,
-    files: Vec<String>,
-    pr_links: Vec<String>,
+/// Print the exact summarizer inputs (ask, selected turns with their lengths)
+/// for every session — to inspect input quality without running the model.
+pub fn dump_inputs() -> Result<()> {
+    for s in crate::units::session_inputs()? {
+        println!("## {} · {}", short(&s.id), s.repo);
+        println!("ask [{} chars]: {}", s.ask.len(), s.ask);
+        for (i, t) in s.turns.iter().enumerate() {
+            println!("  turn{i} [{} chars]: {}", t.len(), t);
+        }
+        println!();
+    }
+    Ok(())
 }
 
 fn session_summaries(n: usize) -> Result<()> {
-    let mut files = Vec::new();
-    if Path::new(LOCAL_DIR).is_dir() {
-        collect_jsonl(Path::new(LOCAL_DIR), &mut files)?;
-    }
-    let mut seen_files: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut s: HashMap<String, Session> = HashMap::new();
-    for f in files {
-        let Ok(data) = std::fs::read_to_string(&f) else { continue };
-        for line in data.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
-            let sid = ev["session_id"].as_str().unwrap_or("").to_string();
-            if sid.is_empty() {
-                continue;
-            }
-            let kind = ev["kind"].as_str().unwrap_or("");
-            let ts = ev["ts"].as_str().unwrap_or("").to_string();
-            let e = s.entry(sid.clone()).or_default();
-            if e.first_ts.is_empty() || ts < e.first_ts {
-                e.first_ts = ts.clone();
-            }
-            if ts > e.last_ts {
-                e.last_ts = ts.clone();
-            }
-            match kind {
-                "session_start" => {
-                    if let Some(cwd) = ev["payload"]["cwd"].as_str() {
-                        e.repo = cwd.rsplit('/').next().unwrap_or(cwd).to_string();
-                    }
-                }
-                "user_prompt" => {
-                    if let Some(t) = ev["payload"]["text"].as_str() {
-                        if t.trim().len() >= 12 {
-                            e.prompts.push(t.trim().to_string());
-                        }
-                    }
-                }
-                "attachment_ref" => {
-                    let tool = ev["payload"]["tool_name"].as_str().unwrap_or("");
-                    if FILE_TOOLS.contains(&tool) {
-                        if let Some(p) = ev["payload"]["local_path"].as_str() {
-                            let base = p.rsplit('/').next().unwrap_or(p).to_string();
-                            if seen_files.entry(sid.clone()).or_default().insert(base.clone()) {
-                                e.files.push(base);
-                            }
-                        }
-                    }
-                }
-                "agent_meta" => {
-                    let blob = ev["payload"].to_string();
-                    if let Some(pos) = blob.find("/pull/") {
-                        let tail: String = blob[pos..].chars().take(24).collect();
-                        e.pr_links.push(format!("…{tail}"));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut all: Vec<(String, Session)> = s.into_iter().filter(|(_, v)| !v.prompts.is_empty()).collect();
-    all.sort_by(|a, b| b.1.last_ts.cmp(&a.1.last_ts));
+    let mut all = crate::units::sessions()?;
+    all.sort_by(|a, b| b.ended.cmp(&a.ended));
+    // Capture coverage for the token accounting: the share of sessions whose
+    // source actually recorded usage (cowork and pre-capture envelopes
+    // don't). Emitted here, not in the LLM pass — this path always runs.
+    let with = all.iter().filter(|s| s.has_usage()).count();
+    crate::metrics::Run::new("stats")
+        .set("sessions", all.len())
+        .set("with_usage", with)
+        .set("usage_coverage_pct", 100.0 * with as f64 / all.len().max(1) as f64)
+        .emit();
     println!("# session summaries (most recent {n})\n");
-    for (sid, sess) in all.into_iter().take(n) {
-        let repo = if sess.repo.is_empty() { "?".into() } else { sess.repo };
+    for s in all.into_iter().take(n) {
         println!(
             "## {} · {} · {}",
-            short(&sid),
-            repo,
-            sess.first_ts.split('T').next().unwrap_or("")
+            short(&s.id),
+            if s.repo.is_empty() { "?" } else { &s.repo },
+            s.started.split('T').next().unwrap_or("")
         );
         println!(
-            "{} prompts · {} files touched",
-            sess.prompts.len(),
-            sess.files.len()
+            "{} prompts · {} assistant · {} tools · {} files · effort {}",
+            s.prompts,
+            s.assistant,
+            s.tools,
+            s.files.len(),
+            crate::view::meter(s.struggle)
         );
-        println!("ask: {}", excerpt(&sess.prompts[0], 200));
-        if !sess.files.is_empty() {
-            let shown: Vec<String> = sess.files.iter().take(8).cloned().collect();
-            println!("files: {}", shown.join(", "));
+        for line in [crate::view::usage_line(&s), crate::view::tools_line(&s)].into_iter().flatten() {
+            println!("{line}");
         }
-        if !sess.pr_links.is_empty() {
-            println!("linked: {}", sess.pr_links.join(" "));
+        println!("ask: {}", s.ask);
+        if let Some(sum) = &s.summary {
+            println!("summary: {sum}");
+        }
+        if !s.files.is_empty() {
+            println!("files: {}", s.files.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
+        }
+        if let Some(pr) = &s.linked_pr {
+            println!("linked: {pr}");
         }
         println!();
     }
@@ -123,85 +74,12 @@ fn session_summaries(n: usize) -> Result<()> {
 }
 
 fn topic_digests(n: usize) -> Result<()> {
-    let docs = load_docs(crate::DOCS_PATH)?;
-    let by_id: HashMap<i64, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
-
-    println!("# topic digests (top {n})\n");
-    if let Ok(raw) = std::fs::read_to_string("clusters.json") {
-        let arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
-        let mut groups: BTreeMap<i64, (String, Vec<i64>)> = BTreeMap::new();
-        for it in &arr {
-            let c = it["cluster"].as_i64().unwrap_or(-1);
-            let label = it["label"].as_str().unwrap_or("").to_string();
-            let id = it["id"].as_i64().unwrap_or(-1);
-            let e = groups.entry(c).or_insert_with(|| (label, Vec::new()));
-            e.1.push(id);
-        }
-        let mut clusters: Vec<(i64, String, Vec<i64>)> =
-            groups.into_iter().map(|(c, (l, ids))| (c, l, ids)).collect();
-        clusters.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
-        for (_c, label, ids) in clusters.into_iter().take(n) {
-            digest_one(&label, &ids, &by_id);
-        }
+    let mut topics = crate::units::topic_units(12)?;
+    if topics.is_empty() {
+        eprintln!("(no topics — run `cluster` first)");
         return Ok(());
     }
-
-    // Fallback: per-repo GitHub digest.
-    eprintln!("(no clusters.json — falling back to per-repo digests; run `cluster` first)");
-    let mut by_repo: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    for d in &docs {
-        if d.meta.source == "github" {
-            by_repo.entry(d.meta.repo.clone()).or_default().push(d.id);
-        }
-    }
-    let mut repos: Vec<(String, Vec<i64>)> = by_repo.into_iter().collect();
-    repos.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-    for (repo, ids) in repos.into_iter().take(n) {
-        digest_one(&repo, &ids, &by_id);
-    }
-    Ok(())
-}
-
-fn digest_one(label: &str, ids: &[i64], by_id: &HashMap<i64, &Doc>) {
-    let docs: Vec<&Doc> = ids.iter().filter_map(|i| by_id.get(i).copied()).collect();
-    let prs = docs.iter().filter(|d| d.meta.kind == "pull_request").count();
-    let issues = docs.iter().filter(|d| d.meta.kind == "issue").count();
-    let sess = docs.iter().filter(|d| d.meta.source == "agent").count();
-    let mut repos: HashMap<&str, usize> = HashMap::new();
-    for d in &docs {
-        *repos.entry(d.meta.repo.as_str()).or_default() += 1;
-    }
-    let mut repo_v: Vec<_> = repos.into_iter().collect();
-    repo_v.sort_by(|a, b| b.1.cmp(&a.1));
-    let repo_s = repo_v
-        .iter()
-        .take(3)
-        .map(|(r, c)| format!("{r}({c})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!("## {label}");
-    println!("{} docs · {prs} PRs · {issues} issues · {sess} sessions · repos: {repo_s}", docs.len());
-    let mut notable: Vec<&&Doc> = docs.iter().filter(|d| d.meta.source == "github").collect();
-    notable.sort_by(|a, b| b.meta.ts.cmp(&a.meta.ts));
-    for d in notable.into_iter().take(5) {
-        println!(
-            "- {}#{} {}",
-            d.meta.repo,
-            d.meta.number.unwrap_or(0),
-            first_line(&d.text)
-        );
-    }
-    println!();
-}
-
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for e in std::fs::read_dir(dir)? {
-        let p = e?.path();
-        if p.is_dir() {
-            collect_jsonl(&p, out)?;
-        } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            out.push(p);
-        }
-    }
+    topics.truncate(n);
+    print!("{}", crate::view::topics_md(&topics));
     Ok(())
 }
