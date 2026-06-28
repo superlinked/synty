@@ -23,24 +23,6 @@ the one-line summaries are written by a small model on your CPU. synty's topic
 clustering and cross-source links (PRs, issues, and sessions, joined) mean the
 data comes already structured, so you're not analyzing a pile of raw logs.
 
-## See it in action
-
-Browse your work memory in the terminal: topics, drill-down, search, stats, the
-fleet roster.
-
-![synty's TUI: topics, drill-down, search, stats, status](docs/tui.gif)
-
-One paste from nothing to tracking plus a viewer. Start local, point at a bucket
-later (`◐ local` → `✓ on the team`).
-
-![synty init onboarding: local trial, then join the team](docs/install.gif)
-
-The agent surface: `related` / `search` / `status` printing Markdown to stdout.
-
-![synty CLI: related, search, status](docs/cli.gif)
-
-<sub>Rendered from `docs/*.tape` with [vhs](https://github.com/charmbracelet/vhs); see [CONTRIBUTING](CONTRIBUTING.md#rendering-the-demo-gifs) to re-render.</sub>
-
 ## Install & update
 
 One paste takes you from nothing to tracking plus a viewer. The bucket is
@@ -63,6 +45,24 @@ current, and `synty status` (plus the TUI footer) flags a newer build.
 
 *Building from source? See [Build & offline](#build--offline) and replace `synty`
 with `cargo run --release --`.*
+
+## See it in action
+
+Browse your work memory in the terminal: topics, drill-down, search, stats, the
+fleet roster.
+
+![synty's TUI: topics, drill-down, search, stats, status](docs/tui.gif)
+
+One paste from nothing to tracking plus a viewer. Start local, point at a bucket
+later (`◐ local` → `✓ on the team`).
+
+![synty init onboarding: local trial, then join the team](docs/install.gif)
+
+The agent surface: `related` / `search` / `status` printing Markdown to stdout.
+
+![synty CLI: related, search, status](docs/cli.gif)
+
+<sub>Rendered from `docs/*.tape` with [vhs](https://github.com/charmbracelet/vhs); see [CONTRIBUTING](CONTRIBUTING.md#rendering-the-demo-gifs) to re-render.</sub>
 
 ## Start local, then connect your machines or team
 
@@ -89,29 +89,26 @@ on by default the whole time, with its own indicator; it's never a second gate.
 
 ## Use it: you browse, your agents read
 
-**You, in the TUI.** `synty tui` opens tabs for **Topics**, **Work**,
-**Search**, **Stats**, and **Status**, with drill-down from a topic into its
-sessions and the full text. Filter to one repo or account (`r`/`a`), refresh on
-demand (`u`). The footer shows where you stand: activation (`◐ local` →
-`✓ <bucket>`) and freshness (`◐ encoding 120/470` · `⚠ stale` · `✓ fresh`).
+You explore in the TUI; your agents read the same data over the CLI and MCP, no
+server or auth. Every read command prints Markdown to stdout, or `--json` for a
+versioned envelope.
 
-**Your agents, over the CLI and MCP.** Every read command prints Markdown to
-stdout, no server or auth. `synty related` is the zero-effort entry point: no
-query, it reads the current repo's recent commits and changed files and surfaces
-prior work across everything synty has seen.
+| Command | What it does |
+|---|---|
+| `synty related` | prior work for your current task, from this repo's git (no query) |
+| `synty search "<query>"` | semantic search; add `--filter repo=…,kind=pull_request` |
+| `synty recent` | latest PRs, issues, and prompts |
+| `synty topic [name]` | emergent topics, or one topic's members |
+| `synty show <id>` | open a session, PR/issue (`repo#123`), or topic |
+| `synty status` | what's indexed, freshness, activation, the fleet roster |
+| `synty stats` | tokens / tools / sessions vs LOC / PRs / issues per week |
+| `synty tui` | interactive browser: tabs, drill-down, filter by repo or account |
+| `synty mcp` | serve the whole read surface to agents over stdio |
 
-```sh
-synty related                  # prior work for what you're doing now (from this repo's git)
-synty search "rate limiting"   # semantic search (--filter repo=api, kind=pull_request, …)
-synty recent                   # latest PRs, issues, and prompts
-synty topic                    # emergent topics (or `topic auth` to filter)
-synty status                   # health: indexed, freshness, activation, the fleet roster
-synty stats                    # usage: tokens/tools/sessions vs LOC/PRs/issues per week
-synty show a1b2c3d4            # drill into a session, PR/issue (repo#123), or topic
-```
-
-Each result is a ranked Markdown card, PRs/issues and session moments together
-(illustrative):
+`synty related` is the zero-effort entry point: no query, it reads the current
+repo's recent commits and changed files and surfaces prior work everywhere synty
+has seen. Each result is a ranked Markdown card with drillable ids (`[a1b2c3d4]`
+sessions, `repo#123` PRs/issues, `[72a778f8]` topics) that feed `synty show`:
 
 ```text
 ## rate limiting middleware
@@ -123,11 +120,6 @@ Each result is a ranked Markdown card, PRs/issues and session moments together
 3. [19.0] **issue api#1502** — 429s under burst load on the search endpoint
    open · https://github.com/acme/api/issues/1502
 ```
-
-Ids ride inline (`[a1b2c3d4]` sessions, `repo#123` PRs/issues, `[72a778f8]`
-topics) and feed `synty show <id>`. Add `--json` to any read command for a
-versioned envelope (`{"v": 1, "kind": …, "data": …}`). `synty mcp` serves the
-whole surface to a coding agent over stdio.
 
 ## Own your data
 
