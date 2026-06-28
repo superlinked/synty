@@ -6,7 +6,8 @@ synty is a passively-collected memory of how work actually happens: it ingests
 coding-agent sessions (Claude Code, Codex, Cowork) and GitHub activity, and makes
 the result searchable and readable by both humans and agents. The pivot from v1
 (`superlinked/synty-legacy`) is to a **single self-contained Rust binary** built
-on **late-interaction retrieval, with generation only for local summaries**.
+on **late-interaction retrieval, with generation only for local summaries and
+topic names**.
 Nothing leaves the machine, no API keys, runs offline.
 
 This document owns the architecture and the target end-state, and marks what is
@@ -19,8 +20,9 @@ data.
 
 - **Nothing leaves the machine.** The core (retrieval via ColBERT
   late-interaction, clustering, and keyphrases) is deterministic and
-  embedding-only, never an LLM. Session summaries are the one exception: a small
-  local model (Qwen3-0.6B on candle, the `llm` feature) generates them offline.
+  embedding-only, never an LLM. Session summaries and topic names are the
+  exception: a small local model (Qwen3-0.6B on candle, the `llm` feature)
+  generates them offline.
   No data leaves the machine either way; that is the actual feature, and a local
   model preserves it.
 - **Local-first, self-contained.** One static binary. The model downloads once
@@ -74,7 +76,7 @@ envelopes with deterministic event_ids (so a re-parse never duplicates). The
 GitHub path pulls PRs/issues straight from the GraphQL API with a token, so it
 runs on CI or a server without a developer machine.
 
-## Derivations (all without an LLM)
+## Derivations
 
 - **Search.** Filtered late-interaction retrieval. *Built.*
 - **Clusters (topics).** Emergent, no taxonomy. Clustering is over **units of

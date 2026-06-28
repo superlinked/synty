@@ -1,30 +1,41 @@
 # synty
 
-**A passive memory of how your work actually happens.** synty quietly watches
-your coding-agent sessions (Claude Code, Codex, Cowork) and your GitHub activity,
-and makes all of it searchable, by you and by the agents you work with. Before
-starting a task, ask *"has anyone touched the auth flow?"*, or just run `synty
-related` to pull the relevant prior sessions and PRs **without typing a query**.
+**Your coding agents start every session from zero. So do you.**
 
-It runs as a single local binary. **No API keys, nothing leaves your machine**,
-not even the summaries, which a small model writes locally. Retrieval is
-late-interaction embeddings (ColBERT) plus deterministic logic, with no LLM in
-the loop. For a tool that ingests your dev transcripts, that privacy *is* the
-point.
+synty quietly records every coding-agent session (Claude Code, Codex, Cowork)
+and your GitHub activity, building one local, searchable memory of how the work
+actually happened. The tracker installs once and runs everywhere, and the data
+it captures is yours to keep and read directly.
+
+**Two ways to use it:**
+
+- **Find past work in seconds.** Ask *"has anyone touched the auth flow?"*, or
+  just run `synty related`, and it surfaces the sessions and PRs that matter. You
+  browse in the TUI; your agents read the same answers over the CLI and MCP.
+- **Build on the raw data.** Everything synty stores is open: raw events as plain
+  JSONL on disk (and in the shared bucket), a SQLite metadata database, `--json`
+  on every command. See where agents get stuck, which tools burn the most tokens,
+  what to fine-tune on, and which tools your agents actually need. Nothing is
+  trapped in a built-in viewer.
+
+**Local-first:** one binary, no API keys, nothing leaves your machine, and even
+the one-line summaries are written by a small model on your CPU. synty's topic
+clustering and cross-source links (PRs, issues, and sessions, joined) mean the
+data comes already structured, so you're not analyzing a pile of raw logs.
 
 ## See it in action
 
-Browse your work memory in the terminal UI: topics, drill-down, search, stats,
-the fleet roster:
+Browse your work memory in the terminal: topics, drill-down, search, stats, the
+fleet roster.
 
 ![synty's TUI: topics, drill-down, search, stats, status](docs/tui.gif)
 
-One command from nothing to tracking + a viewer: a local trial, then join the
-team (`◐ local` → `✓ on the team`):
+One paste from nothing to tracking plus a viewer. Start local, point at a bucket
+later (`◐ local` → `✓ on the team`).
 
 ![synty init onboarding: local trial, then join the team](docs/install.gif)
 
-The agent surface: `related` / `search` / `status` printing Markdown to stdout:
+The agent surface: `related` / `search` / `status` printing Markdown to stdout.
 
 ![synty CLI: related, search, status](docs/cli.gif)
 
@@ -32,88 +43,75 @@ The agent surface: `related` / `search` / `status` printing Markdown to stdout:
 
 ## Install & update
 
-One paste from nothing to "tracking + a viewer". The bucket is optional: omit
-it to trial synty against your own sessions first, add it later to join your
-team:
+One paste takes you from nothing to tracking plus a viewer. The bucket is
+optional: omit it to trial synty against your own sessions, add it later to
+share memory across your machines or your team.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh                      # local trial
-curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh -s -- gs://my-team   # join the team
+curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh -s -- gs://my-team   # share a bucket
 ```
 
-The installer puts the binary on PATH, runs `synty init [bucket]` (pins your
-GitHub identity, enables the login-time tracker, runs the first build), then
-opens the viewer. The binary is the prebuilt asset from the latest [GitHub
+The installer puts the binary on PATH, runs `synty init [bucket]` (GitHub
+identity, login-time tracker, first build), and opens the viewer. The binary is
+the prebuilt asset from the latest [GitHub
 Release](https://github.com/superlinked/synty/releases).
 
-Update in place with `synty upgrade`: it pulls the latest release, verifies the
-sha256, replaces the binary, and restarts the tracker. It's a no-op when you're
-current, and `synty status` (plus the TUI footer) nags when a newer build
-exists. *Building from source? See [Build & offline](#build--offline); replace
-`synty` with `cargo run --release --` in any command below.*
+**Update** with `synty upgrade`: it pulls the latest release, checks the sha256,
+swaps the binary in place, and restarts the tracker. It's a no-op when you're
+current, and `synty status` (plus the TUI footer) flags a newer build.
 
-## Start local, then join your team
+*Building from source? See [Build & offline](#build--offline) and replace `synty`
+with `cargo run --release --`.*
 
-**1 · Local-first (recommended): see the value, then join.**
+## Start local, then connect your machines or team
 
-1. **Install with no bucket.** `synty init` pins your identity, turns on the
-   login-time tracker, and builds an index from your local sessions (+ your
-   org's PRs if you have a `gh`/`GITHUB_TOKEN`). Status reads **`◐ local`**.
-2. **Use it.** The tracker runs at login; you browse in `synty tui` and run
-   `synty related` / `synty search` before tasks. Everything stays on your
-   machine; you push nothing, and the fleet can't see you.
-3. **Join the team** when you're ready: `synty init gs://my-team`. That sets the
-   bucket; the next build pulls the fleet's shared memory and your tracker starts
-   contributing. Status flips to **`✓ my-team`**, and you're an activated member.
+You don't need a bucket to get value. Start on one machine; add a bucket when you
+want synty to span more than one.
 
-**2 · Straight to the team.** If you already trust it, install with the bucket
-(journey 1, but the one-liner carries `gs://my-team`). You land directly at
-`✓ my-team`.
+**1. Local-first (recommended).**
 
-**3 · Everyday: you browse, your agents read.** Same index, two surfaces:
+- `synty init` pins your identity, turns on the login-time tracker, and builds an
+  index from your local sessions (plus your org's PRs if you have a
+  `gh`/`GITHUB_TOKEN`). Status reads **`◐ local`**.
+- Use it: the tracker runs at login, you browse in `synty tui`, and you run
+  `synty related` before tasks. Everything stays on your machine; the fleet
+  can't see you.
+- Add a bucket when you're ready: `synty init gs://my-team`. The bucket is the
+  shared memory, whether that's your own laptop and desktop or your whole team.
+  Status flips to **`✓ my-team`**.
 
-- **You:** `synty tui`, an interactive terminal UI for exploring.
-- **Your agents:** `synty related` / `synty search` (Markdown to stdout), or the
-  MCP server, so a coding agent consults past work mid-session.
+**2. Straight to a bucket.** If you already trust it, install with the bucket
+(`… | sh -s -- gs://my-team`) and land at `✓ my-team`.
 
-The only thing that moves you from `◐ local` to `✓ <bucket>` is setting a bucket.
-Autostart (login-time tracking) is on by default the whole time and has its own
-indicator; it's never a second gate.
+The only thing that activates you is setting a bucket. The login-time tracker is
+on by default the whole time, with its own indicator; it's never a second gate.
 
-## Browse it yourself, or let your agents read it
+## Use it: you browse, your agents read
 
-### The TUI: browse, filter, drill in
+**You, in the TUI.** `synty tui` opens tabs for **Topics**, **Work**,
+**Search**, **Stats**, and **Status**, with drill-down from a topic into its
+sessions and the full text. Filter to one repo or account (`r`/`a`), refresh on
+demand (`u`). The footer shows where you stand: activation (`◐ local` →
+`✓ <bucket>`) and freshness (`◐ encoding 120/470` · `⚠ stale` · `✓ fresh`).
 
-`synty tui` opens tabs for **Topics**, **Work**, **Search**, **Stats**, and
-**Status**, with drill-down from a topic into its sessions and the full document
-text. Filter any list to one repo or account with `r`/`a`; refresh on demand
-with `u`. The footer always says where you stand: activation (`◐ local` →
-`✓ <bucket>`) and freshness (`◐ encoding 120/470` · `⚠ stale` · `✓ fresh`). The
-Stats tab charts what the agents consume against what the work produces; the
-Status tab shows tracker health and the fleet roster (who runs synty where, who
-runs agents untracked) and toggles login-time tracking. On startup it pulls the
-fleet's published index and freshens in the background.
-
-### The CLI & MCP: Markdown your agents read
-
-Every read command prints Markdown to stdout, exactly what a coding agent reads
-over the shell, no server or auth. `synty related` is the zero-effort entry
-point: **non-interactive, no query**. It reads this repo's recent commits and
-changed files, builds a query from them, and surfaces prior work across every
-repo synty has seen.
+**Your agents, over the CLI and MCP.** Every read command prints Markdown to
+stdout, no server or auth. `synty related` is the zero-effort entry point: no
+query, it reads the current repo's recent commits and changed files and surfaces
+prior work across everything synty has seen.
 
 ```sh
-synty related                  # prior work related to what you're doing now (from this repo's git)
+synty related                  # prior work for what you're doing now (from this repo's git)
 synty search "rate limiting"   # semantic search (--filter repo=api, kind=pull_request, …)
 synty recent                   # latest PRs, issues, and prompts
 synty topic                    # emergent topics (or `topic auth` to filter)
-synty status                   # health: what's indexed, freshness, activation, the fleet roster
+synty status                   # health: indexed, freshness, activation, the fleet roster
 synty stats                    # usage: tokens/tools/sessions vs LOC/PRs/issues per week
-synty show a1b2c3d4            # drill into a session, PR/issue (repo#123), or topic key
+synty show a1b2c3d4            # drill into a session, PR/issue (repo#123), or topic
 ```
 
 Each result is a ranked Markdown card, PRs/issues and session moments together
-(illustrative output):
+(illustrative):
 
 ```text
 ## rate limiting middleware
@@ -126,86 +124,103 @@ Each result is a ranked Markdown card, PRs/issues and session moments together
    open · https://github.com/acme/api/issues/1502
 ```
 
-Output is built to be drilled: `search`, `related`, `recent`, and `topic` print
-stable ids inline (`[a1b2c3d4]` sessions, `repo#123` PRs/issues, `[72a778f8]`
-topics) that feed `synty show <id>`. Every read command takes `--json`: one
-versioned envelope, `{"v": 1, "kind": "…", "data": …}`, so a script checks `v`
-once and dispatches on `kind`.
+Ids ride inline (`[a1b2c3d4]` sessions, `repo#123` PRs/issues, `[72a778f8]`
+topics) and feed `synty show <id>`. Add `--json` to any read command for a
+versioned envelope (`{"v": 1, "kind": …, "data": …}`). `synty mcp` serves the
+whole surface to a coding agent over stdio.
 
-For coding agents, `synty mcp` serves the same surface over stdio (`synty_search`,
-`synty_related`, `synty_topics`, `synty_recent`, `synty_status`, `synty_stats`,
-`synty_tool`, `synty_show`). `synty_related` takes the agent's repo path and
-needs no query; ids in any tool's output feed `synty_show`.
+## Own your data
 
-## Fleet mode (teams)
+synty is a capture layer, not a walled garden. Everything it records sits in
+plain files under your synty home (`~/.synty` by default), so you can analyze it
+however you like without going back through synty.
 
-Solo, the "bucket" is a local directory. For a team it's one shared S3/GCS
-bucket, and the bucket is the *only* shared infrastructure: no build server, no
-cron, no coordination service. That works because everything in it is
-append-only (events), write-once (embeddings, summaries), or swapped atomically
-behind a pointer (the index), so machines cooperate without ever talking to each
-other. Three roles, one binary:
+- **Raw events** (the source of truth): append-only JSONL under `corpus/local/`,
+  and `events/<stream>/` in a shared bucket. The envelope schema is in
+  [`docs/design.md`](docs/design.md).
+- **Documents** (sessions + GitHub, ingested): `corpus/docs.jsonl`, one object
+  per line with `meta` (`source`, `kind`, `repo`, `author`, `session_id`, `ts`).
+- **Metadata**: a SQLite database under `index/`; the `meta` fields are the
+  columns, so any SQLite tool can query it.
+
+The shaped views are already a pipe away:
+
+```sh
+# weekly token, tool, and session totals
+synty stats --json | jq '.data.weeks[] | {week: .start, tok_in, tok_out, tools}'
+
+# one tool's profile: calls, errors, latency (where agents get stuck)
+synty tool Bash --json | jq '{calls: .data.calls, errors: .data.errors, p95_ms: .data.p95_ms}'
+
+# count documents by kind, straight from the raw file
+jq -r '.meta.kind' ~/.synty/corpus/docs.jsonl | sort | uniq -c
+```
+
+Build a dashboard on it, fine-tune a model on your own sessions, decide which
+tools your agents actually need. And because synty already clusters the work and
+links across sources (PRs, issues, sessions), your analysis starts from
+structured data instead of a heap of logs.
+
+## Fleet mode
+
+Solo, the "bucket" is a local directory. For a team, or just your own laptop and
+desktop, it's one shared S3/GCS bucket, and that bucket is the *only* shared
+infrastructure: no build server and no coordination service. It works because
+everything in it is append-only (events), write-once (embeddings, summaries), or
+swapped atomically behind a pointer (the index).
+
+Three roles, one binary:
 
 - **Every machine writes.** The tracker runs at login: model-free, near-zero
-  footprint, it tails local agent session files and pushes raw events.
-- **One machine scrapes GitHub.** Whichever machine has a token refreshes the
-  org's PRs/issues during its builds (incrementally) and shares the result.
-  Nobody else needs a token.
+  footprint, tailing local session files and pushing raw events.
+- **One machine scrapes GitHub.** Whoever has a token refreshes the org's
+  PRs/issues during its builds and shares the result. Nobody else needs a token.
 - **Viewers build.** Opening `synty tui` (or `synty build`) pulls the latest
-  published read-model, then freshens in the background, encoding and
-  summarizing only what no machine has done yet, one soft lease per build, then a
-  pointer swap.
+  read-model, then freshens in the background: encode and summarize only what no
+  machine has done yet, one soft lease per build, then a pointer swap.
 
-The configured bucket is the default everywhere; `--bucket` overrides. Cloud
-buckets need `--features s3` / `gcs`. To exercise the whole sync path locally
-(no cloud account): `scripts/fleet-smoke.sh` runs publish → cold pull → delta
-pull against a temp local-dir bucket and checks the `[metrics sync]` numbers.
+Cloud buckets need `--features s3` / `gcs`. To exercise the whole sync path with
+no cloud account, `scripts/fleet-smoke.sh` runs publish, a cold pull, then a
+delta pull against a temp local bucket and checks the `[metrics sync]` numbers.
 
-> **Caveat:** every fleet member has raw bucket access and can read everyone's
-> sessions. synty is built for high-trust teams; there's no redaction or
-> per-reader mediation. If that doesn't fit, stay solo with a local bucket, or
-> share one only among people who can already read each other's work.
+> **Heads up:** every member with the bucket can read every session in it. synty
+> is built for high-trust groups; there's no redaction or per-reader mediation.
+> If that doesn't fit, stay local, or share a bucket only among people who can
+> already see each other's work.
 
 ## Run the pipeline yourself
 
-`synty build` runs the whole pipeline once (track → ingest → index → summarize →
-cluster → topic summaries); `synty up` loops it every minute (your machine is
-both the model-free tracker and the builder). The individual steps, for
-scripting:
+`synty build` runs the whole thing (track → ingest → index → summarize →
+cluster); `synty up` loops it every minute. The individual steps, for scripting:
 
 ```sh
-synty track     # tail agent sessions → canonical event envelopes
-synty github    # pull the org's active PRs/issues (org from `init`; $GITHUB_TOKEN or gh)
-synty ingest    # turn events + GitHub into searchable documents
+synty track     # tail agent sessions → event envelopes
+synty github    # pull the org's active PRs/issues (token or gh)
+synty ingest    # events + GitHub → searchable documents
 synty index     # encode with ColBERT and build the index
-synty summarize                  # local-LLM one-line summary per unit
+synty summarize # local one-line summary per unit (run again for topic summaries)
 synty cluster --resolution 2.0   # group units by summary embedding → topics
-synty summarize                  # again: reduce each topic from its members
 ```
 
-`cluster` groups *units of work* (sessions, PRs, issues) by their summary, so run
-`summarize` first; the topic summaries are a second `summarize` pass.
+## How it works
 
-## How it works, and why nothing leaves your machine
-
-- **Retrieval has no LLM in it.** `pylate-rs` runs a small ColBERT model
+- **Late-interaction retrieval.** `pylate-rs` runs a small ColBERT model
   (ModernBERT, 32 M params) that encodes each document as one vector *per
   token*; `next-plaid` (PLAID) scores queries with MaxSim, backed by SQLite for
-  exact metadata filters. Late interaction retrieves far better than
-  single-vector embeddings on short, code-adjacent text.
-- **Summaries are local.** The one-line unit/topic summaries come from a small
-  model (Qwen3-0.6B) running offline on your CPU, never a remote API, so your
-  sessions are never sent anywhere. Topic *names* must share a distinctive
-  cluster term and embed close to their members, else an extractive title wins.
+  exact metadata filters. Late interaction beats single-vector embeddings on
+  short, code-adjacent text.
+- **Summaries and names from a small local model.** The one-line session and
+  topic summaries, and the gated topic names, come from Qwen3-0.6B on your CPU,
+  never a remote API. A name has to share a distinctive cluster term and embed
+  close to its members, or an extractive title wins.
 - **Events are the source of truth.** Sessions and GitHub items become
-  append-only event envelopes; the index and its metadata are derived
-  projections, rebuildable from the events at any time and shareable through a
-  bucket.
-- **Activation = a bucket.** A machine is a fleet member exactly when a bucket is
-  set; that single fact is what the status surface tracks.
+  append-only envelopes; the index and metadata are derived projections,
+  rebuildable any time and shareable through a bucket.
+- **Activation is a bucket.** A machine is a fleet member exactly when a bucket
+  is set. That single fact is what the status surface tracks.
 
-Architecture and rationale live in `docs/design.md`; validation on real data in
-`evals/`.
+Architecture and rationale live in [`docs/design.md`](docs/design.md); the
+on-real-data validation lives in [`evals/`](evals/).
 
 ## Build & offline
 
@@ -213,14 +228,14 @@ Architecture and rationale live in `docs/design.md`; validation on real data in
 cargo build --release        # plain CPU, portable, dependency-light (the shipped build)
 ```
 
-On Apple Silicon, build with `--features metal` for GPU encode (~5.7× faster);
+On Apple Silicon, add `--features metal` for GPU encode (~5.7× faster);
 `accelerate` (macOS) and `mkl` (Linux) are CPU-BLAS alternatives. None is the
 default.
 
 The embedding model (`mixedbread-ai/mxbai-edge-colbert-v0-32m`, ~127 MB)
-downloads on first use; the summarizer (~1.2 GB) downloads the first time
-anything summarizes. For a guaranteed-offline setup, fetch the embedding model
-once and point `SYNTY_MODEL` at the local directory:
+downloads on first use; the summarizer (~1.2 GB) the first time anything
+summarizes. For a guaranteed-offline setup, fetch the embedding model once and
+point `SYNTY_MODEL` at the directory:
 
 ```sh
 m=models/mxbai; mkdir -p $m/1_Dense
@@ -232,5 +247,5 @@ done
 export SYNTY_MODEL="$PWD/models/mxbai"
 ```
 
-Cutting a release (the CI matrix, version tags) is a maintainer task: see
+Cutting a release (version tags, the CI build matrix) is a maintainer task: see
 [CONTRIBUTING](CONTRIBUTING.md#releasing).
