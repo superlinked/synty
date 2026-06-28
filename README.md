@@ -1,6 +1,6 @@
 # synty
 
-### Your coding agents start every session from zero. So do you.
+**Your coding agents start every session from zero. So do you.**
 
 synty quietly records every coding-agent session (Claude Code, Codex, Cowork)
 and your GitHub activity, building one local, searchable memory of how the work
@@ -43,9 +43,9 @@ The agent surface: `related` / `search` / `status` printing Markdown to stdout.
 
 ## Install & update
 
-One paste, nothing to "tracking plus a viewer". The bucket is optional: omit it
-to trial synty against your own sessions, add it later to share memory across
-your machines or your team.
+One paste takes you from nothing to tracking plus a viewer. The bucket is
+optional: omit it to trial synty against your own sessions, add it later to
+share memory across your machines or your team.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh                      # local trial
