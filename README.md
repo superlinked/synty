@@ -98,8 +98,6 @@ desktop, point synty at one shared S3/GCS bucket and you build one memory:
 synty init gs://my-team
 ```
 
-![synty onboarding: a local trial activating onto a shared bucket](docs/install.gif)
-
 That bucket is the only shared infrastructure: no build server, no coordination
 service. Every machine's tracker pushes events; whoever opens a viewer builds the
 index and publishes it for the rest; one tokened machine scrapes GitHub for
