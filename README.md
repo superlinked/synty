@@ -112,8 +112,10 @@ everyone. Cloud buckets need `--features s3` / `gcs`.
 
 - **Retrieval is late interaction.** `pylate-rs` runs a small ColBERT model
   (ModernBERT, 32 M params) that encodes each document as one vector per token;
-  `next-plaid` scores queries with MaxSim over a SQLite metadata filter. It beats
-  single-vector embeddings on short, code-adjacent text.
+  `next-plaid` scores queries with MaxSim over a SQLite metadata filter. That
+  per-token scoring lets a rare or specific term (a function name, a file path)
+  carry its own signal, instead of being averaged into one document vector the
+  way single-vector embeddings do.
 - **Summaries and topic names** come from a small local model (Qwen3-0.6B) on
   your CPU, never a remote API, with an extractive fallback.
 - **Events are the source of truth.** The index and metadata are derived

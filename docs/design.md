@@ -48,8 +48,10 @@ data.
   SQLite metadata store). Filtered search resolves a `column=value` predicate to
   a doc-id subset via the metadata DB, then runs MaxSim over it.
 - **Why late interaction:** one ~128-dim vector per token (not per document)
-  retrieves far better than single-vector embeddings on short, code-adjacent
-  text, and the SQLite side gives exact metadata filtering for free.
+  means a specific term still carries its own signal instead of being averaged
+  into a single pooled vector; that advantage over single-vector embeddings
+  holds generally and widens on longer documents, where pooling discards more.
+  The SQLite side gives exact metadata filtering for free.
 
 ## Data model
 
