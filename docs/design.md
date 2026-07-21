@@ -146,7 +146,7 @@ runs on CI or a server without a developer machine.
 ## Surfaces
 
 - **CLI → stdout (agents):** `search`, `related`, `topic`, `recent`, `status`,
-  `stats`, `tool`, `show` print Markdown an agent reads over the shell: no
+  `stats`, `tool`, `show`, and `trace` print Markdown an agent reads over the shell: no
   server, no auth, no network. `related` takes no query: it derives one from the
   repo's recent commits + changed files and searches cross-repo, so an agent can
   pull prior work on its current task for free. Stable ids ride inline (sessions
@@ -163,6 +163,36 @@ runs on CI or a server without a developer machine.
   path and needs no query). *Built.*
 - **JSON output:** `--json` on every read command, one versioned envelope
   (`{"v": 1, "kind": …, "data": …}`) so scripts check the format once. *Built.*
+
+### Execution-trace query surface
+
+`synty trace` is the narrow forensic layer over canonical raw events. It gives
+the investigating agent compact, composable facts without embedding an analyst
+or a remediation workflow in synty itself:
+
+- `trace list --type turns|spans|jobs` filters by repo, machine, source, status,
+  operation, time, error presence, and duration, then sorts by recency or
+  duration. Jobs may instead sort by source-reported wait time.
+- `trace show <id>` expands a source-native turn, paired tool call/result, raw
+  event, associated job, or session into a bounded evidence timeline. Turn
+  timelines collapse same-turn job polls into one navigable job row.
+- `trace search <literal>` searches the raw envelopes, including prompts,
+  commands, outputs, and metadata; `trace compare <left> <right>` returns only
+  factual field differences between two turns or two spans.
+
+Turn boundaries use source-native task/turn markers where they exist and
+prompt boundaries otherwise. Tool spans pair call/result ids within a session.
+For Codex asynchronous commands, a job associates the initiating `exec_command`
+with later `write_stdin` calls by the exact process-session id present in both
+records. It reports lifecycle elapsed time separately from the sum of
+source-reported tool waits: a long-lived background server is not automatically
+a long wait. A continuation without a captured initiating call remains visible
+and is labeled `continuation_only` rather than guessed onto another command.
+Every duration says whether the source reported it or it is merely an event
+gap; the latter may include human approval or idle time and is deliberately not
+presented as tool runtime. The projection is rebuilt on demand from JSONL for
+now, keeping raw envelopes authoritative and avoiding a new index contract
+until corpus-scale use demonstrates one is needed. *Built.*
 
 ## Tiers and the trust boundary
 
@@ -261,7 +291,8 @@ A working binary: `up` (solo loop), `build` (one-shot fleet-aware pipeline),
 (GraphQL backfill), `ingest` (envelopes + GitHub → `corpus/docs.jsonl`,
 `--bucket` to pull), `index` (encode + content-addressed store + versioned
 build + publish), `search [--filter col=value] [--json]`, `topic`, `recent`,
-`status`, `tui`, `mcp`, `cluster [--resolution]`, `summarize`, `eval`, plus the
+`status`, `trace list/show/search/compare` (turns, spans, async jobs), `tui`, `mcp`,
+`cluster [--resolution]`, `summarize`, `eval`, plus the
 scenario test suite (`cargo test`, pure). The bucket backplane (local always,
 S3/GCS opt-in) gives fleet-wide encode-once and collaborative builds.
 Validated at M0/M1 on real data (3,938 docs / 770 K embeddings): retrieval 12/12
