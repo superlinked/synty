@@ -178,7 +178,7 @@ or a remediation workflow in synty itself:
   timelines collapse same-turn job polls into one navigable job row.
 - `trace search <literal>` searches the raw envelopes, including prompts,
   commands, outputs, and metadata; `trace compare <left> <right>` returns only
-  factual field differences between two turns or two spans.
+  factual field differences between two turns, two spans, or two jobs.
 
 Turn boundaries use source-native task/turn markers where they exist and
 prompt boundaries otherwise. Tool spans pair call/result ids within a session.

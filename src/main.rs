@@ -251,8 +251,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect coding-agent execution as turns, paired tool spans, and raw
-    /// event evidence. This is a factual trace surface, not a bottleneck judge.
+    /// Inspect coding-agent execution as turns, paired tool spans, async job
+    /// chains, and raw event evidence. This is a factual trace surface, not a
+    /// bottleneck judge.
     Trace {
         #[command(subcommand)]
         command: TraceCmd,
@@ -720,7 +721,7 @@ mod tests {
     // Trace reads are grouped under one namespace and keep scriptable filters
     // on the list/search operations rather than adding more top-level commands.
     #[test]
-    fn trace_parses_forensic_list_job_and_search_queries() {
+    fn trace_parses_forensic_list_show_search_and_compare_queries() {
         let list = Cli::try_parse_from([
             "synty", "trace", "list", "--type", "spans", "--status", "error",
             "--sort", "duration", "--limit", "7", "--json",
@@ -763,6 +764,30 @@ mod tests {
             Cmd::Trace {
                 command: TraceCmd::Search { query, kind: Some(k), .. }
             } if query == "libxcb.so.1" && k == "tool_result"
+        ));
+
+        let show = Cli::try_parse_from(["synty", "trace", "show", "job:01ABC"])
+            .expect("job detail with the default evidence window");
+        assert!(matches!(
+            show.cmd,
+            Cmd::Trace {
+                command: TraceCmd::Show {
+                    id,
+                    before: 6,
+                    after: 12,
+                    json: false,
+                }
+            } if id == "job:01ABC"
+        ));
+
+        let compare = Cli::try_parse_from([
+            "synty", "trace", "compare", "job:left", "job:right", "--json",
+        ]).expect("job comparison");
+        assert!(matches!(
+            compare.cmd,
+            Cmd::Trace {
+                command: TraceCmd::Compare { left, right, json: true }
+            } if left == "job:left" && right == "job:right"
         ));
     }
 

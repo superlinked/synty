@@ -555,8 +555,15 @@ fn build_codex_turns(
     for (pos, &i) in indexes.iter().enumerate() {
         let e = &events[i];
         if e.event_kind == "task_started" {
-            if let Some(b) = cur.take() {
-                push_turn(b, events, spans, ctx, sid, out);
+            if let Some(mut prior) = cur.take() {
+                if prior.duration_ms.is_none() {
+                    prior.duration_ms = turn_gap_ms(events, &prior.event_indexes);
+                    prior.duration_source = "event_gap".into();
+                }
+                if prior.status == "open" {
+                    prior.status = "unknown".into();
+                }
+                push_turn(prior, events, spans, ctx, sid, out);
             }
             cur = Some(TurnBuilder {
                 id: if e.turn_id.is_empty() {
@@ -2011,6 +2018,62 @@ mod tests {
         assert_eq!(s.spans[0].exit_code, Some(1));
         assert_eq!(s.spans[0].duration_ms, Some(2_500));
         assert_eq!(s.spans[0].duration_source, "reported");
+    }
+
+    #[test]
+    fn new_task_finalizes_an_abandoned_prior_turn() {
+        let lines = [
+            ev(
+                "a001",
+                "2026-06-01T10:00:00Z",
+                "codex_cli",
+                "S",
+                "agent_meta",
+                json!({"event_kind":"task_started","payload":{"turn_id":"T1"}}),
+            ),
+            ev(
+                "a002",
+                "2026-06-01T10:00:01Z",
+                "codex_cli",
+                "S",
+                "user_prompt",
+                json!({"text":"first task"}),
+            ),
+            ev(
+                "a003",
+                "2026-06-01T10:00:05Z",
+                "codex_cli",
+                "S",
+                "agent_meta",
+                json!({"event_kind":"task_started","payload":{"turn_id":"T2"}}),
+            ),
+            ev(
+                "a004",
+                "2026-06-01T10:00:06Z",
+                "codex_cli",
+                "S",
+                "user_prompt",
+                json!({"text":"second task"}),
+            ),
+            ev(
+                "a005",
+                "2026-06-01T10:00:09Z",
+                "codex_cli",
+                "S",
+                "agent_meta",
+                json!({"event_kind":"task_complete","payload":{"turn_id":"T2","duration_ms":3000}}),
+            ),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let s = TraceStore::from_lines(&refs);
+        let first = s.turns.iter().find(|t| t.id == "T1").expect("first turn");
+        let second = s.turns.iter().find(|t| t.id == "T2").expect("second turn");
+        assert_eq!(first.status, "unknown");
+        assert_eq!(first.duration_ms, Some(1_000));
+        assert_eq!(first.duration_source, "event_gap");
+        assert_eq!(second.status, "ok");
+        assert_eq!(second.duration_ms, Some(3_000));
+        assert_eq!(s.turns.len(), 2);
     }
 
     #[test]
