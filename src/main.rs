@@ -43,9 +43,10 @@ mod qwen;
 mod search;
 mod summarize;
 mod topics;
+mod trace;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 pub const CORPUS_DIR: &str = "corpus";
@@ -250,6 +251,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect coding-agent execution as turns, paired tool spans, async job
+    /// chains, and raw event evidence. This is a factual trace surface, not a
+    /// bottleneck judge.
+    Trace {
+        #[command(subcommand)]
+        command: TraceCmd,
+    },
     /// Initialize synty on this machine in one step: set the bucket (omit for a
     /// local trial), pin the GitHub identity, enable the login-time tracker, and
     /// run the first build. Idempotent — re-run with a bucket to switch a local
@@ -390,6 +398,114 @@ enum Cmd {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum TraceEntity {
+    Turns,
+    Spans,
+    Jobs,
+}
+
+impl TraceEntity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Turns => "turns",
+            Self::Spans => "spans",
+            Self::Jobs => "jobs",
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TraceSort {
+    Recent,
+    Duration,
+    Wait,
+}
+
+impl TraceSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Duration => "duration",
+            Self::Wait => "wait",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum TraceCmd {
+    /// List source-native turns, paired tool spans, or associated async jobs.
+    List {
+        /// Execution entity to list.
+        #[arg(long = "type", value_enum, default_value_t = TraceEntity::Turns)]
+        entity: TraceEntity,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        machine: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        /// Exact factual status: ok, error, aborted, running, open, or unknown.
+        #[arg(long)]
+        status: Option<String>,
+        /// Tool/command substring (spans, jobs, or turns with a matching span).
+        #[arg(long)]
+        operation: Option<String>,
+        /// For turns or jobs, require at least one error-status child span.
+        #[arg(long)]
+        has_errors: bool,
+        /// ISO timestamp or YYYY-MM-DD lower bound.
+        #[arg(long)]
+        since: Option<String>,
+        /// Minimum turn/span duration, or associated-job lifecycle elapsed time.
+        #[arg(long)]
+        min_ms: Option<u64>,
+        #[arg(long, value_enum, default_value_t = TraceSort::Recent)]
+        sort: TraceSort,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a compact timeline for a turn/session or evidence around a span/event.
+    Show {
+        /// Full id or unique prefix printed by another trace command.
+        id: String,
+        /// Events before a span/event hit.
+        #[arg(long, default_value_t = 6)]
+        before: usize,
+        /// Events after a span/event hit.
+        #[arg(long, default_value_t = 12)]
+        after: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Literal case-insensitive search over raw event envelopes, including
+    /// prompts, commands, tool outputs, and metadata.
+    Search {
+        query: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        machine: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two turn, span, or async-job ids field-by-field.
+    Compare {
+        left: String,
+        right: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Run from the synty home: an explicit $SYNTY_HOME wins; a cwd that already
 /// holds synty state (.synty/) is its own home (the dev-checkout case); else
 /// fall back to ~/.synty when the installer created it. Every state path in
@@ -493,6 +609,24 @@ fn main() -> Result<()> {
                 print!("{}", view::show_report(&id)?);
             }
         }
+        Cmd::Trace { command } => match command {
+            TraceCmd::List {
+                entity, repo, machine, source, status, operation, has_errors,
+                since, min_ms, sort, limit, json,
+            } => trace::list(
+                entity.as_str(), repo.as_deref(), machine.as_deref(), source.as_deref(),
+                status.as_deref(), operation.as_deref(), has_errors, since.as_deref(),
+                min_ms, sort.as_str(), limit, json,
+            )?,
+            TraceCmd::Show { id, before, after, json } => {
+                trace::show(&id, before, after, json)?
+            }
+            TraceCmd::Search { query, repo, machine, source, kind, limit, json } => trace::search(
+                &query, repo.as_deref(), machine.as_deref(), source.as_deref(),
+                kind.as_deref(), limit, json,
+            )?,
+            TraceCmd::Compare { left, right, json } => trace::compare(&left, &right, json)?,
+        },
         Cmd::Init { bucket, machine, no_build } => init::run(bucket, &machine, no_build)?,
         Cmd::Tui { bucket } => tui::run(model_id(), config::resolve_bucket(bucket))?,
         Cmd::Mcp => mcp::run(model_id())?,
@@ -560,7 +694,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{excerpt, first_line, Cli, Cmd};
+    use super::{excerpt, first_line, Cli, Cmd, TraceCmd, TraceEntity, TraceSort};
     use clap::Parser;
 
     // `synty init` is the single onboarding command: the bucket is an optional
@@ -582,6 +716,79 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["synty", "upgrade"]).expect("upgrade").cmd, Cmd::Upgrade));
         // The bucket-publish path is gone — distribution is GitHub Releases.
         assert!(Cli::try_parse_from(["synty", "publish"]).is_err());
+    }
+
+    // Trace reads are grouped under one namespace and keep scriptable filters
+    // on the list/search operations rather than adding more top-level commands.
+    #[test]
+    fn trace_parses_forensic_list_show_search_and_compare_queries() {
+        let list = Cli::try_parse_from([
+            "synty", "trace", "list", "--type", "spans", "--status", "error",
+            "--sort", "duration", "--limit", "7", "--json",
+        ]).expect("filtered span list");
+        assert!(matches!(
+            list.cmd,
+            Cmd::Trace {
+                command: TraceCmd::List {
+                    entity: TraceEntity::Spans,
+                    status: Some(s),
+                    sort: TraceSort::Duration,
+                    limit: 7,
+                    json: true,
+                    ..
+                }
+            } if s == "error"
+        ));
+
+        let jobs = Cli::try_parse_from([
+            "synty", "trace", "list", "--type", "jobs", "--operation", "whisper",
+            "--sort", "wait",
+        ]).expect("associated job list");
+        assert!(matches!(
+            jobs.cmd,
+            Cmd::Trace {
+                command: TraceCmd::List {
+                    entity: TraceEntity::Jobs,
+                    operation: Some(q),
+                    sort: TraceSort::Wait,
+                    ..
+                }
+            } if q == "whisper"
+        ));
+
+        let search = Cli::try_parse_from([
+            "synty", "trace", "search", "libxcb.so.1", "--kind", "tool_result",
+        ]).expect("raw evidence search");
+        assert!(matches!(
+            search.cmd,
+            Cmd::Trace {
+                command: TraceCmd::Search { query, kind: Some(k), .. }
+            } if query == "libxcb.so.1" && k == "tool_result"
+        ));
+
+        let show = Cli::try_parse_from(["synty", "trace", "show", "job:01ABC"])
+            .expect("job detail with the default evidence window");
+        assert!(matches!(
+            show.cmd,
+            Cmd::Trace {
+                command: TraceCmd::Show {
+                    id,
+                    before: 6,
+                    after: 12,
+                    json: false,
+                }
+            } if id == "job:01ABC"
+        ));
+
+        let compare = Cli::try_parse_from([
+            "synty", "trace", "compare", "job:left", "job:right", "--json",
+        ]).expect("job comparison");
+        assert!(matches!(
+            compare.cmd,
+            Cmd::Trace {
+                command: TraceCmd::Compare { left, right, json: true }
+            } if left == "job:left" && right == "job:right"
+        ));
     }
 
     #[test]

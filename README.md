@@ -47,6 +47,7 @@ Every read command prints Markdown to stdout, or `--json` for a versioned envelo
 | `synty recent` | latest PRs, issues, and prompts |
 | `synty topic [name]` | emergent topics, or one topic's members |
 | `synty show <id>` | open a session, PR/issue (`repo#123`), or topic |
+| `synty trace list/show/search/compare` | inspect turns, paired tool calls, async jobs, and raw evidence |
 | `synty status` | what's indexed, freshness, activation, the fleet roster |
 | `synty stats` | tokens / tools / sessions vs LOC / PRs / issues per week |
 | `synty tui` | interactive browser: tabs, drill-down, filter by repo or account |
@@ -82,7 +83,10 @@ plain files under `~/.synty`, so you can build on it directly:
 
 ```sh
 synty stats --json | jq '.data.weeks[] | {week: .start, tok_in, tok_out}'   # weekly token trend
-synty tool Bash --json | jq '{calls: .data.calls, errors: .data.errors}'    # where agents get stuck
+synty trace list --type spans --status error --sort duration               # slow/error tool evidence
+synty trace list --type jobs --sort wait                                   # associated exec/poll lifecycles
+synty trace search 'libxcb.so.1'                                           # literal raw-event lookup
+synty trace show <full-or-unique-id> --json                                # surrounding execution context
 jq -r '.meta.kind' ~/.synty/corpus/docs.jsonl | sort | uniq -c              # straight from the raw file
 ```
 
