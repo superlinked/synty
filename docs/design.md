@@ -48,7 +48,9 @@ data.
   if the GPU can't init), `accelerate` (macOS CPU BLAS), `mkl` (Linux CPU BLAS).
 - **Index / search:** `next-plaid` (PLAID multi-vector index + MaxSim scoring,
   SQLite metadata store). Filtered search resolves a `column=value` predicate to
-  a doc-id subset via the metadata DB, then runs MaxSim over it.
+  a doc-id subset via the metadata DB, then runs MaxSim over it. Fleet builds
+  inventory shared vectors once, then fetch, encode, and append bounded document
+  batches so a long retention window never holds every token matrix in RAM.
 - **Why late interaction:** one ~128-dim vector per token (not per document)
   means a specific term still carries its own signal instead of being averaged
   into a single pooled vector; that advantage over single-vector embeddings
