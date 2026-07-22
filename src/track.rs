@@ -651,19 +651,41 @@ fn run_service(cmd: &str, args: &[&str]) -> Result<()> {
 
 /// (Un)load the unit via the service manager, then verify activation.
 fn loader(kind: &str, path: &str, on: bool) -> Result<()> {
+    loader_with(
+        kind,
+        path,
+        on,
+        run_service,
+        service_registered,
+        || service_loaded(kind),
+        || std::thread::sleep(Duration::from_millis(100)),
+    )
+}
+
+/// Loader flow with injectable service operations so lifecycle ordering and
+/// readiness behavior can be exercised without touching the host manager.
+fn loader_with(
+    kind: &str,
+    path: &str,
+    on: bool,
+    mut run: impl FnMut(&str, &[&str]) -> Result<()>,
+    mut registered: impl FnMut(&str) -> bool,
+    mut ready: impl FnMut() -> bool,
+    wait: impl FnMut(),
+) -> Result<()> {
     match (kind, on) {
         ("launchd", true) => {
             let domain = launch_domain();
             let target = format!("{domain}/{SERVICE_LABEL}");
-            if service_registered(kind) {
-                let _ = run_service("launchctl", &["bootout", &target]);
+            if registered(kind) {
+                let _ = run("launchctl", &["bootout", &target]);
             }
-            run_service("launchctl", &["bootstrap", &domain, path])?;
-            run_service("launchctl", &["kickstart", "-k", &target])?;
+            run("launchctl", &["bootstrap", &domain, path])?;
+            run("launchctl", &["kickstart", "-k", &target])?;
         }
         ("launchd", false) => {
-            if service_registered(kind) {
-                run_service(
+            if registered(kind) {
+                run(
                     "launchctl",
                     &["bootout", &format!("{}/{}", launch_domain(), SERVICE_LABEL)],
                 )?;
@@ -671,26 +693,20 @@ fn loader(kind: &str, path: &str, on: bool) -> Result<()> {
         }
         ("systemd", true) => {
             for args in SYSTEMD_LOAD_SEQUENCE {
-                run_service("systemctl", args)?;
+                run("systemctl", args)?;
             }
         }
         ("systemd", false) => {
             // `is-active` can be false while an enabled failed service still
             // has a login symlink. Always disable before removing the unit.
-            run_service(
+            run(
                 "systemctl",
                 &["--user", "disable", "--now", "synty.service"],
             )?;
         }
         _ => bail!("unknown service manager: {kind}"),
     }
-    if on
-        && !poll_service_ready(
-            || service_loaded(kind),
-            21,
-            || std::thread::sleep(Duration::from_millis(100)),
-        )
-    {
+    if on && !poll_service_ready(&mut ready, 21, wait) {
         bail!("{kind} accepted the unit but {SERVICE_LABEL} is not loaded");
     }
     Ok(())
@@ -920,14 +936,36 @@ mod tests {
 
     #[test]
     fn systemd_reinstall_restarts_the_active_watcher() {
+        let mut operations = Vec::new();
+        let mut readiness = [false, false, true].into_iter();
+        let mut probes = 0;
+        let mut waits = 0;
+        loader_with(
+            "systemd",
+            "/tmp/synty.service",
+            true,
+            |command, args| {
+                operations.push(format!("{command} {}", args.join(" ")));
+                Ok(())
+            },
+            |_| false,
+            || {
+                probes += 1;
+                readiness.next().unwrap_or(false)
+            },
+            || waits += 1,
+        )
+        .unwrap();
         assert_eq!(
-            SYSTEMD_LOAD_SEQUENCE,
+            operations,
             &[
-                &["--user", "daemon-reload"][..],
-                &["--user", "enable", "synty.service"][..],
-                &["--user", "restart", "synty.service"][..],
+                "systemctl --user daemon-reload",
+                "systemctl --user enable synty.service",
+                "systemctl --user restart synty.service",
             ]
         );
+        assert_eq!(probes, 3, "loader polls until the service is ready");
+        assert_eq!(waits, 2, "loader waits between failed readiness probes");
     }
 
     #[test]
