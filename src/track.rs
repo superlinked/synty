@@ -617,6 +617,11 @@ fn poll_service_ready(
     false
 }
 
+// launchd can take several seconds to report a freshly bootstrapped background
+// process as running while the machine is under load. Keep the wait bounded,
+// but long enough that `init` and `upgrade` do not report a false failure.
+const SERVICE_READY_ATTEMPTS: usize = 101;
+
 fn service_registered(kind: &str) -> bool {
     kind == "launchd"
         && std::process::Command::new("launchctl")
@@ -706,7 +711,7 @@ fn loader_with(
         }
         _ => bail!("unknown service manager: {kind}"),
     }
-    if on && !poll_service_ready(&mut ready, 21, wait) {
+    if on && !poll_service_ready(&mut ready, SERVICE_READY_ATTEMPTS, wait) {
         bail!("{kind} accepted the unit but {SERVICE_LABEL} is not loaded");
     }
     Ok(())
@@ -935,9 +940,8 @@ mod tests {
     }
 
     #[test]
-    fn systemd_reinstall_restarts_the_active_watcher() {
+    fn systemd_reinstall_restarts_and_tolerates_slow_startup() {
         let mut operations = Vec::new();
-        let mut readiness = [false, false, true].into_iter();
         let mut probes = 0;
         let mut waits = 0;
         loader_with(
@@ -951,7 +955,7 @@ mod tests {
             |_| false,
             || {
                 probes += 1;
-                readiness.next().unwrap_or(false)
+                probes == 51
             },
             || waits += 1,
         )
@@ -964,8 +968,8 @@ mod tests {
                 "systemctl --user restart synty.service",
             ]
         );
-        assert_eq!(probes, 3, "loader polls until the service is ready");
-        assert_eq!(waits, 2, "loader waits between failed readiness probes");
+        assert_eq!(probes, 51, "loader tolerates a five-second startup");
+        assert_eq!(waits, 50, "loader waits between failed readiness probes");
     }
 
     #[test]
