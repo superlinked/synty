@@ -87,7 +87,7 @@ pub fn capture_since_ms() -> Option<i64> {
     load()
         .capture_since
         .as_deref()
-        .and_then(|s| parse_capture_since(s).ok())
+        .and_then(|s| capture_since_ms_from(s).ok())
 }
 
 /// `now`, YYYY-MM-DD (UTC midnight), or RFC3339 → canonical RFC3339 UTC.
@@ -109,7 +109,8 @@ pub fn normalize_capture_since(raw: &str) -> Result<String> {
     Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-fn parse_capture_since(raw: &str) -> Result<i64> {
+/// Parse one CLI/config capture boundary into epoch milliseconds.
+pub fn capture_since_ms_from(raw: &str) -> Result<i64> {
     let canonical = normalize_capture_since(raw)?;
     Ok(chrono::DateTime::parse_from_rfc3339(&canonical)?.timestamp_millis())
 }
@@ -150,7 +151,7 @@ mod tests {
             "2026-07-21T15:15:30Z"
         );
         assert!(normalize_capture_since("last Tuesday").is_err());
-        let cutoff = parse_capture_since("2026-07-21").unwrap();
+        let cutoff = capture_since_ms_from("2026-07-21").unwrap();
         assert!(!captured_at("2026-07-20T23:59:59Z", Some(cutoff)));
         assert!(captured_at("2026-07-21T00:00:00Z", Some(cutoff)));
         assert!(captured_at("future-envelope-time", Some(cutoff)));

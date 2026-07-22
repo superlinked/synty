@@ -221,6 +221,25 @@ impl Bucket for Cloud {
         Ok(rel)
     }
 
+    fn list_after(&self, prefix: &str, offset: &str) -> Result<Vec<String>> {
+        let p = self.full(prefix);
+        let offset = self.full(offset);
+        let keys = self
+            .rt
+            .block_on(async {
+                let mut stream = self.store.list_with_offset(Some(&p), &offset);
+                let mut out = Vec::new();
+                while let Some(item) = stream.next().await {
+                    out.push(item?.location.to_string());
+                }
+                Ok::<_, object_store::Error>(out)
+            })
+            .map_err(|e| anyhow!("list {prefix} after {offset}: {e}"))?;
+        let mut rel: Vec<String> = keys.iter().map(|k| self.relative(k)).collect();
+        rel.sort();
+        Ok(rel)
+    }
+
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         use object_store::{PutMode, PutOptions};
         let p = self.full(key);

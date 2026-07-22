@@ -768,10 +768,7 @@ fn main() -> Result<()> {
             bucket,
         } => {
             let capture_since_ms = match since {
-                Some(raw) => Some(
-                    chrono::DateTime::parse_from_rfc3339(&config::normalize_capture_since(&raw)?)?
-                        .timestamp_millis(),
-                ),
+                Some(raw) => Some(config::capture_since_ms_from(&raw)?),
                 None => config::capture_since_ms(),
             };
             track::run(track::Opts {

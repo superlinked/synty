@@ -14,6 +14,15 @@ const MIN_TEXT: usize = 12;
 const MAX_TEXT: usize = 6000;
 
 pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()> {
+    run_with_config(corpus_dir, out_path, bucket, &crate::config::load())
+}
+
+fn run_with_config(
+    corpus_dir: &str,
+    out_path: &str,
+    bucket: Option<&str>,
+    cfg: &crate::config::Config,
+) -> Result<()> {
     // Pull every device's events from the shared bucket so this build sees the
     // whole fleet's sessions, not just the local machine's.
     if let Some(b) = bucket {
@@ -50,7 +59,7 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
     }
 
     let manifest_path = format!("{out_path}.manifest");
-    let manifest = input_manifest(gh_files.iter().map(|(p, _, _)| p).chain(&local_files));
+    let manifest = input_manifest(gh_files.iter().map(|(p, _, _)| p).chain(&local_files), cfg);
     if Path::new(out_path).exists()
         && std::fs::read_to_string(&manifest_path).ok().as_deref() == Some(manifest.as_str())
     {
@@ -78,7 +87,7 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
     // Two passes over the event files — session_start maps first (a session can
     // span files), then docs — holding one file in memory at a time instead of
     // the whole corpus as one string.
-    let known: std::collections::HashSet<String> = crate::config::load().repos.into_iter().collect();
+    let known: std::collections::HashSet<String> = cfg.repos.iter().cloned().collect();
     let local_actor = crate::identity::actor();
     let mut maps = SessionMaps::default();
     for f in &local_files {
@@ -95,7 +104,11 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
             n_session += docs.len() - before;
         }
     }
-    if let Some(cutoff) = crate::config::capture_since_ms() {
+    let cutoff = cfg
+        .capture_since
+        .as_deref()
+        .and_then(|raw| crate::config::capture_since_ms_from(raw).ok());
+    if let Some(cutoff) = cutoff {
         docs.retain(|d| {
             d.meta.source != "agent" || crate::config::captured_at(&d.meta.ts, Some(cutoff))
         });
@@ -104,7 +117,7 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
     let n_skipped = maps.skipped;
 
     let total = docs.len();
-    let cap = crate::config::load().max_docs.unwrap_or(CAP);
+    let cap = cfg.max_docs.unwrap_or(CAP);
     let (docs, dropped) = cap_by_recency(docs, cap);
     let docs = stable_order(docs, out_path);
     if dropped > 0 {
@@ -295,8 +308,11 @@ pub fn session_docs(text: &str, known: &std::collections::HashSet<String>) -> (V
 }
 
 /// The fast-path key: every input file's (path, mtime_ms, size), one per line,
-/// plus the config that steers repo folding. Equal manifest → equal docs.jsonl.
-fn input_manifest<'a>(files: impl Iterator<Item = &'a PathBuf>) -> String {
+/// plus the config that steers derivation. Equal manifest → equal docs.jsonl.
+fn input_manifest<'a>(
+    files: impl Iterator<Item = &'a PathBuf>,
+    cfg: &crate::config::Config,
+) -> String {
     let mut out = String::new();
     for p in files {
         let (mtime, size) = std::fs::metadata(p)
@@ -307,7 +323,7 @@ fn input_manifest<'a>(files: impl Iterator<Item = &'a PathBuf>) -> String {
             .unwrap_or((0, 0));
         out.push_str(&format!("{}\t{mtime}\t{size}\n", p.display()));
     }
-    out.push_str(&derivation_config(&crate::config::load()));
+    out.push_str(&derivation_config(cfg));
     out
 }
 
@@ -487,6 +503,45 @@ mod tests {
         assert!(docs.iter().all(|d| d.meta.session_id == "S1"));
         assert!(docs.iter().all(|d| d.meta.repo == "sie-internal"));
         assert!(docs.iter().all(|d| d.meta.source == "agent"));
+    }
+
+    // Starting collection at an absolute boundary removes older local session
+    // text from the user-visible corpus without applying that privacy gate to
+    // the separately configured GitHub history.
+    #[test]
+    fn ingest_keeps_only_post_boundary_agent_docs() {
+        let dir = std::env::temp_dir().join(format!("synty-ingest-cutoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let corpus = dir.join("corpus");
+        let stream = corpus.join("local/edge-dev-codex");
+        let github = corpus.join("github");
+        std::fs::create_dir_all(&stream).unwrap();
+        std::fs::create_dir_all(&github).unwrap();
+        std::fs::write(stream.join("track.jsonl"), concat!(
+            r#"{"event_id":"start","kind":"session_start","session_id":"S1","ts":"2026-07-20T23:50:00Z","payload":{"cwd":"/work/sie"}}"#, "\n",
+            r#"{"event_id":"old","kind":"user_prompt","session_id":"S1","ts":"2026-07-20T23:55:00Z","payload":{"text":"old private agent prompt"}}"#, "\n",
+            r#"{"event_id":"new","kind":"user_prompt","session_id":"S1","ts":"2026-07-21T00:05:00Z","payload":{"text":"new retained agent prompt"}}"#, "\n",
+        )).unwrap();
+        std::fs::write(
+            github.join("prs-sie.json"),
+            r#"[{"number":7,"title":"older GitHub work remains visible","body":"A team source, not a local capture.","author":{"login":"alice"},"createdAt":"2026-07-01T00:00:00Z"}]"#,
+        ).unwrap();
+        let cfg = crate::config::Config {
+            capture_since: Some("2026-07-21T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let out = corpus.join("docs.jsonl");
+        run_with_config(
+            corpus.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            &cfg,
+        ).unwrap();
+        let body = std::fs::read_to_string(out).unwrap();
+        assert!(body.contains("new retained agent prompt"), "{body}");
+        assert!(!body.contains("old private agent prompt"), "{body}");
+        assert!(body.contains("older GitHub work remains visible"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Unchanged inputs skip the rebuild entirely (the `up` loop polls ingest;

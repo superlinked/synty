@@ -17,6 +17,7 @@ use std::path::Path;
 
 const POINTER_KEY: &str = "current.json";
 const EVENTS: &str = "events";
+const EVENT_STREAMS: &str = "event-streams";
 const EVENT_CHUNK_BYTES: usize = 1 << 20;
 
 /// Filename → blob hash for one (build, rev).
@@ -116,6 +117,10 @@ struct UploadState {
     /// straddles the boundary without publishing starts for old-only sessions.
     #[serde(default)]
     pending_starts: BTreeMap<String, BTreeMap<String, String>>,
+    /// Stream markers already created in each bucket. Readers list this bounded
+    /// registry, then continue each stream from a persisted key cursor.
+    #[serde(default)]
+    registered_streams: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Default event upload path used by builds outside the long-lived tracker.
@@ -150,27 +155,38 @@ pub fn push_events_with(
         .pending_starts
         .entry(bucket_uri.to_string())
         .or_default();
+    let registered_streams = state
+        .registered_streams
+        .entry(bucket_uri.to_string())
+        .or_default();
     let (mut n, mut bytes_up) = (0, 0u64);
     let mut changed = false;
-    for entry in walkdir::WalkDir::new(local_dir)
+    let mut files: Vec<std::path::PathBuf> = walkdir::WalkDir::new(local_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl")
-        {
-            continue;
-        }
-        let rel_path = entry.path().strip_prefix(local_dir)?;
-        // Only the tracker's source files are upload inputs. Pulled immutable
-        // chunks also live below corpus/local and must never be re-chunked.
-        if rel_path.components().count() != 2
-            || !entry.file_name().to_string_lossy().starts_with("track")
-        {
-            continue;
-        }
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .filter(|path| {
+            let Ok(rel) = path.strip_prefix(local_dir) else { return false };
+            // Pulled immutable chunks also live below corpus/local and must
+            // never be re-chunked.
+            rel.components().count() == 2
+                && path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("track"))
+        })
+        .collect();
+    // Chunk keys sort by stream/day/offset. Publishing files in that same order
+    // makes a reader's per-stream key cursor safe even while an upload is live.
+    files.sort();
+    for path in files {
+        let rel_path = path.strip_prefix(local_dir)?;
         let rel = rel_path.to_string_lossy().replace('\\', "/");
-        let bytes = std::fs::read(entry.path())?;
+        let (stream, file) = rel.split_once('/').unwrap_or(("local", rel.as_str()));
+        if registered_streams.insert(stream.to_string()) {
+            b.put_if_absent(&format!("{EVENT_STREAMS}/{stream}"), b"")?;
+            changed = true;
+        }
+        let bytes = std::fs::read(&path)?;
         let mut start = offsets
             .get(&rel)
             .copied()
@@ -195,7 +211,6 @@ pub fn push_events_with(
             continue;
         };
         let end = start + last_nl as u64 + 1;
-        let (stream, file) = rel.split_once('/').unwrap_or(("local", rel.as_str()));
         let filtered =
             filter_events_since(&pending[..=last_nl], capture_since_ms, stream, pending_starts);
         for (part, chunk) in event_chunks(&filtered, EVENT_CHUNK_BYTES)
@@ -321,33 +336,116 @@ fn event_chunks(raw: &[u8], target: usize) -> Vec<Vec<u8>> {
     out
 }
 
-/// Download all devices' event files from the bucket into `local_dir`. Immutable
-/// chunks need no HEAD once present; legacy mutable daily files retain their
-/// size check. This is how a build sees every device's sessions, not just the
-/// local machine's.
+/// Last immutable chunk key applied per (bucket, stream). The file lives below
+/// `local_dir`, so removing a local corpus also resets its cursors and forces a
+/// complete reconstruction.
+#[derive(Serialize, Deserialize, Default)]
+struct DownloadState {
+    #[serde(default)]
+    buckets: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Download all devices' event files from the bucket into `local_dir`. Writers
+/// publish one immutable marker per stream; readers list that bounded registry
+/// and ask each stream only for chunk keys after its persisted cursor. Legacy
+/// buckets without markers retain the full-list path until a writer upgrades.
 pub fn pull_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
     let b = bucket::open(bucket_uri)?;
+    let state_path = Path::new(local_dir).join(".downloads.json");
+    pull_events_from(b.as_ref(), bucket_uri, local_dir, &state_path)
+}
+
+fn pull_events_from(
+    b: &dyn bucket::Bucket,
+    bucket_uri: &str,
+    local_dir: &str,
+    state_path: &Path,
+) -> Result<usize> {
+    let mut state: DownloadState = std::fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let cursors = state.buckets.entry(bucket_uri.to_string()).or_default();
     let (mut n, mut bytes_down) = (0, 0u64);
-    for key in b.list(EVENTS)? {
-        let rel = key.strip_prefix(&format!("{EVENTS}/")).unwrap_or(&key);
-        let dest = Path::new(local_dir).join(rel);
-        let local_size = std::fs::metadata(&dest).ok().map(|m| m.len());
-        if key.contains("/chunks/") && local_size.is_some() {
-            continue; // content-addressed-by-key and written atomically
+    let markers = b.list(EVENT_STREAMS)?;
+    let mut cursor_changed = false;
+    if markers.is_empty() {
+        // Upgrade compatibility: old writers have no registry. Their mutable
+        // files require size checks and the only safe discovery is a full list.
+        for key in b.list(EVENTS)? {
+            let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
+            n += usize::from(fetched);
+            bytes_down += bytes;
         }
-        if local_size.is_some() && local_size == b.size(&key)? {
-            continue;
+    } else {
+        for marker in markers {
+            let Some(stream) = marker.strip_prefix(&format!("{EVENT_STREAMS}/")) else {
+                continue;
+            };
+            if stream.is_empty() || stream.contains('/') {
+                continue;
+            }
+            let chunk_prefix = format!("{EVENTS}/{stream}/chunks/");
+            let mut cursor = cursors.get(stream).cloned().unwrap_or_default();
+            if !cursor.is_empty() && !event_dest(local_dir, &cursor)?.is_file() {
+                cursor.clear(); // local corpus was pruned; reconstruct it
+            }
+            for key in b.list_after(&chunk_prefix, &cursor)? {
+                let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
+                n += usize::from(fetched);
+                bytes_down += bytes;
+                cursor = key;
+                cursors.insert(stream.to_string(), cursor.clone());
+                cursor_changed = true;
+            }
+            // Old mutable daily files sit beside `chunks/`, so this bounded
+            // compatibility list never walks the immutable chunk history.
+            for key in b.list(&format!("{EVENTS}/{stream}/track"))? {
+                let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
+                n += usize::from(fetched);
+                bytes_down += bytes;
+            }
         }
-        let Some(bytes) = b.get(&key)? else { continue };
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p)?;
+    }
+    if cursor_changed {
+        if let Some(parent) = state_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        bytes_down += bytes.len() as u64;
-        crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
-        n += 1;
+        crate::write_atomic(&state_path.to_string_lossy(), &serde_json::to_vec(&state)?)?;
     }
     sync_metric("events_down", n, bytes_down);
     Ok(n)
+}
+
+fn event_dest(local_dir: &str, key: &str) -> Result<std::path::PathBuf> {
+    let rel = key.strip_prefix(&format!("{EVENTS}/")).unwrap_or(key);
+    if !Path::new(rel)
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(anyhow!("unsafe event object key: {key}"));
+    }
+    Ok(Path::new(local_dir).join(rel))
+}
+
+/// Fetch one immutable chunk (presence is enough to skip) or legacy mutable
+/// file (size comparison), always through an atomic local rename.
+fn pull_event_key(b: &dyn bucket::Bucket, key: &str, local_dir: &str) -> Result<(bool, u64)> {
+    let dest = event_dest(local_dir, key)?;
+    let local_size = std::fs::metadata(&dest).ok().map(|m| m.len());
+    if key.contains("/chunks/") && local_size.is_some() {
+        return Ok((false, 0));
+    }
+    if local_size.is_some() && local_size == b.size(key)? {
+        return Ok((false, 0));
+    }
+    let Some(bytes) = b.get(key)? else { return Err(anyhow!("event object disappeared during pull: {key}")) };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let size = bytes.len() as u64;
+    crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
+    Ok((true, size))
 }
 
 /// Bring a reader onto the fleet's latest raw-event and published read-model
@@ -552,6 +650,36 @@ mod tests {
     use super::*;
     use crate::bucket::Bucket; // trait methods (put/get) on LocalFs in tests
 
+    struct RecordingBucket {
+        inner: crate::bucket::LocalFs,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingBucket {
+        fn new(root: &Path) -> Self {
+            Self { inner: crate::bucket::LocalFs::new(root), calls: Default::default() }
+        }
+    }
+
+    impl Bucket for RecordingBucket {
+        fn put(&self, key: &str, bytes: &[u8]) -> Result<()> { self.inner.put(key, bytes) }
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> { self.inner.get(key) }
+        fn exists(&self, key: &str) -> Result<bool> { self.inner.exists(key) }
+        fn size(&self, key: &str) -> Result<Option<u64>> { self.inner.size(key) }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.calls.lock().unwrap().push(format!("list:{prefix}"));
+            self.inner.list(prefix)
+        }
+        fn list_after(&self, prefix: &str, offset: &str) -> Result<Vec<String>> {
+            self.calls.lock().unwrap().push(format!("after:{prefix}:{offset}"));
+            self.inner.list_after(prefix, offset)
+        }
+        fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+            self.inner.put_if_absent(key, bytes)
+        }
+        fn delete(&self, key: &str) -> Result<()> { self.inner.delete(key) }
+    }
+
     fn event(id: &str, sid: &str, kind: &str, ts: &str, text: &str) -> String {
         serde_json::json!({
             "v": 1, "event_id": id, "stream": "edge-m-codex", "seq": 0,
@@ -722,6 +850,68 @@ mod tests {
             event_chunks(raw, 6),
             vec![b"aaaa\n".to_vec(), b"bbbb\n".to_vec(), b"cccc\n".to_vec()]
         );
+    }
+
+    #[test]
+    fn event_object_keys_cannot_escape_the_local_corpus() {
+        assert!(event_dest("corpus/local", "events/edge-ok/chunks/a.jsonl").is_ok());
+        assert!(event_dest("corpus/local", "events/../../config.json").is_err());
+    }
+
+    #[test]
+    fn repeated_event_pulls_continue_each_registered_stream_by_key() {
+        let root = std::env::temp_dir().join(format!("synty-event-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source/edge-m-codex");
+        let bucket = root.join("bucket");
+        let reader = root.join("reader");
+        std::fs::create_dir_all(&source).unwrap();
+        let file = source.join("track.2026-07-21.jsonl");
+        std::fs::write(&file, event("a", "s", "user_prompt", "2026-07-21T10:00:00Z", "first")).unwrap();
+        let upload_state = root.join("uploads.json");
+        push_events_with(
+            bucket.to_str().unwrap(),
+            root.join("source").to_str().unwrap(),
+            upload_state.to_str().unwrap(),
+            None,
+        ).unwrap();
+
+        let store = RecordingBucket::new(&bucket);
+        let download_state = reader.join(".downloads.json");
+        assert_eq!(pull_events_from(
+            &store,
+            bucket.to_str().unwrap(),
+            reader.to_str().unwrap(),
+            &download_state,
+        ).unwrap(), 1);
+        store.calls.lock().unwrap().clear();
+        assert_eq!(pull_events_from(
+            &store,
+            bucket.to_str().unwrap(),
+            reader.to_str().unwrap(),
+            &download_state,
+        ).unwrap(), 0);
+        let calls = store.calls.lock().unwrap().clone();
+        assert!(!calls.iter().any(|c| c == "list:events"), "historical event namespace was relisted: {calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("after:events/edge-m-codex/chunks/:events/edge-m-codex/chunks/")), "missing persisted stream cursor: {calls:?}");
+
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&file).unwrap()
+            .write_all(event("b", "s", "assistant_message", "2026-07-21T10:01:00Z", "second").as_bytes())
+            .unwrap();
+        assert_eq!(push_events_with(
+            bucket.to_str().unwrap(),
+            root.join("source").to_str().unwrap(),
+            upload_state.to_str().unwrap(),
+            None,
+        ).unwrap(), 1);
+        assert_eq!(pull_events_from(
+            &store,
+            bucket.to_str().unwrap(),
+            reader.to_str().unwrap(),
+            &download_state,
+        ).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // The GitHub corpus travels through the bucket by manifest: a scraping

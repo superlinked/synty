@@ -239,11 +239,13 @@ bucket and drops into the viewer, so a paste goes from nothing to tracking.
 
 ## Storage layout (bucket)
 
-```
+```text
 events/<stream>/chunks/<track-day>/<range-hash>.jsonl
                                       immutable append deltas (source of truth);
                                         stream = edge-<machine>-<source>, so many
                                         trackers' files coexist without collision
+event-streams/<stream>                immutable bounded discovery registry;
+                                        readers continue each stream by key cursor
 members/<machine>/activation.json     immutable init access marker (no session data)
 embeddings/<hash[..2]>/<hash>.emb      content-addressed f16 vectors (write-once)
 summaries/<kh[..2]>/<kh>-<ihash>.json  per-(unit, input-hash) LLM summaries

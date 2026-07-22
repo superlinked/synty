@@ -117,7 +117,9 @@ sudo loginctl enable-linger "$USER"
 That bucket is the only shared infrastructure: no build server, no coordination
 service. Each machine writes a stable `edge-<machine>-<source>` stream, so
 writers do not overwrite one another. Readers pull every stream plus the latest
-published read-model. The TUI builds unpublished event deltas in the background;
+published read-model. A bounded stream registry and per-stream local key cursors
+avoid relisting historical chunks on each read. The TUI builds unpublished
+event deltas in the background;
 `synty build` does the same explicitly, while `search` warns if raw events are
 newer than the published index. One tokened machine scrapes GitHub for everyone.
 
