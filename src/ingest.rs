@@ -194,6 +194,9 @@ pub fn github_docs(json: &str, kind: &str, repo: &str) -> Result<Vec<Doc>> {
                 repo: repo.into(),
                 author: author.into(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
                 ts: it["createdAt"].as_str().unwrap_or("").into(),
                 number: it["number"].as_i64(),
                 url: it["url"].as_str().map(String::from),
@@ -214,6 +217,9 @@ pub fn github_docs(json: &str, kind: &str, repo: &str) -> Result<Vec<Doc>> {
 pub struct SessionMaps {
     repo: HashMap<String, String>,
     actor: HashMap<String, String>,
+    campaign: HashMap<String, String>,
+    role: HashMap<String, String>,
+    backend: HashMap<String, String>,
     pub skipped: usize,
 }
 
@@ -237,6 +243,26 @@ pub fn scan_starts(text: &str, known: &std::collections::HashSet<String>, maps: 
                     {
                         if !a.is_empty() {
                             maps.actor.insert(sid.to_string(), a.to_string());
+                        }
+                    }
+                    if let Some(sid) = v["session_id"].as_str() {
+                        let campaign = v["rollup_dim"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .or_else(|| v["payload"]["campaign_id"].as_str());
+                        if let Some(campaign) = campaign {
+                            maps.campaign.insert(sid.to_string(), campaign.to_string());
+                        }
+                        if let Some(role) = v["payload"]["campaign_role"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                        {
+                            maps.role.insert(sid.to_string(), role.to_string());
+                        }
+                        if let Some(backend) =
+                            v["payload"]["backend"].as_str().filter(|value| !value.is_empty())
+                        {
+                            maps.backend.insert(sid.to_string(), backend.to_string());
                         }
                     }
                 }
@@ -275,6 +301,9 @@ pub fn docs_from_events(
         let sid = v["session_id"].as_str().unwrap_or("").to_string();
         let repo = maps.repo.get(&sid).cloned().unwrap_or_default();
         let author = maps.actor.get(&sid).cloned().unwrap_or_else(|| local_actor.to_string());
+        let campaign_id = maps.campaign.get(&sid).cloned().unwrap_or_default();
+        let campaign_role = maps.role.get(&sid).cloned().unwrap_or_default();
+        let backend = maps.backend.get(&sid).cloned().unwrap_or_default();
         out.push(Doc {
             id: 0,
             text: trunc(text, MAX_TEXT),
@@ -284,6 +313,9 @@ pub fn docs_from_events(
                 repo,
                 author,
                 session_id: sid,
+                campaign_id,
+                campaign_role,
+                backend,
                 ts: v["ts"].as_str().unwrap_or("").into(),
                 number: None,
                 url: None,
@@ -673,6 +705,9 @@ mod tests {
                 repo: "r".into(),
                 author: String::new(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
                 ts: ts.into(),
                 number: None,
                 url: None,
@@ -742,6 +777,9 @@ mod tests {
                 repo: "r".into(),
                 author: String::new(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
                 ts: ts.into(),
                 number: None,
                 url: None,

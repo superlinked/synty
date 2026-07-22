@@ -1,0 +1,7 @@
+.git
+target
+tmp
+corpus
+.synty
+docs/*.gif
+evals/runs*

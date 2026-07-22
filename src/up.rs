@@ -64,6 +64,8 @@ pub fn build(bucket: &str, machine: &str, resolution: f64, no_track: bool) -> Re
             watch: false,
             poll_secs: 60,
             upload_interval_secs: crate::config::upload_interval_secs(),
+            campaign: crate::config::campaign_id(),
+            role: crate::config::campaign_role(),
             install: None,
             cursors: ".synty/cursors.json".into(),
             bucket: Some(bucket.to_string()),
@@ -169,6 +171,8 @@ fn tick(bucket: &str, machine: &str, poll_secs: u64) -> Result<()> {
         watch: false,
         poll_secs,
         upload_interval_secs: crate::config::upload_interval_secs(),
+        campaign: crate::config::campaign_id(),
+        role: crate::config::campaign_role(),
         install: None,
         cursors: ".synty/cursors.json".into(),
         bucket: Some(bucket.to_string()), // push events so a fleet build sees them

@@ -33,8 +33,9 @@ Rust binary.
   the other opt-in backends. None may become default.
 - Distribution is GitHub Releases, cut by `.github/workflows/release.yml` on a
   `v*` tag: it builds per platform with explicit features (this does not change
-  the default above) — `--features metal,s3,gcs` for the macOS asset,
-  `--features s3,gcs` for Linux — and attaches `synty-<os>-<arch>` (+ `.sha256`).
+  the default above) — `--features metal,s3,gcs,mcp-http` for the macOS asset,
+  `--features s3,gcs,mcp-http` for Linux — and attaches `synty-<os>-<arch>`
+  (+ `.sha256`).
   `synty upgrade` self-updates from the latest release (sha256-verified, via the
   GitHub token); a cached nag flags when behind. These are ops, not pipeline
   steps.

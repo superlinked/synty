@@ -1,0 +1,6 @@
+apiVersion: v2
+name: synty
+description: Local-first coding-agent memory tracker, builder, and read-only MCP gateway
+type: application
+version: 0.1.0
+appVersion: "0.2.3"

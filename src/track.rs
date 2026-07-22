@@ -32,6 +32,8 @@ pub struct Opts {
     pub watch: bool,
     pub poll_secs: u64,
     pub upload_interval_secs: u64,
+    pub campaign: Option<String>,
+    pub role: Option<String>,
     pub install: Option<String>,
     pub cursors: String,
     /// If set, push drained event chunks to this bucket under events/ (the
@@ -93,6 +95,8 @@ struct Stream {
     /// build on another machine attributes the session to its author, not to
     /// whoever runs the build.
     actor: String,
+    campaign: String,
+    campaign_role: String,
 }
 
 struct Tracker {
@@ -150,6 +154,8 @@ impl Tracker {
                 n_sessions: 0,
                 n_skipped: 0,
                 actor: actor.clone(),
+                campaign: o.campaign.clone().unwrap_or_default(),
+                campaign_role: o.role.clone().unwrap_or_default(),
                 src,
             });
         }
@@ -327,12 +333,22 @@ impl Stream {
             self.n_skipped += skipped;
 
             for e in &mut evts {
+                if !self.campaign.is_empty() {
+                    e.rollup_dim = self.campaign.clone();
+                }
                 if e.kind == kind::SESSION_START {
                     e.payload["actor"] = json!(self.actor);
                     // Which synty produced this stream — distinct from the
                     // agent's own `version` the parser may have captured.
                     // Lets the fleet roster report upgrade lag per machine.
                     e.payload["tracker_version"] = json!(env!("CARGO_PKG_VERSION"));
+                    if !self.campaign.is_empty() {
+                        e.payload["campaign_id"] = json!(self.campaign);
+                    }
+                    if !self.campaign_role.is_empty() {
+                        e.payload["campaign_role"] = json!(self.campaign_role);
+                    }
+                    e.payload["backend"] = json!(self.src.envelope_source());
                 }
             }
             if cutoff_ms > 0 {
@@ -391,7 +407,7 @@ impl Stream {
                 session_id: sid.clone(),
                 kind: kind::SESSION_END.to_string(),
                 payload: json!({"reason": if all {"shutdown"} else {"idle"}}),
-                rollup_dim: String::new(),
+                rollup_dim: self.campaign.clone(),
             });
         }
         self.append(&events)?;
@@ -435,9 +451,26 @@ fn started_path(cursors: &Path) -> PathBuf {
 }
 
 fn default_roots(id: &str, home: &str) -> Vec<String> {
+    let claude_home = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    let codex_home = std::env::var("CODEX_HOME").ok();
+    roots_with_overrides(id, home, claude_home.as_deref(), codex_home.as_deref())
+}
+
+fn roots_with_overrides(
+    id: &str,
+    home: &str,
+    claude_home: Option<&str>,
+    codex_home: Option<&str>,
+) -> Vec<String> {
     match id {
-        "claudecode" => vec![format!("{home}/.claude/projects")],
-        "codex" => vec![format!("{home}/.codex/sessions")],
+        "claudecode" => {
+            let base = claude_home.map(str::to_owned).unwrap_or_else(|| format!("{home}/.claude"));
+            vec![format!("{base}/projects")]
+        }
+        "codex" => {
+            let base = codex_home.map(str::to_owned).unwrap_or_else(|| format!("{home}/.codex"));
+            vec![format!("{base}/sessions")]
+        }
         "cowork" => vec![
             format!("{home}/Library/Application Support/Claude/local-agent-mode-sessions"),
             format!("{home}/Library/Application Support/Claude/claude-code-sessions"),
@@ -876,6 +909,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_home_overrides_change_only_the_selected_source() {
+        assert_eq!(
+            roots_with_overrides("codex", "/home/a", None, Some("/var/codex")),
+            vec!["/var/codex/sessions"]
+        );
+        assert_eq!(
+            roots_with_overrides("claudecode", "/home/a", Some("/var/claude"), None),
+            vec!["/var/claude/projects"]
+        );
+        assert_eq!(
+            roots_with_overrides("codex", "/home/a", None, None),
+            vec!["/home/a/.codex/sessions"]
+        );
+    }
+
+    #[test]
     fn autostart_requires_both_unit_and_loaded_service() {
         assert!(autostart_ready(true, true));
         assert!(
@@ -1034,6 +1083,8 @@ mod tests {
             n_sessions: 0,
             n_skipped: 0,
             actor: "tester".into(),
+            campaign: String::new(),
+            campaign_role: String::new(),
         };
         let cutoff = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
             .unwrap()
@@ -1087,6 +1138,8 @@ mod tests {
                 n_sessions: 0,
                 n_skipped: 0,
                 actor: "tester".into(),
+                campaign: String::new(),
+                campaign_role: String::new(),
             };
             st.drain(0, &HashMap::new()).unwrap();
             st.flush_ends(i64::MAX - 1, true).unwrap();
@@ -1125,6 +1178,8 @@ mod tests {
             n_sessions: 0,
             n_skipped: 0,
             actor: "tester".into(),
+            campaign: String::new(),
+            campaign_role: String::new(),
         };
 
         // First run: parse from the top, persist cursor + started set.
@@ -1173,6 +1228,8 @@ mod tests {
             n_sessions: 0,
             n_skipped: 0,
             actor: "tester".into(),
+            campaign: "camp-1".into(),
+            campaign_role: "investigator".into(),
         };
         st.drain(0, &HashMap::new()).unwrap();
 
@@ -1181,6 +1238,10 @@ mod tests {
         let e: Event = serde_json::from_str(line).unwrap();
         assert_eq!(e.payload["actor"], "tester", "actor stamp must survive alongside the version");
         assert_eq!(e.payload["tracker_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(e.rollup_dim, "camp-1");
+        assert_eq!(e.payload["campaign_id"], "camp-1");
+        assert_eq!(e.payload["campaign_role"], "investigator");
+        assert_eq!(e.payload["backend"], "claude_code");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1221,6 +1282,8 @@ mod tests {
                 n_sessions: 0,
                 n_skipped: 0,
                 actor: machine.into(),
+                campaign: String::new(),
+                campaign_role: String::new(),
             };
             st.drain(0, &HashMap::new()).unwrap();
             st.flush_ends(i64::MAX - 1, true).unwrap(); // close the session so it becomes a unit

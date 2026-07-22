@@ -18,6 +18,8 @@ struct SessionContext {
     machine: String,
     cwd: String,
     repo: String,
+    campaign: String,
+    role: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -213,6 +215,16 @@ impl TraceStore {
         }
         if ctx.machine.is_empty() {
             ctx.machine = machine.clone();
+        }
+        if ctx.campaign.is_empty() {
+            ctx.campaign = if ev.rollup_dim.is_empty() {
+                ev.payload["campaign_id"].as_str().unwrap_or("").to_string()
+            } else {
+                ev.rollup_dim.clone()
+            };
+        }
+        if ctx.role.is_empty() {
+            ctx.role = ev.payload["campaign_role"].as_str().unwrap_or("").to_string();
         }
         if let Some(cwd) = event_cwd(&ev.payload).filter(|s| !s.is_empty()) {
             if ctx.cwd.is_empty() {
@@ -739,7 +751,7 @@ fn push_turn(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn list(
+pub fn list_text(
     entity: &str,
     repo: Option<&str>,
     machine: Option<&str>,
@@ -752,9 +764,10 @@ pub fn list(
     sort: &str,
     limit: usize,
     json_out: bool,
-) -> Result<()> {
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<String> {
     let store = TraceStore::load()?;
-    match entity {
+    let out = match entity {
         "turns" => {
             let mut rows: Vec<&Turn> = store
                 .turns
@@ -776,6 +789,7 @@ pub fn list(
                     )
                 })
                 .filter(|t| !has_errors || t.errors > 0)
+                .filter(|t| scope_allows(&store, &t.session_id, &t.repo, &t.source, scope))
                 .filter(|t| {
                     operation.is_none_or(|q| {
                         t.span_indexes
@@ -787,9 +801,9 @@ pub fn list(
             sort_turns(&mut rows, sort);
             rows.truncate(limit);
             if json_out {
-                println!("{}", crate::view::envelope("trace_turns", json!(rows)));
+                crate::view::envelope("trace_turns", json!(rows))
             } else {
-                print!("{}", turns_md(&rows));
+                turns_md(&rows)
             }
         }
         "spans" => {
@@ -813,13 +827,14 @@ pub fn list(
                     )
                 })
                 .filter(|s| operation.is_none_or(|q| span_operation_matches(s, q)))
+                .filter(|s| scope_allows(&store, &s.session_id, &s.repo, &s.source, scope))
                 .collect();
             sort_spans(&mut rows, sort);
             rows.truncate(limit);
             if json_out {
-                println!("{}", crate::view::envelope("trace_spans", json!(rows)));
+                crate::view::envelope("trace_spans", json!(rows))
             } else {
-                print!("{}", spans_md(&rows));
+                spans_md(&rows)
             }
         }
         "jobs" => {
@@ -843,19 +858,36 @@ pub fn list(
                     )
                 })
                 .filter(|j| !has_errors || j.errors > 0)
+                .filter(|j| scope_allows(&store, &j.session_id, &j.repo, &j.source, scope))
                 .filter(|j| operation.is_none_or(|q| job_operation_matches(j, q)))
                 .collect();
             sort_jobs(&mut rows, sort);
             rows.truncate(limit);
             if json_out {
-                println!("{}", crate::view::envelope("trace_jobs", json!(rows)));
+                crate::view::envelope("trace_jobs", json!(rows))
             } else {
-                print!("{}", jobs_md(&rows));
+                jobs_md(&rows)
             }
         }
         _ => bail!("trace list: --type must be turns, spans, or jobs"),
-    }
-    Ok(())
+    };
+    Ok(out)
+}
+
+fn scope_allows(
+    store: &TraceStore,
+    session_id: &str,
+    repo: &str,
+    source: &str,
+    scope: Option<&crate::policy::ReadScope>,
+) -> bool {
+    let Some(scope) = scope else { return true };
+    let context = store.sessions.get(session_id);
+    scope.allows_repo(repo)
+        && scope.allows_source(source)
+        && (scope.campaigns.is_empty()
+            || context.is_some_and(|ctx| scope.campaigns.contains(&ctx.campaign)))
+        && (scope.roles.is_empty() || context.is_some_and(|ctx| scope.roles.contains(&ctx.role)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -941,20 +973,50 @@ fn sort_jobs(rows: &mut [&Job], sort: &str) {
 }
 
 pub fn show(id: &str, before: usize, after: usize, json_out: bool) -> Result<()> {
+    print!("{}", show_text(id, before, after, json_out, None)?);
+    Ok(())
+}
+
+pub fn show_text(
+    id: &str,
+    before: usize,
+    after: usize,
+    json_out: bool,
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<String> {
     let store = TraceStore::load()?;
-    match resolve(&store, id)? {
-        Resolved::Job(i) => show_job(&store, i, json_out),
-        Resolved::Turn(i) => show_turn(&store, i, json_out),
-        Resolved::Span(i) => show_span(&store, i, before, after, json_out),
-        Resolved::Event(i) => show_event(&store, i, before, after, json_out),
-        Resolved::Session(sid) => show_session(&store, &sid, json_out),
+    let resolved = resolve(&store, id)?;
+    anyhow::ensure!(resolved_allowed(&store, &resolved, scope), "trace id is outside the read scope");
+    match resolved {
+        Resolved::Job(i) => show_job_text(&store, i, json_out),
+        Resolved::Turn(i) => show_turn_text(&store, i, json_out),
+        Resolved::Span(i) => show_span_text(&store, i, before, after, json_out),
+        Resolved::Event(i) => show_event_text(&store, i, before, after, json_out),
+        Resolved::Session(sid) => show_session_text(&store, &sid, json_out),
     }
 }
 
 pub fn compare(left: &str, right: &str, json_out: bool) -> Result<()> {
+    print!("{}", compare_text(left, right, json_out, None)?);
+    Ok(())
+}
+
+pub fn compare_text(
+    left: &str,
+    right: &str,
+    json_out: bool,
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<String> {
     let store = TraceStore::load()?;
-    let l = comparable(&store, resolve(&store, left)?)?;
-    let r = comparable(&store, resolve(&store, right)?)?;
+    let left_resolved = resolve(&store, left)?;
+    let right_resolved = resolve(&store, right)?;
+    anyhow::ensure!(
+        resolved_allowed(&store, &left_resolved, scope)
+            && resolved_allowed(&store, &right_resolved, scope),
+        "trace id is outside the read scope"
+    );
+    let l = comparable(&store, left_resolved)?;
+    let r = comparable(&store, right_resolved)?;
     let mut differences = Vec::new();
     if let (Some(lm), Some(rm)) = (l.as_object(), r.as_object()) {
         let mut keys: Vec<&String> = lm.keys().chain(rm.keys()).collect();
@@ -967,13 +1029,10 @@ pub fn compare(left: &str, right: &str, json_out: bool) -> Result<()> {
         }
     }
     if json_out {
-        println!(
-            "{}",
-            crate::view::envelope(
-                "trace_compare",
-                json!({"left": l, "right": r, "differences": differences})
-            )
-        );
+        Ok(crate::view::envelope(
+            "trace_compare",
+            json!({"left": l, "right": r, "differences": differences}),
+        ))
     } else {
         let lm = l.as_object().expect("comparable object");
         let rm = r.as_object().expect("comparable object");
@@ -986,13 +1045,12 @@ pub fn compare(left: &str, right: &str, json_out: bool) -> Result<()> {
                 md_cell(&value_short(rm.get(&key))),
             ));
         }
-        print!("{o}");
+        Ok(o)
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn search(
+pub fn search_text(
     query: &str,
     repo: Option<&str>,
     machine: Option<&str>,
@@ -1000,15 +1058,16 @@ pub fn search(
     kind: Option<&str>,
     limit: usize,
     json_out: bool,
-) -> Result<()> {
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<String> {
     if query.trim().is_empty() {
         bail!("trace search: query cannot be empty");
     }
     let paths = crate::units::jsonl_files(Path::new(crate::units::LOCAL_DIR));
     let known: HashSet<String> = crate::config::load().repos.into_iter().collect();
-    let hits = search_hits(&paths, query, repo, machine, source, kind, limit, &known)?;
+    let hits = search_hits(&paths, query, repo, machine, source, kind, limit, &known, scope)?;
     if json_out {
-        println!("{}", crate::view::envelope("trace_search", json!(hits)));
+        Ok(crate::view::envelope("trace_search", json!(hits)))
     } else {
         let mut o = format!("# trace search · {:?} ({})\n\n", query, hits.len());
         for h in &hits {
@@ -1023,9 +1082,8 @@ pub fn search(
                 h.summary,
             ));
         }
-        print!("{o}");
+        Ok(o)
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1038,6 +1096,7 @@ fn search_hits(
     kind: Option<&str>,
     limit: usize,
     known: &HashSet<String>,
+    scope: Option<&crate::policy::ReadScope>,
 ) -> Result<Vec<SearchHit>> {
     let q = query.to_lowercase();
     let mut seen = HashSet::new();
@@ -1069,6 +1128,7 @@ fn search_hits(
                 || !contains_opt(&m, machine)
                 || !contains_opt(&ev.source, source)
                 || !contains_opt(&ev.kind, kind)
+                || scope.is_some_and(|scope| !scope.allows_event(&ev, &ctx.repo))
             {
                 continue;
             }
@@ -1115,6 +1175,48 @@ enum Resolved {
     Span(usize),
     Event(usize),
     Session(String),
+}
+
+fn resolved_allowed(
+    store: &TraceStore,
+    resolved: &Resolved,
+    scope: Option<&crate::policy::ReadScope>,
+) -> bool {
+    match resolved {
+        Resolved::Job(index) => {
+            let row = &store.jobs[*index];
+            scope_allows(store, &row.session_id, &row.repo, &row.source, scope)
+        }
+        Resolved::Turn(index) => {
+            let row = &store.turns[*index];
+            scope_allows(store, &row.session_id, &row.repo, &row.source, scope)
+        }
+        Resolved::Span(index) => {
+            let row = &store.spans[*index];
+            scope_allows(store, &row.session_id, &row.repo, &row.source, scope)
+        }
+        Resolved::Event(index) => {
+            let row = &store.events[*index];
+            let repo = store
+                .sessions
+                .get(&row.session_id)
+                .map(|ctx| ctx.repo.as_str())
+                .unwrap_or("");
+            scope_allows(store, &row.session_id, repo, &row.source, scope)
+        }
+        Resolved::Session(session_id) => {
+            let context = store.sessions.get(session_id);
+            scope.is_none_or(|scope| {
+                context.is_some_and(|ctx| {
+                    scope.allows_repo(&ctx.repo)
+                        && scope.allows_source(&ctx.source)
+                        && (scope.campaigns.is_empty()
+                            || scope.campaigns.contains(&ctx.campaign))
+                        && (scope.roles.is_empty() || scope.roles.contains(&ctx.role))
+                })
+            })
+        }
+    }
 }
 
 fn resolve(store: &TraceStore, query: &str) -> Result<Resolved> {
@@ -1168,14 +1270,14 @@ fn id_matches(id: &str, query: &str) -> bool {
     id == query || id.starts_with(query)
 }
 
-fn show_turn(store: &TraceStore, index: usize, json_out: bool) -> Result<()> {
+fn show_turn_text(store: &TraceStore, index: usize, json_out: bool) -> Result<String> {
     let turn = &store.turns[index];
     let timeline = turn_timeline(store, turn);
     if json_out {
-        println!(
-            "{}",
-            crate::view::envelope("trace_turn", json!({"turn": turn, "timeline": timeline}))
-        );
+        Ok(crate::view::envelope(
+            "trace_turn",
+            json!({"turn": turn, "timeline": timeline}),
+        ))
     } else {
         let mut o = format!(
             "# turn [{}]\n\nid: {}\nsession: {}\n{} · {} · {} · {} · {} spans · {} errors\nask: {}\n\n",
@@ -1206,19 +1308,18 @@ fn show_turn(store: &TraceStore, index: usize, json_out: bool) -> Result<()> {
                 significant_event_count(store, turn) - timeline.len()
             ));
         }
-        print!("{o}");
+        Ok(o)
     }
-    Ok(())
 }
 
-fn show_job(store: &TraceStore, index: usize, json_out: bool) -> Result<()> {
+fn show_job_text(store: &TraceStore, index: usize, json_out: bool) -> Result<String> {
     let job = &store.jobs[index];
     let children: Vec<&Span> = job.span_indexes.iter().map(|&i| &store.spans[i]).collect();
     if json_out {
-        println!(
-            "{}",
-            crate::view::envelope("trace_job", json!({"job": job, "span_timeline": children}))
-        );
+        Ok(crate::view::envelope(
+            "trace_job",
+            json!({"job": job, "span_timeline": children}),
+        ))
     } else {
         let mut o = format!(
             "# job [{}] · process {}\n\nid: {}\nassociation: {}\nsession: {}\n{} · {} elapsed · {} reported-wait · {} polls · {} stdin writes · {} child errors\n",
@@ -1274,25 +1375,24 @@ fn show_job(store: &TraceStore, index: usize, json_out: bool) -> Result<()> {
                 },
             ));
         }
-        print!("{o}");
+        Ok(o)
     }
-    Ok(())
 }
 
-fn show_span(
+fn show_span_text(
     store: &TraceStore,
     index: usize,
     before: usize,
     after: usize,
     json_out: bool,
-) -> Result<()> {
+) -> Result<String> {
     let span = &store.spans[index];
     let around = event_window(store, &span.session_id, span.start_event, before, after);
     if json_out {
-        println!(
-            "{}",
-            crate::view::envelope("trace_span", json!({"span": span, "around": around}))
-        );
+        Ok(crate::view::envelope(
+            "trace_span",
+            json!({"span": span, "around": around}),
+        ))
     } else {
         let mut o = format!(
             "# span [{}] · {}\n\nid: {}\nturn: {}\nsession: {}\n{} · {} · {} · {} · {}\n",
@@ -1326,25 +1426,24 @@ fn show_span(
                 e.summary
             ));
         }
-        print!("{o}");
+        Ok(o)
     }
-    Ok(())
 }
 
-fn show_event(
+fn show_event_text(
     store: &TraceStore,
     index: usize,
     before: usize,
     after: usize,
     json_out: bool,
-) -> Result<()> {
+) -> Result<String> {
     let event = &store.events[index];
     let around = event_window(store, &event.session_id, index, before, after);
     if json_out {
-        println!(
-            "{}",
-            crate::view::envelope("trace_event", json!({"event": event, "around": around}))
-        );
+        Ok(crate::view::envelope(
+            "trace_event",
+            json!({"event": event, "around": around}),
+        ))
     } else {
         let mut o = format!(
             "# event [{}] · {}\n\nid: {}\nsession: {}\n{} · {} · {}\nsummary: {}\n\naround:\n",
@@ -1366,26 +1465,22 @@ fn show_event(
                 e.summary
             ));
         }
-        print!("{o}");
+        Ok(o)
     }
-    Ok(())
 }
 
-fn show_session(store: &TraceStore, sid: &str, json_out: bool) -> Result<()> {
+fn show_session_text(store: &TraceStore, sid: &str, json_out: bool) -> Result<String> {
     let mut turns: Vec<&Turn> = store.turns.iter().filter(|t| t.session_id == sid).collect();
     turns.sort_by(|a, b| a.started.cmp(&b.started));
     let ctx = store.sessions.get(sid).cloned().unwrap_or_default();
     if json_out {
-        println!(
-            "{}",
-            crate::view::envelope(
-                "trace_session",
-                json!({
-                    "session_id": sid, "source": ctx.source, "machine": ctx.machine,
-                    "repo": ctx.repo, "turns": turns,
-                })
-            )
-        );
+        Ok(crate::view::envelope(
+            "trace_session",
+            json!({
+                "session_id": sid, "source": ctx.source, "machine": ctx.machine,
+                "repo": ctx.repo, "turns": turns,
+            }),
+        ))
     } else {
         let mut o = format!(
             "# trace session [{}]\n\nid: {}\n{} · {} · {} · {} turns\n\n",
@@ -1397,9 +1492,8 @@ fn show_session(store: &TraceStore, sid: &str, json_out: bool) -> Result<()> {
             turns.len()
         );
         o.push_str(&turns_md(&turns));
-        print!("{o}");
+        Ok(o)
     }
-    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2498,6 +2592,7 @@ mod tests {
             Some("tool_result"),
             10,
             &known,
+            None,
         )
         .expect("filtered search");
         assert_eq!(hits.len(), 1);

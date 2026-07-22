@@ -5,14 +5,19 @@
 // small (initialize, tools/list, tools/call, ping), so it's hand-rolled — no
 // new dependencies, and stdout carries protocol JSON only (logs go to stderr).
 
-use crate::{encode::Encoder, load_docs, readmodel, search, units, view};
+use crate::{encode::Encoder, load_docs, readmodel, search, trace, units, view};
 use anyhow::Result;
 use next_plaid::{MmapIndex, SearchParameters};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
-pub fn run(model_id: String) -> Result<()> {
-    let mut srv = Server { model_id, engine: None };
+pub fn run(
+    model_id: String,
+    role: crate::policy::McpRole,
+    scope: crate::policy::ReadScope,
+    redaction: crate::redact::Profile,
+) -> Result<()> {
+    let mut srv = Server::new(model_id, role, scope, redaction);
     eprintln!("synty mcp: serving tools over stdio");
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -30,16 +35,28 @@ pub fn run(model_id: String) -> Result<()> {
     Ok(())
 }
 
-struct Server {
+pub(crate) struct Server {
     model_id: String,
+    role: crate::policy::McpRole,
+    scope: crate::policy::ReadScope,
+    redaction: crate::redact::Profile,
     /// The build the engine serves + encoder + index — loaded on the first
     /// search call, kept warm, reopened when the pointer moves.
     engine: Option<(readmodel::Current, Encoder, MmapIndex)>,
 }
 
 impl Server {
+    pub(crate) fn new(
+        model_id: String,
+        role: crate::policy::McpRole,
+        scope: crate::policy::ReadScope,
+        redaction: crate::redact::Profile,
+    ) -> Self {
+        Self { model_id, role, scope, redaction, engine: None }
+    }
+
     /// One JSON-RPC message → one response, or None for notifications.
-    fn handle(&mut self, req: &Value) -> Option<Value> {
+    pub(crate) fn handle(&mut self, req: &Value) -> Option<Value> {
         let id = match req.get("id") {
             Some(v) if !v.is_null() => v.clone(),
             _ => return None, // notification (e.g. notifications/initialized)
@@ -52,7 +69,7 @@ impl Server {
                 "serverInfo": {"name": "synty", "version": env!("CARGO_PKG_VERSION")},
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_defs()})),
+            "tools/list" => Ok(json!({"tools": tool_defs(self.role)})),
             "tools/call" => self.call(&req["params"]),
             other => Err(format!("method not found: {other}")),
         };
@@ -67,11 +84,17 @@ impl Server {
     fn call(&mut self, p: &Value) -> std::result::Result<Value, String> {
         let name = p["name"].as_str().unwrap_or("");
         let a = &p["arguments"];
+        if !self.role.allows_tool(name) {
+            return Err(format!("tool not allowed for {:?} role: {name}", self.role));
+        }
+        if self.scope.restricted() && matches!(name, "synty_stats" | "synty_tool") {
+            return Err(format!("tool unavailable with a restricted read scope: {name}"));
+        }
         let out = match name {
             "synty_search" => self.search(a),
             "synty_related" => self.related(a),
-            "synty_topics" => topics_text(a),
-            "synty_recent" => recent_text(a),
+            "synty_topics" => topics_text(a, &self.scope),
+            "synty_recent" => recent_text(a, &self.scope),
             "synty_status" => view::status().map(|s| view::status_md(&s)),
             "synty_stats" => view::stats(a["weeks"].as_u64().unwrap_or(4) as usize).map(|s| view::stats_md(&s)),
             "synty_tool" => {
@@ -87,14 +110,86 @@ impl Server {
                 if id.is_empty() {
                     Err(anyhow::anyhow!("id is required — ids appear inline in synty_search/synty_recent/synty_topics output"))
                 } else {
-                    view::show_report(id)
+                    view::show_report_scoped(id, &self.scope)
+                }
+            }
+            "synty_trace_list" => {
+                let entity = a["type"].as_str().unwrap_or("");
+                if entity.is_empty() {
+                    Err(anyhow::anyhow!("type is required (turns, spans, or jobs)"))
+                } else {
+                    trace::list_text(
+                        entity,
+                        string_arg(a, "repo"),
+                        string_arg(a, "machine"),
+                        string_arg(a, "source"),
+                        string_arg(a, "status"),
+                        string_arg(a, "operation"),
+                        a["has_errors"].as_bool().unwrap_or(false),
+                        string_arg(a, "since"),
+                        a["min_ms"].as_u64(),
+                        a["sort"].as_str().unwrap_or("recent"),
+                        a["limit"].as_u64().unwrap_or(20) as usize,
+                        false,
+                        Some(&self.scope),
+                    )
+                }
+            }
+            "synty_trace_show" => {
+                let id = a["id"].as_str().unwrap_or("");
+                if id.is_empty() {
+                    Err(anyhow::anyhow!("id is required — trace ids appear in synty_trace_list"))
+                } else {
+                    trace::show_text(
+                        id,
+                        a["before"].as_u64().unwrap_or(6) as usize,
+                        a["after"].as_u64().unwrap_or(12) as usize,
+                        false,
+                        Some(&self.scope),
+                    )
+                }
+            }
+            "synty_trace_search" => {
+                let query = a["query"].as_str().unwrap_or("");
+                if query.is_empty() {
+                    Err(anyhow::anyhow!("query is required"))
+                } else {
+                    trace::search_text(
+                        query,
+                        string_arg(a, "repo"),
+                        string_arg(a, "machine"),
+                        string_arg(a, "source"),
+                        string_arg(a, "kind"),
+                        a["limit"].as_u64().unwrap_or(20) as usize,
+                        false,
+                        Some(&self.scope),
+                    )
+                }
+            }
+            "synty_trace_compare" => {
+                let left = a["left"].as_str().unwrap_or("");
+                let right = a["right"].as_str().unwrap_or("");
+                if left.is_empty() || right.is_empty() {
+                    Err(anyhow::anyhow!("left and right trace ids are required"))
+                } else {
+                    trace::compare_text(left, right, false, Some(&self.scope))
                 }
             }
             other => return Err(format!("unknown tool: {other}")),
         };
         Ok(match out {
-            Ok(text) => json!({"content": [{"type": "text", "text": text}], "isError": false}),
-            Err(e) => json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true}),
+            Ok(text) => json!({
+                "content": [{"type": "text", "text": crate::redact::text(
+                    &text, self.redaction
+                )}],
+                "isError": false
+            }),
+            Err(e) => json!({
+                "content": [{"type": "text", "text": crate::redact::text(
+                    &e.to_string(), self.redaction
+                )}],
+                "isError": true
+            }),
         })
     }
 
@@ -141,7 +236,7 @@ impl Server {
         let (_, enc, idx) = self.engine.as_mut().expect("engine loaded");
         let docs = load_docs(readmodel::docs_path())?;
         let q = enc.encode_query(query)?;
-        let subset = search::subset_for(filter)?;
+        let subset = search::subset_for_scope(filter, &self.scope)?;
         let params = SearchParameters { top_k: k, ..Default::default() };
         let res = idx.search(&q, &params, subset.as_deref()).map_err(|e| anyhow::anyhow!("search: {e}"))?;
         let mut out = search::render(&docs, query, filter, &res);
@@ -152,8 +247,21 @@ impl Server {
     }
 }
 
-fn topics_text(a: &Value) -> Result<String> {
+fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args[key].as_str().filter(|value| !value.is_empty())
+}
+
+fn topics_text(a: &Value, scope: &crate::policy::ReadScope) -> Result<String> {
     let mut topics = units::topic_units(12)?;
+    if scope.restricted() {
+        topics = topics
+            .into_iter()
+            .filter_map(|mut topic| {
+                topic.units.retain(|unit| scope.allows_repo(&unit.repo));
+                (!topic.units.is_empty()).then_some(topic)
+            })
+            .collect();
+    }
     if let Some(q) = a["query"].as_str().filter(|q| !q.is_empty()) {
         let ql = q.to_lowercase();
         topics.retain(|t| {
@@ -164,8 +272,9 @@ fn topics_text(a: &Value) -> Result<String> {
     Ok(view::topics_md(&topics))
 }
 
-fn recent_text(a: &Value) -> Result<String> {
+fn recent_text(a: &Value, scope: &crate::policy::ReadScope) -> Result<String> {
     let mut us = units::units()?;
+    us.retain(|unit| scope.allows_repo(&unit.repo));
     if let Some(r) = a["repo"].as_str().filter(|r| !r.is_empty()) {
         us.retain(|u| u.repo == r);
     }
@@ -173,9 +282,9 @@ fn recent_text(a: &Value) -> Result<String> {
     Ok(view::work_md(&us))
 }
 
-fn tool_defs() -> Value {
+fn tool_defs(role: crate::policy::McpRole) -> Value {
     let obj = |props: Value, required: Value| json!({"type": "object", "properties": props, "required": required});
-    json!([
+    let all = json!([
         {
             "name": "synty_search",
             "description": "Semantic search over this machine's coding-agent sessions and GitHub activity (PRs, issues, prompts). Use before starting work to find prior attempts, decisions, and related PRs. Ids in the output ([a1b2c3d4], repo#123) feed synty_show.",
@@ -233,8 +342,53 @@ fn tool_defs() -> Value {
             "inputSchema": obj(json!({
                 "id": {"type": "string", "description": "The id to resolve"}
             }), json!(["id"])),
+        },
+        {
+            "name": "synty_trace_list",
+            "description": "List forensic agent turns, paired tool spans, or associated async jobs. Use to find slow waits, errors, and execution lifecycles; returned ids feed synty_trace_show and synty_trace_compare.",
+            "inputSchema": obj(json!({
+                "type": {"type": "string", "enum": ["turns", "spans", "jobs"]},
+                "repo": {"type": "string"}, "machine": {"type": "string"},
+                "source": {"type": "string"}, "status": {"type": "string"},
+                "operation": {"type": "string"}, "has_errors": {"type": "boolean"},
+                "since": {"type": "string"}, "min_ms": {"type": "integer", "minimum": 0},
+                "sort": {"type": "string", "enum": ["recent", "duration", "wait"]},
+                "limit": {"type": "integer", "minimum": 1}
+            }), json!(["type"])),
+        },
+        {
+            "name": "synty_trace_show",
+            "description": "Show bounded execution evidence around one trace turn, span, job, event, or session id.",
+            "inputSchema": obj(json!({
+                "id": {"type": "string"}, "before": {"type": "integer", "minimum": 0},
+                "after": {"type": "integer", "minimum": 0}
+            }), json!(["id"])),
+        },
+        {
+            "name": "synty_trace_search",
+            "description": "Literal case-insensitive search over raw execution events with optional repo, machine, source, and kind filters.",
+            "inputSchema": obj(json!({
+                "query": {"type": "string"}, "repo": {"type": "string"},
+                "machine": {"type": "string"}, "source": {"type": "string"},
+                "kind": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}
+            }), json!(["query"])),
+        },
+        {
+            "name": "synty_trace_compare",
+            "description": "Compare two trace turn, span, or job ids field by field.",
+            "inputSchema": obj(json!({
+                "left": {"type": "string"}, "right": {"type": "string"}
+            }), json!(["left", "right"])),
         }
-    ])
+    ]);
+    Value::Array(
+        all.as_array()
+            .expect("tool definitions are an array")
+            .iter()
+            .filter(|tool| tool["name"].as_str().is_some_and(|name| role.allows_tool(name)))
+            .cloned()
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -242,7 +396,12 @@ mod tests {
     use super::*;
 
     fn srv() -> Server {
-        Server { model_id: "m".into(), engine: None }
+        Server::new(
+            "m".into(),
+            crate::policy::McpRole::Operator,
+            crate::policy::ReadScope::default(),
+            crate::redact::Profile::Off,
+        )
     }
 
     // The MCP handshake: initialize echoes the client's protocol version and
@@ -274,7 +433,20 @@ mod tests {
             resp["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["synty_search", "synty_related", "synty_topics", "synty_recent", "synty_status", "synty_stats", "synty_tool", "synty_show"]
+            [
+                "synty_search",
+                "synty_related",
+                "synty_topics",
+                "synty_recent",
+                "synty_status",
+                "synty_stats",
+                "synty_tool",
+                "synty_show",
+                "synty_trace_list",
+                "synty_trace_show",
+                "synty_trace_search",
+                "synty_trace_compare",
+            ]
         );
         assert_eq!(resp["result"]["tools"][0]["inputSchema"]["required"][0], "query");
     }
@@ -293,7 +465,14 @@ mod tests {
         };
         assert_eq!(required("synty_tool"), "name");
         assert_eq!(required("synty_show"), "id");
-        for (tool, hint) in [("synty_tool", "name is required"), ("synty_show", "id is required")] {
+        for (tool, hint) in [
+            ("synty_tool", "name is required"),
+            ("synty_show", "id is required"),
+            ("synty_trace_list", "type is required"),
+            ("synty_trace_show", "id is required"),
+            ("synty_trace_search", "query is required"),
+            ("synty_trace_compare", "left and right"),
+        ] {
             let resp = srv()
                 .handle(&json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                     "params": {"name": tool, "arguments": {}}}))

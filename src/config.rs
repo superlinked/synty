@@ -50,6 +50,22 @@ pub struct Config {
     /// local tail still polls every 30s; this is the network batching cadence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_interval_secs: Option<u64>,
+    /// Optional repository allowlist for newly captured/imported campaign
+    /// sessions. Empty preserves the existing all-repository behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capture_repos: Vec<String>,
+    /// Redaction applied before team-bucket event upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_redaction: Option<String>,
+    /// Redaction applied to MCP responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_redaction: Option<String>,
+    /// Default campaign id stamped onto tracked/imported sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_id: Option<String>,
+    /// Default campaign role stamped onto tracked/imported sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_role: Option<String>,
     /// Days of stream silence before a machine's tracker counts as gone quiet
     /// on the fleet roster (default 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +95,30 @@ pub fn upload_interval_secs() -> u64 {
         .upload_interval_secs
         .unwrap_or(DEFAULT_UPLOAD_INTERVAL_SECS)
         .max(1)
+}
+
+pub fn upload_redaction() -> crate::redact::Profile {
+    load()
+        .upload_redaction
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(crate::redact::Profile::Standard)
+}
+
+pub fn mcp_redaction() -> crate::redact::Profile {
+    load()
+        .mcp_redaction
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(crate::redact::Profile::McpSafe)
+}
+
+pub fn campaign_id() -> Option<String> {
+    load().campaign_id.filter(|value| !value.is_empty())
+}
+
+pub fn campaign_role() -> Option<String> {
+    load().campaign_role.filter(|value| !value.is_empty())
 }
 
 /// Resolve the persisted capture boundary to milliseconds since the epoch.

@@ -52,7 +52,8 @@ Every read command prints Markdown to stdout, or `--json` for a versioned envelo
 | `synty status` | what's indexed, freshness, activation, the fleet roster |
 | `synty stats` | tokens / tools / sessions vs LOC / PRs / issues per week |
 | `synty tui` | interactive browser: tabs, drill-down, filter by repo or account |
-| `synty mcp` | serve the read surface to agents over stdio |
+| `synty mcp` | serve the read surface to agents (stdio, or `--http` with token) |
+| `synty import` | ingest harness/Devin NDJSON into a local owned stream |
 | `synty build` / `synty up` | rebuild the index once / keep it fresh on a loop |
 
 A result is a ranked Markdown card with ids you can drill (`[a1b2c3d4]` sessions,
@@ -79,7 +80,8 @@ plain files under `~/.synty`, so you can build on it directly:
 - **Raw events** (the source of truth): append-only JSONL under `corpus/local/`
   (and `events/<stream>/` in a shared bucket).
 - **Documents**: `corpus/docs.jsonl`, one object per line with `meta`
-  (`source`, `kind`, `repo`, `author`, `session_id`, `ts`).
+  (`source`, `kind`, `repo`, `author`, `session_id`, `campaign_id`,
+  `campaign_role`, `backend`, `ts`).
 - **Metadata**: a SQLite database under `index/`, queryable with any SQLite tool.
 
 ```sh
@@ -88,6 +90,8 @@ synty trace list --type spans --status error --sort duration               # slo
 synty trace list --type jobs --sort wait                                   # associated exec/poll lifecycles
 synty trace search 'libxcb.so.1'                                           # literal raw-event lookup
 synty trace show <full-or-unique-id> --json                                # surrounding execution context
+# Agents can call the same forensic surface over MCP (synty_trace_*), including
+# authenticated HTTP when the binary is built with --features mcp-http.
 jq -r '.meta.kind' ~/.synty/corpus/docs.jsonl | sort | uniq -c              # straight from the raw file
 ```
 
@@ -105,7 +109,15 @@ synty init s3://my-team-synty --aws-profile synty-writer --capture-since now
 
 # AWS VM/container: omit --aws-profile and use its instance/task/workload role
 synty init s3://my-team-synty --capture-since 2026-07-21
+
+# Container / supervisor: skip launchd/systemd; run track --watch yourself
+synty init s3://my-team-synty --capture-since now --no-build --no-autostart
 ```
+
+Codex and Claude Code session roots honor `$CODEX_HOME` and `$CLAUDE_CONFIG_DIR`
+when set (otherwise `~/.codex` / `~/.claude`). Upload sync and remote MCP
+responses apply built-in redaction profiles (`standard` / `mcp_safe`); operators
+with raw bucket credentials still see the stored objects.
 
 On a systemd-based EC2 developer VM, enable lingering once so the per-user
 tracker starts at boot without an SSH login, then run `init` normally:
@@ -143,10 +155,10 @@ For S3, scope each writer/reader role to the chosen bucket (or URI prefix):
 `s3:DeleteObject` on its objects. Delete is used only to release the soft build
 lease; event chunks and content-addressed derived objects are immutable.
 
-> **Heads up:** every member with the bucket can read every session in it. synty
-> is built for high-trust groups; there's no per-reader redaction. If that
-> doesn't fit, stay local, or scope the bucket to people who already see each
-> other's work.
+> **Heads up:** every member with raw bucket credentials can read every stored
+> object. Mediated MCP clients are narrower: role/tool policy, optional read
+> scope, and response redaction. If neither fit, stay local, or scope the bucket
+> to people who already see each other's work.
 
 ## How it works
 
@@ -167,13 +179,15 @@ on-real-data validation lives in [`evals/`](evals/).
 ## Build
 
 ```sh
-cargo build --release        # plain CPU, portable, dependency-light (the shipped build)
+cargo build --release                          # plain CPU, portable (the shipped core)
+cargo build --release --features s3,gcs,mcp-http   # team + remote MCP container build
 ```
 
 On Apple Silicon, add `--features metal` for GPU encode (~5.7× faster);
-`accelerate` (macOS) and `mkl` (Linux) are CPU-BLAS alternatives. The embedding
-model (~127 MB) downloads on first use; the summarizer (~1.2 GB) the first time
-anything summarizes. For an air-gapped setup and the per-stage pipeline, see
+`accelerate` (macOS) and `mkl` (Linux) are CPU-BLAS alternatives. Release assets
+and the Dockerfile include `mcp-http`. The embedding model (~127 MB) downloads
+on first use; the summarizer (~1.2 GB) the first time anything summarizes. For
+an air-gapped setup and the per-stage pipeline, see
 [`docs/design.md`](docs/design.md) and [CONTRIBUTING](CONTRIBUTING.md).
 
 Cutting a release is a maintainer task: see [CONTRIBUTING](CONTRIBUTING.md#releasing).

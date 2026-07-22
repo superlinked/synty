@@ -1,0 +1,64 @@
+image:
+  repository: ghcr.io/superlinked/synty
+  tag: "0.2.3"
+  pullPolicy: IfNotPresent
+
+bucket: ""
+captureSince: now
+uploadInterval: 60
+machine: k8s
+awsProfile: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  accessModes: [ReadWriteMany]
+  size: 20Gi
+
+tracker:
+  enabled: true
+  source: all
+  poll: 30
+  # Existing claim containing the agent's HOME (.codex/.claude). Required to
+  # capture native logs; omit when events arrive through `synty import`.
+  agentHomeClaim: ""
+  agentHomeMountPath: /home/agent
+  # Optional overrides when session roots are not under the mounted HOME.
+  codexHome: ""
+  claudeConfigDir: ""
+  campaign: ""
+  role: ""
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+builder:
+  enabled: true
+  schedule: "*/15 * * * *"
+  resources:
+    requests: { cpu: "2", memory: 2Gi }
+    limits: { cpu: "8", memory: 8Gi }
+
+mcp:
+  enabled: true
+  port: 8765
+  role: investigator
+  existingSecret: synty-mcp
+  tokenKey: token
+  scope:
+    repos: []
+    campaigns: []
+    roles: []
+    sources: []
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "2", memory: 2Gi }
+
+networkPolicy:
+  enabled: true

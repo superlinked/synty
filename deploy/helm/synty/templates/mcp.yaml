@@ -1,0 +1,103 @@
+{{- if .Values.mcp.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "synty.fullname" . }}-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "synty.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "synty.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: mcp
+    spec:
+      serviceAccountName: {{ include "synty.serviceAccountName" . }}
+      containers:
+        - name: mcp
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              synty init "$SYNTY_BUCKET" --machine "$SYNTY_MACHINE" \
+                --no-build --no-autostart \
+                {{- if .Values.awsProfile }} --aws-profile "$SYNTY_AWS_PROFILE"{{- end }}
+              exec synty mcp --http --listen-public \
+                --bind "0.0.0.0:{{ .Values.mcp.port }}" \
+                --token "$SYNTY_MCP_TOKEN" \
+                --role "$SYNTY_MCP_ROLE" \
+                --scope /etc/synty/scope.json \
+                --redaction mcp_safe
+          env:
+            - { name: SYNTY_HOME, value: /var/synty }
+            - { name: SYNTY_BUCKET, value: {{ required "bucket is required" .Values.bucket | quote }} }
+            - { name: SYNTY_MACHINE, value: {{ printf "%s-mcp" .Values.machine | quote }} }
+            - { name: SYNTY_MCP_ROLE, value: {{ .Values.mcp.role | quote }} }
+            - name: SYNTY_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "mcp.existingSecret is required" .Values.mcp.existingSecret }}
+                  key: {{ .Values.mcp.tokenKey }}
+            {{- if .Values.awsProfile }}
+            - { name: SYNTY_AWS_PROFILE, value: {{ .Values.awsProfile | quote }} }
+            {{- end }}
+          ports:
+            - { name: mcp, containerPort: {{ .Values.mcp.port }} }
+          volumeMounts:
+            - { name: synty-home, mountPath: /var/synty }
+            - { name: scope, mountPath: /etc/synty, readOnly: true }
+          livenessProbe:
+            httpGet: { path: /health, port: mcp }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /health, port: mcp }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.mcp.resources | nindent 12 }}
+      volumes:
+        - name: synty-home
+          persistentVolumeClaim:
+            claimName: {{ include "synty.claimName" . }}
+        - name: scope
+          configMap:
+            name: {{ include "synty.fullname" . }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "synty.fullname" . }}-mcp
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "synty.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mcp
+  ports:
+    - { name: mcp, port: {{ .Values.mcp.port }}, targetPort: mcp }
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "synty.fullname" . }}-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "synty.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: mcp
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - { protocol: TCP, port: {{ .Values.mcp.port }} }
+  egress:
+    - {}
+{{- end }}
+{{- end }}

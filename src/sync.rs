@@ -273,7 +273,8 @@ fn push_events_scoped(
         let end = start + last_nl as u64 + 1;
         let filtered =
             filter_events_since(&pending[..=last_nl], capture_since_ms, stream, pending_starts);
-        for (part, chunk) in event_chunks(&filtered, EVENT_CHUNK_BYTES)
+        let redacted = redact_event_lines(&filtered, crate::config::upload_redaction());
+        for (part, chunk) in event_chunks(&redacted, EVENT_CHUNK_BYTES)
             .into_iter()
             .enumerate()
         {
@@ -303,6 +304,26 @@ fn push_events_scoped(
     }
     sync_metric("event_chunks_up", n, bytes_up);
     Ok(n)
+}
+
+fn redact_event_lines(raw: &[u8], profile: crate::redact::Profile) -> Vec<u8> {
+    if profile == crate::redact::Profile::Off {
+        return raw.to_vec();
+    }
+    let mut out = Vec::new();
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        if let Some(redacted) = crate::redact::event_line(line, profile) {
+            out.extend_from_slice(&redacted);
+        } else {
+            let text = crate::redact::text(&String::from_utf8_lossy(line), profile);
+            out.extend_from_slice(text.trim_end_matches(['\r', '\n']).as_bytes());
+            out.push(b'\n');
+        }
+    }
+    out
 }
 
 /// Retain post-boundary events plus the session_start metadata for any session

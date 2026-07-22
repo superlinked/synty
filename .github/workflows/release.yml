@@ -19,7 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked # pure: no model, corpus, or network
-      - run: cargo test --locked --features s3,gcs # compile + test shipped cloud paths
+      - run: cargo test --locked --features s3,gcs,mcp-http # compile + test shipped remote paths
 
   build:
     needs: test
@@ -30,11 +30,11 @@ jobs:
           # Apple Silicon: GPU encode via metal, with runtime CPU fallback.
           - os: macos-14
             asset: synty-darwin-arm64
-            features: metal,s3,gcs
+            features: metal,s3,gcs,mcp-http
           # Linux x64: plain CPU, portable.
           - os: ubuntu-latest
             asset: synty-linux-x64
-            features: s3,gcs
+            features: s3,gcs,mcp-http
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

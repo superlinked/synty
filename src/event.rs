@@ -15,6 +15,8 @@ pub mod source {
     pub const CLAUDE_CODE: &str = "claude_code";
     pub const CODEX_CLI: &str = "codex_cli";
     pub const COWORK: &str = "cowork";
+    pub const HARNESS: &str = "harness";
+    pub const DEVIN: &str = "devin";
     pub const GITHUB: &str = "github";
     pub const SYNTY: &str = "synty";
 }

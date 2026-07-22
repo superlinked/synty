@@ -166,10 +166,14 @@ runs on CI or a server without a developer machine.
   browse/drill (topic → members → full document), reusing the CLI's view-models.
   *Built.*
 - **MCP server:** `synty mcp` serves the CLI's read surface as agent tools over
-  stdio (hand-rolled JSON-RPC, no new deps): search, related, topics, recent,
-  status, stats, tool, show, so a coding agent consults past work mid-session
-  and drills by the ids the tools print (`synty_related` takes the agent's repo
-  path and needs no query). *Built.*
+  stdio by default (hand-rolled JSON-RPC): search, related, topics, recent,
+  status, stats, tool, show, plus forensic `synty_trace_*` tools. Role/tool
+  policy and optional read scope bound mediated clients; responses apply a
+  redaction profile. `--http` (feature `mcp-http`) exposes the same dispatcher
+  as authenticated Streamable HTTP at `/mcp` for remote agents. *Built.*
+- **Harness import:** `synty import` normalizes campaign/Devin NDJSON into
+  owned envelope streams with deterministic ids, capture boundaries, and
+  import-time redaction. *Built.*
 - **JSON output:** `--json` on every read command, one versioned envelope
   (`{"v": 1, "kind": …, "data": …}`) so scripts check the format once. *Built.*
 
@@ -209,9 +213,12 @@ until corpus-scale use demonstrates one is needed. *Built.*
   locally, and answers from the CLI/TUI. No mediation needed, since you are the
   only reader. No server, no creds.
 - **Team / company:** a shared bucket that every member reads and writes
-  directly. synty assumes a high-trust team: anyone with the bucket can read
-  every tracked session, because read rules cannot be enforced on a client with
-  raw bucket access. There is no mediation layer and no per-reader redaction.
+  directly. synty assumes a high-trust team for raw bucket credentials: anyone
+  with the bucket can read every stored object, because read rules cannot be
+  enforced on a client with that access. A separate mediated path exists for
+  agents: `synty mcp` (stdio or authenticated HTTP) applies role/tool policy,
+  optional read scope, and response redaction; upload sync can also redact
+  before writing team event chunks.
 
 Usage and topic rollups are by work (topic, repo, period); the one per-person
 view is the fleet-coverage roster, which names who runs agents untracked so a
@@ -228,11 +235,14 @@ the rest, no migration). A machine is **activated**, a real fleet member,
 exactly when a bucket is set; the bucket is the only thing that moves the badge.
 Autostart (the login-time tracker) is turned on by `init`/install and is on by
 default thereafter, reported in its own indicator, not a second activation gate.
-An orphan plist/unit is not reported as active, and initialization fails visibly
-if the service manager does not load the watcher. `--capture-since` persists an
-absolute event boundary and `--upload-interval` sets the network batching
-cadence. A systemd user service starts at boot on a headless developer VM when
-the administrator enables lingering for that user (`loginctl enable-linger`).
+Containers and process supervisors pass `--no-autostart` and run
+`synty track --watch` themselves. An orphan plist/unit is not reported as
+active, and initialization fails visibly if the service manager does not load
+the watcher. `--capture-since` persists an absolute event boundary and
+`--upload-interval` sets the network batching cadence. Optional `--campaign` /
+`--role` persist campaign stamps used by later track/import runs. A systemd
+user service starts at boot on a headless developer VM when the administrator
+enables lingering for that user (`loginctl enable-linger`).
 The state shows on `status` and the TUI footer (`◐ local`, accent → `✓
 <bucket>`, sage), so the ramp is legible. The install one-liner carries the
 bucket and drops into the viewer, so a paste goes from nothing to tracking.
@@ -322,10 +332,11 @@ A working binary: `up` (solo loop), `build` (one-shot fleet-aware pipeline),
 (GraphQL backfill), `ingest` (envelopes + GitHub → `corpus/docs.jsonl`,
 `--bucket` to pull), `index` (encode + content-addressed store + versioned
 build + publish), `search [--filter col=value] [--json]`, `topic`, `recent`,
-`status`, `trace list/show/search/compare` (turns, spans, async jobs), `tui`, `mcp`,
-`cluster [--resolution]`, `summarize`, `eval`, plus the
-scenario test suite (`cargo test`, pure). The bucket backplane (local always,
-S3/GCS opt-in) gives fleet-wide encode-once and collaborative builds.
+`status`, `trace list/show/search/compare` (turns, spans, async jobs), `tui`,
+`mcp` (stdio + optional HTTP), `import`, `cluster [--resolution]`, `summarize`,
+`eval`, plus the scenario test suite (`cargo test`, pure). The bucket backplane
+(local always, S3/GCS/MCP-HTTP opt-in) gives fleet-wide encode-once and
+collaborative builds.
 Validated at M0/M1 on real data (3,938 docs / 770 K embeddings): retrieval 12/12
 relevant top-3, agent task-start dogfood 3/3, session summaries specific and
 accurate (extractive in the core; one-line abstractive from a local Qwen3-0.6B

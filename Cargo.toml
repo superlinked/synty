@@ -35,6 +35,9 @@ s3 = [
     "dep:async-trait",
 ]
 gcs = ["dep:object_store", "object_store/gcp", "dep:tokio", "dep:futures"]
+# Authenticated Streamable HTTP transport for remote MCP clients. Stdio stays
+# available in every build; release/container artifacts opt into this feature.
+mcp-http = ["dep:tiny_http"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -43,6 +46,7 @@ chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive"] }
 half = "2.7.1"
 libc = "0.2"
+regex = "1"
 
 # Local summarizer (the `llm` feature). candle-transformers/tokenizers are
 # already resolved transitively via pylate-rs; declaring them direct just lets
@@ -72,3 +76,4 @@ futures = { version = "0.3", optional = true }
 aws-config = { version = "=1.8.8", optional = true, default-features = false, features = ["rt-tokio", "credentials-process", "default-https-client"] }
 aws-credential-types = { version = "=1.2.8", optional = true }
 async-trait = { version = "0.1", optional = true }
+tiny_http = { version = "0.12", optional = true }

@@ -409,6 +409,45 @@ pub fn show_report(id: &str) -> Result<String> {
     })
 }
 
+pub fn show_report_scoped(id: &str, scope: &crate::policy::ReadScope) -> Result<String> {
+    if !scope.restricted() {
+        return show_report(id);
+    }
+    let mut docs = load_docs(readmodel::docs_path()).unwrap_or_default();
+    docs.retain(|doc| {
+        scope.allows_repo(&doc.meta.repo)
+            && scope.allows_source(&doc.meta.source)
+            && (scope.campaigns.is_empty()
+                || scope.campaigns.contains(&doc.meta.campaign_id))
+            && (scope.roles.is_empty() || scope.roles.contains(&doc.meta.campaign_role))
+    });
+    let allowed_sessions: std::collections::HashSet<&str> = docs
+        .iter()
+        .filter_map(|doc| (!doc.meta.session_id.is_empty()).then_some(doc.meta.session_id.as_str()))
+        .collect();
+    let sessions = crate::units::sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|session| allowed_sessions.contains(session.id.as_str()))
+        .collect();
+    let topics = crate::units::topic_units(12)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|mut topic| {
+            topic.units.retain(|unit| scope.allows_repo(&unit.repo));
+            (!topic.units.is_empty()).then_some(topic)
+        })
+        .collect();
+    let target = resolve_among(id, sessions, topics, &docs)?;
+    Ok(match &target {
+        ShowTarget::Session(session) => session_md(session, &session_prompts(&docs, &session.id)),
+        ShowTarget::Gh { doc, topic } => {
+            unit_md(doc, topic.as_ref().map(|(key, title)| (key.as_str(), title.as_str())))
+        }
+        ShowTarget::Topic(topic) => topic_md(topic),
+    })
+}
+
 pub fn show_json_report(id: &str) -> Result<String> {
     let (t, docs) = show_load(id)?;
     Ok(match &t {
@@ -1359,6 +1398,9 @@ mod tests {
                 repo: repo.into(),
                 author: "alice".into(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
                 ts: "2026-06-01T10:00:00Z".into(),
                 number: Some(n),
                 url: Some("https://gh/7".into()),
@@ -1442,6 +1484,9 @@ mod tests {
                 repo: "sie".into(),
                 author: String::new(),
                 session_id: s.id.clone(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
                 ts: String::new(),
                 number: None,
                 url: None,
@@ -1630,6 +1675,9 @@ mod tests {
                 repo: repo.into(),
                 author: author.into(),
                 session_id: sid.into(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
                 ts: "2026-01-01T00:00:00Z".into(),
                 number: None,
                 url: None,

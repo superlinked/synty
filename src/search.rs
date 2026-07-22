@@ -10,15 +10,51 @@ use next_plaid::{MmapIndex, QueryResult, SearchParameters};
 /// Filter is `column=value` (e.g. `repo=sie-web`); bound as a parameter so the
 /// next-plaid WHERE validator accepts it.
 pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
-    let Some(f) = filter else { return Ok(None) };
-    let (col, val) = f.split_once('=').ok_or_else(|| anyhow!("filter must be col=value: {f}"))?;
+    subset_for_scope(filter, &crate::policy::ReadScope::default())
+}
+
+pub fn subset_for_scope(
+    filter: Option<&str>,
+    scope: &crate::policy::ReadScope,
+) -> Result<Option<Vec<i64>>> {
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+    if let Some(f) = filter {
+        let (col, val) =
+            f.split_once('=').ok_or_else(|| anyhow!("filter must be col=value: {f}"))?;
+        clauses.push(format!("{} = ?", col.trim()));
+        params.push(serde_json::json!(val.trim()));
+    }
+    append_scope_clause(&mut clauses, &mut params, "repo", &scope.repos);
+    append_scope_clause(&mut clauses, &mut params, "campaign_id", &scope.campaigns);
+    append_scope_clause(&mut clauses, &mut params, "campaign_role", &scope.roles);
+    append_scope_clause(&mut clauses, &mut params, "source", &scope.sources);
+    if clauses.is_empty() {
+        return Ok(None);
+    }
     let ids = next_plaid::filtering::where_condition(
         &readmodel::index_dir().to_string_lossy(),
-        &format!("{} = ?", col.trim()),
-        &[serde_json::json!(val.trim())],
+        &clauses.join(" AND "),
+        &params,
     )
-    .map_err(|e| anyhow!("filter `{f}`: {e}"))?;
+    .map_err(|e| anyhow!("filter: {e}"))?;
     Ok(Some(ids))
+}
+
+fn append_scope_clause(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<serde_json::Value>,
+    column: &str,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    clauses.push(format!(
+        "{column} IN ({})",
+        std::iter::repeat_n("?", values.len()).collect::<Vec<_>>().join(",")
+    ));
+    params.extend(values.iter().map(|value| serde_json::json!(value)));
 }
 
 pub fn run(

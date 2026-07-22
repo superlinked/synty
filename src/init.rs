@@ -17,8 +17,11 @@ pub fn run(
     aws_profile: Option<String>,
     capture_since: Option<String>,
     upload_interval: Option<u64>,
+    campaign: Option<String>,
+    role: Option<String>,
     machine: &str,
     no_build: bool,
+    no_autostart: bool,
 ) -> Result<()> {
     let mut cfg = config::load();
 
@@ -35,6 +38,12 @@ pub fn run(
     }
     if let Some(secs) = upload_interval {
         cfg.upload_interval_secs = Some(secs.max(1));
+    }
+    if let Some(campaign) = campaign.filter(|value| !value.is_empty()) {
+        cfg.campaign_id = Some(campaign);
+    }
+    if let Some(role) = role.filter(|value| !value.is_empty()) {
+        cfg.campaign_role = Some(role);
     }
 
     // 2. GitHub identity — best-effort, no prompts. With a token, pin the login
@@ -72,11 +81,16 @@ pub fn run(
         up::build(&config::resolve_bucket(bucket), machine, 1.0, false)?;
     }
 
-    // 4. Track at login after the initial one-shot has completed.
-    track::autostart_set(true).context(
-        "enable login-time tracker (configuration was saved, but initialization is not complete)",
-    )?;
-    eprintln!("init: login-time tracker enabled");
+    // 4. Track at login after the initial one-shot has completed. Containers
+    //    supervise `track --watch` themselves and opt out explicitly.
+    if no_autostart {
+        eprintln!("init: autostart skipped — run `synty track --watch` under your supervisor");
+    } else {
+        track::autostart_set(true).context(
+            "enable login-time tracker (configuration was saved, but initialization is not complete)",
+        )?;
+        eprintln!("init: login-time tracker enabled");
+    }
 
     // 5. Tell the user where they stand on the local→bucket ramp.
     match &cfg.bucket {
