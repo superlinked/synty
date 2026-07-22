@@ -21,10 +21,15 @@ pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
     Ok(Some(ids))
 }
 
-pub fn run(query: &str, filter: Option<&str>, k: usize, model_id: &str, bucket: &str, json: bool) -> Result<()> {
-    if crate::sync::pull_if_stale(bucket).unwrap_or(false) {
-        eprintln!("pulled published read-model from {bucket}");
-    }
+pub fn run(
+    query: &str,
+    filter: Option<&str>,
+    k: usize,
+    model_id: &str,
+    bucket: &str,
+    json: bool,
+) -> Result<()> {
+    crate::sync::pull_for_read(bucket);
     if let Some(note) = crate::view::stale_note() {
         eprintln!("{note}");
     }

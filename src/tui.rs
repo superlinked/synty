@@ -344,11 +344,10 @@ impl ViewCache {
 }
 
 pub fn run(model_id: String, bucket: String) -> Result<()> {
-    // Show the fleet's latest published read-model immediately; the background
-    // freshen catches up on anything newer after the UI is on screen.
-    if crate::sync::pull_if_stale(&bucket).unwrap_or(false) {
-        eprintln!("pulled published read-model from {bucket}");
-    }
+    // Show the fleet's latest published read-model immediately. Pulling raw
+    // chunks first lets status detect an unpublished delta; the background
+    // freshen then catches it up after the UI is on screen.
+    crate::sync::pull_for_read(&bucket);
     // Gag stderr first: the background model load (and candle/pylate-rs) write
     // device/diagnostic lines to stderr, which would scroll the alternate screen
     // and shove the header off the top. Restored when `_gag` drops.

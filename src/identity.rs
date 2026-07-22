@@ -2,7 +2,7 @@
 // hardcoded "daniel"; this derives a real identity instead, and a stable machine
 // id for the `edge-<machine>-<source>` stream names so a fleet doesn't all
 // collide on the "local" default. Resolution is offline and best-effort —
-// `synty setup` (later) pins the exact GitHub login into .synty/identity, which
+// `synty init` pins the exact GitHub login into shared configuration, which
 // takes precedence here the moment it exists.
 
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::path::Path;
 const ID_DIR: &str = ".synty";
 
 /// The actor to stamp on this machine's sessions. Precedence: a pinned GitHub
-/// login (.synty/identity, written by setup) → the local part of git's
+/// login (`.synty/config.json`, written by init/backfill) → the local part of git's
 /// user.email → $USER. So a person's sessions merge with their GitHub PRs
 /// instead of every session reading as one hardcoded name.
 pub fn actor() -> String {

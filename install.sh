@@ -3,6 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh                      # local trial
 #   curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh -s -- gs://my-team   # join the team
+#   curl -fsSL https://raw.githubusercontent.com/superlinked/synty/main/install.sh | sh -s -- s3://my-team --aws-profile synty-writer --capture-since now
 #
 # It puts the binary on PATH, runs `synty init [bucket]` (pins your GitHub
 # identity, enables the login-time tracker, runs the first build), then opens
@@ -18,7 +19,11 @@
 # releases.
 set -eu
 
-BUCKET="${1:-}"
+case "${1:-}" in
+  --*) BUCKET="" ;;
+  "") BUCKET="" ;;
+  *) BUCKET="$1"; shift ;;
+esac
 RELEASE_REPO="${SYNTY_RELEASE_REPO:-superlinked/synty}"
 
 # 1. Resolve the binary. This machine's platform key matches `release::platform_key`.
@@ -66,9 +71,9 @@ mkdir -p "$SYNTY_HOME"
 # 4. One step: config + GitHub identity + login-time tracker + first build.
 #    With a bucket it's the local→bucket switch; without, a local trial.
 if [ -n "$BUCKET" ]; then
-  "$DEST/synty" init "$BUCKET"
+  "$DEST/synty" init "$BUCKET" "$@"
 else
-  "$DEST/synty" init
+  "$DEST/synty" init "$@"
 fi
 
 # 5. Drop into the viewer when there's a terminal to drive it. Under `curl | sh`

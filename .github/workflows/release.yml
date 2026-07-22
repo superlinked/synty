@@ -19,6 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked # pure: no model, corpus, or network
+      - run: cargo test --locked --features s3,gcs # compile + test shipped cloud paths
 
   build:
     needs: test

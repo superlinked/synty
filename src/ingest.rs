@@ -1,6 +1,6 @@
 // Build corpus/docs.jsonl from two raw sources:
 //   corpus/github/{prs,issues}-<repo>.json  (gh JSON arrays)
-//   corpus/local/<stream>/<hour>.jsonl      (v1 synty-agent --out envelopes)
+//   corpus/local/<stream>/**/*.jsonl         (local + pulled canonical envelopes)
 // Sessions are chunked per user/assistant/thinking message. Capped by recency.
 
 use crate::{Doc, Meta};
@@ -19,7 +19,7 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
     if let Some(b) = bucket {
         let local = Path::new(corpus_dir).join("local");
         match crate::sync::pull_events(b, &local.to_string_lossy()) {
-            Ok(n) if n > 0 => eprintln!("ingest: pulled {n} event files from {b}/events/"),
+            Ok(n) if n > 0 => eprintln!("ingest: pulled {n} event chunks from {b}/events/"),
             Ok(_) => {}
             Err(e) => eprintln!("ingest: event pull skipped ({e})"),
         }
@@ -94,6 +94,12 @@ pub fn run(corpus_dir: &str, out_path: &str, bucket: Option<&str>) -> Result<()>
             docs_from_events(&d, &maps, &local_actor, &mut seen, &mut docs);
             n_session += docs.len() - before;
         }
+    }
+    if let Some(cutoff) = crate::config::capture_since_ms() {
+        docs.retain(|d| {
+            d.meta.source != "agent" || crate::config::captured_at(&d.meta.ts, Some(cutoff))
+        });
+        n_session = docs.iter().filter(|d| d.meta.source == "agent").count();
     }
     let n_skipped = maps.skipped;
 
@@ -301,15 +307,24 @@ fn input_manifest<'a>(files: impl Iterator<Item = &'a PathBuf>) -> String {
             .unwrap_or((0, 0));
         out.push_str(&format!("{}\t{mtime}\t{size}\n", p.display()));
     }
-    let cfg = crate::config::load();
-    let mut repos = cfg.repos;
+    out.push_str(&derivation_config(&crate::config::load()));
+    out
+}
+
+fn derivation_config(cfg: &crate::config::Config) -> String {
+    let mut out = String::new();
+    let mut repos = cfg.repos.clone();
     repos.sort();
     out.push_str(&format!("repos={}\n", repos.join(",")));
     out.push_str(&format!("cap={}\n", cfg.max_docs.unwrap_or(CAP)));
+    out.push_str(&format!(
+        "capture_since={}\n",
+        cfg.capture_since.as_deref().unwrap_or("")
+    ));
     // Doc-derivation format: bump whenever the derivation itself changes (new
     // Meta fields, new detectors) so a binary upgrade regenerates docs.jsonl
     // once even though the input files are unchanged.
-    out.push_str("fmt=2\n");
+    out.push_str("fmt=3\n");
     out
 }
 
@@ -507,6 +522,17 @@ mod tests {
         run(&corpus_s, &out_s, None).unwrap();
         assert!(std::fs::read_to_string(&out).unwrap().contains("a follow-up prompt arrives"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_boundary_is_part_of_the_ingest_fast_path_key() {
+        let before = crate::config::Config::default();
+        let after = crate::config::Config {
+            capture_since: Some("2026-07-21T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert_ne!(derivation_config(&before), derivation_config(&after));
+        assert!(derivation_config(&after).contains("capture_since=2026-07-21T00:00:00Z"));
     }
 
     // Overlapping trackers (autostart + a manual run) append the same envelope

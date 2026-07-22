@@ -2,7 +2,7 @@
 name = "synty"
 version = "0.1.0"
 edition = "2024"
-description = "A passive, local memory of your coding-agent sessions and GitHub activity: query-free recall for you and the agents you work with. ColBERT retrieval, local summaries, nothing leaves your machine."
+description = "A passive, local-first memory of coding-agent sessions and GitHub activity, with ColBERT retrieval, local summaries, and an optional team bucket."
 license = "Apache-2.0"
 repository = "https://github.com/superlinked/synty"
 homepage = "https://github.com/superlinked/synty"
@@ -25,7 +25,15 @@ accelerate = ["pylate-rs/accelerate", "candle-core/accelerate"]
 # CPU BLAS via Intel MKL (Linux/x86). Build: --features mkl.
 mkl = ["pylate-rs/mkl", "candle-core/mkl"]
 # Cloud bucket backends (object_store). Build: --features s3 / --features gcs.
-s3 = ["dep:object_store", "object_store/aws", "dep:tokio", "dep:futures"]
+s3 = [
+    "dep:object_store",
+    "object_store/aws",
+    "dep:tokio",
+    "dep:futures",
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:async-trait",
+]
 gcs = ["dep:object_store", "object_store/gcp", "dep:tokio", "dep:futures"]
 
 [dependencies]
@@ -56,3 +64,11 @@ walkdir = "2.5.0"
 object_store = { version = "0.11", optional = true, default-features = false }
 tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 futures = { version = "0.3", optional = true }
+# The SDK config chain is only part of the opt-in S3 build. It gives Synty
+# rotating profile/credential_process/instance-role credentials instead of
+# freezing short-lived environment keys inside a login service. Keep this
+# release pinned to the repository's current Rust toolchain; newer aws-config
+# releases raise their MSRV independently of Synty.
+aws-config = { version = "=1.8.8", optional = true, default-features = false, features = ["rt-tokio", "credentials-process", "default-https-client"] }
+aws-credential-types = { version = "=1.2.8", optional = true }
+async-trait = { version = "0.1", optional = true }

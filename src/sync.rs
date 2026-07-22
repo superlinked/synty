@@ -9,13 +9,15 @@
 // already in the content-addressed store) are not published.
 
 use crate::{bucket, readmodel};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const POINTER_KEY: &str = "current.json";
 const EVENTS: &str = "events";
+const EVENT_CHUNK_BYTES: usize = 1 << 20;
 
 /// Filename → blob hash for one (build, rev).
 #[derive(Serialize, Deserialize)]
@@ -102,36 +104,227 @@ fn fetch_build(b: &dyn bucket::Bucket, dir: &Path, files: &BTreeMap<String, Stri
     Ok((reused, fetched, bytes_down))
 }
 
-/// Upload this device's event files to the bucket under `events/`, skipping any
-/// whose bucket copy is already the same size (append-only files only grow).
-/// With many trackers pointed at one bucket, each device's events converge here
-/// under its own stream path, ready for a single build to process them all.
+/// Per-bucket byte offsets already converted from local append-only tracker
+/// files into immutable cloud chunks. Bucket-scoping matters: switching a
+/// machine to a new team bucket must replay its eligible local events there.
+#[derive(Serialize, Deserialize, Default)]
+struct UploadState {
+    #[serde(default)]
+    buckets: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Pre-boundary session_start lines staged until that session produces an
+    /// eligible event. This preserves actor/repo metadata for a session that
+    /// straddles the boundary without publishing starts for old-only sessions.
+    #[serde(default)]
+    pending_starts: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Default event upload path used by builds outside the long-lived tracker.
 pub fn push_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
+    push_events_with(
+        bucket_uri,
+        local_dir,
+        ".synty/uploads.json",
+        crate::config::capture_since_ms(),
+    )
+}
+
+/// Convert only the new complete bytes of local per-day tracker files into
+/// deterministic, immutable objects. A failed/retried pass addresses the same
+/// keys and put_if_absent makes it idempotent; no historical object is HEADed
+/// on every poll, and the growing current-day file is never re-uploaded whole.
+/// The absolute capture bound is applied here as a second privacy gate, so
+/// joining a bucket does not silently publish older local history.
+pub fn push_events_with(
+    bucket_uri: &str,
+    local_dir: &str,
+    state_path: &str,
+    capture_since_ms: Option<i64>,
+) -> Result<usize> {
     let b = bucket::open(bucket_uri)?;
+    let mut state: UploadState = std::fs::read_to_string(state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let offsets = state.buckets.entry(bucket_uri.to_string()).or_default();
+    let pending_starts = state
+        .pending_starts
+        .entry(bucket_uri.to_string())
+        .or_default();
     let (mut n, mut bytes_up) = (0, 0u64);
-    for entry in walkdir::WalkDir::new(local_dir).into_iter().filter_map(|e| e.ok()) {
+    let mut changed = false;
+    for entry in walkdir::WalkDir::new(local_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl")
         {
             continue;
         }
-        let rel = entry.path().strip_prefix(local_dir)?.to_string_lossy().replace('\\', "/");
-        let key = format!("{EVENTS}/{rel}");
-        let bytes = std::fs::read(entry.path())?;
-        if b.size(&key)? == Some(bytes.len() as u64) {
+        let rel_path = entry.path().strip_prefix(local_dir)?;
+        // Only the tracker's source files are upload inputs. Pulled immutable
+        // chunks also live below corpus/local and must never be re-chunked.
+        if rel_path.components().count() != 2
+            || !entry.file_name().to_string_lossy().starts_with("track")
+        {
             continue;
         }
-        b.put(&key, &bytes)?;
-        bytes_up += bytes.len() as u64;
-        n += 1;
+        let rel = rel_path.to_string_lossy().replace('\\', "/");
+        let bytes = std::fs::read(entry.path())?;
+        let mut start = offsets
+            .get(&rel)
+            .copied()
+            .unwrap_or(0)
+            .min(bytes.len() as u64);
+        if start == 0 {
+            // One-time upgrade compatibility: an older Synty may already have
+            // uploaded this exact mutable daily object. Do not duplicate it as
+            // chunks merely because the local upload ledger is new.
+            let legacy = format!("{EVENTS}/{rel}");
+            if b.size(&legacy)? == Some(bytes.len() as u64) {
+                offsets.insert(rel.clone(), bytes.len() as u64);
+                changed = true;
+                continue;
+            }
+        }
+        if start >= bytes.len() as u64 {
+            continue;
+        }
+        let pending = &bytes[start as usize..];
+        let Some(last_nl) = pending.iter().rposition(|b| *b == b'\n') else {
+            continue;
+        };
+        let end = start + last_nl as u64 + 1;
+        let (stream, file) = rel.split_once('/').unwrap_or(("local", rel.as_str()));
+        let filtered =
+            filter_events_since(&pending[..=last_nl], capture_since_ms, stream, pending_starts);
+        for (part, chunk) in event_chunks(&filtered, EVENT_CHUNK_BYTES)
+            .into_iter()
+            .enumerate()
+        {
+            let hash = Sha256::digest(&chunk);
+            let short_hash = hash[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let stem = file.strip_suffix(".jsonl").unwrap_or(file);
+            let key = format!(
+                "{EVENTS}/{stream}/chunks/{stem}/{start:016x}-{end:016x}-{part:04}-{short_hash}.jsonl"
+            );
+            if b.put_if_absent(&key, &chunk)? {
+                bytes_up += chunk.len() as u64;
+                n += 1;
+            }
+        }
+        start = end;
+        offsets.insert(rel, start);
+        changed = true;
     }
-    sync_metric("events_up", n, bytes_up);
+    if changed {
+        if let Some(parent) = Path::new(state_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::write_atomic(state_path, &serde_json::to_vec(&state)?)?;
+    }
+    sync_metric("event_chunks_up", n, bytes_up);
     Ok(n)
 }
 
-/// Download all devices' event files from the bucket into `local_dir`, skipping
-/// any already present at the same size. This is how a build sees every
-/// device's sessions, not just the local machine's.
+/// Retain post-boundary events plus the session_start metadata for any session
+/// that eventually crosses the boundary, staging starts across upload batches.
+/// Unknown/future envelope lines are retained: a privacy cutoff may discard
+/// something proven old, never data it cannot understand.
+fn filter_events_since(
+    raw: &[u8],
+    capture_since_ms: Option<i64>,
+    stream: &str,
+    pending_starts: &mut BTreeMap<String, String>,
+) -> Vec<u8> {
+    let Some(cutoff) = capture_since_ms else {
+        return raw.to_vec();
+    };
+    let rows: Vec<(&[u8], Option<serde_json::Value>)> = raw
+        .split_inclusive(|b| *b == b'\n')
+        .filter(|line| !line.iter().all(|b| b.is_ascii_whitespace()))
+        .map(|line| (line, serde_json::from_slice(line).ok()))
+        .collect();
+    let active: BTreeSet<String> = rows
+        .iter()
+        .filter_map(|(_, v)| {
+            let v = v.as_ref()?;
+            (event_time_ms(v)? >= cutoff)
+                .then(|| v["session_id"].as_str().map(ToString::to_string))
+                .flatten()
+        })
+        .collect();
+    for (line, value) in &rows {
+        let Some(v) = value else { continue };
+        let Some(sid) = v["session_id"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if v["kind"].as_str() == Some("session_start")
+            && event_time_ms(v).is_some_and(|ts| ts < cutoff)
+        {
+            pending_starts.insert(
+                format!("{stream}\0{sid}"),
+                String::from_utf8_lossy(line).into_owned(),
+            );
+        }
+        if v["kind"].as_str() == Some("session_end") && !active.contains(sid) {
+            pending_starts.remove(&format!("{stream}\0{sid}"));
+        }
+    }
+    let mut out = Vec::new();
+    for sid in &active {
+        if let Some(start) = pending_starts.remove(&format!("{stream}\0{sid}")) {
+            out.extend_from_slice(start.as_bytes());
+        }
+    }
+    for (line, value) in rows {
+        let keep = match value.as_ref() {
+            None => true,
+            Some(v) => match event_time_ms(v) {
+                None => true,
+                Some(ts) if ts >= cutoff => true,
+                Some(_) => false,
+            },
+        };
+        if keep {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
+fn event_time_ms(v: &serde_json::Value) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(v["ts"].as_str()?)
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
+/// Split at line boundaries, keeping an over-size single envelope intact.
+fn event_chunks(raw: &[u8], target: usize) -> Vec<Vec<u8>> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    for line in raw.split_inclusive(|b| *b == b'\n') {
+        if !cur.is_empty() && cur.len() + line.len() > target {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.extend_from_slice(line);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Download all devices' event files from the bucket into `local_dir`. Immutable
+/// chunks need no HEAD once present; legacy mutable daily files retain their
+/// size check. This is how a build sees every device's sessions, not just the
+/// local machine's.
 pub fn pull_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
     let b = bucket::open(bucket_uri)?;
     let (mut n, mut bytes_down) = (0, 0u64);
@@ -139,6 +332,9 @@ pub fn pull_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
         let rel = key.strip_prefix(&format!("{EVENTS}/")).unwrap_or(&key);
         let dest = Path::new(local_dir).join(rel);
         let local_size = std::fs::metadata(&dest).ok().map(|m| m.len());
+        if key.contains("/chunks/") && local_size.is_some() {
+            continue; // content-addressed-by-key and written atomically
+        }
         if local_size.is_some() && local_size == b.size(&key)? {
             continue;
         }
@@ -147,11 +343,29 @@ pub fn pull_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
             std::fs::create_dir_all(p)?;
         }
         bytes_down += bytes.len() as u64;
-        std::fs::write(&dest, bytes)?;
+        crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
         n += 1;
     }
     sync_metric("events_down", n, bytes_down);
     Ok(n)
+}
+
+/// Bring a reader onto the fleet's latest raw-event and published read-model
+/// snapshots. Raw events are needed by status/stats/trace and also make an
+/// unpublished delta visible through `stale_note`; the read-model remains the
+/// fast query surface. Sync errors are advisory so an offline reader can keep
+/// using its last complete local snapshot.
+pub fn pull_for_read(bucket_uri: &str) {
+    match pull_events(bucket_uri, "corpus/local") {
+        Ok(n) if n > 0 => eprintln!("pulled {n} fleet event chunks from {bucket_uri}"),
+        Ok(_) => {}
+        Err(e) => eprintln!("event pull skipped ({e})"),
+    }
+    match pull_if_stale(bucket_uri) {
+        Ok(true) => eprintln!("pulled published read-model from {bucket_uri}"),
+        Ok(false) => {}
+        Err(e) => eprintln!("read-model pull skipped ({e})"),
+    }
 }
 
 /// The GitHub corpus manifest: per-file content hashes plus when the last
@@ -337,6 +551,178 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::bucket::Bucket; // trait methods (put/get) on LocalFs in tests
+
+    fn event(id: &str, sid: &str, kind: &str, ts: &str, text: &str) -> String {
+        serde_json::json!({
+            "v": 1, "event_id": id, "stream": "edge-m-codex", "seq": 0,
+            "ts": ts, "source": "codex_cli", "session_id": sid, "kind": kind,
+            "payload": {"text": text}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    #[test]
+    fn event_uploads_are_immutable_incremental_chunks() {
+        let root = std::env::temp_dir().join(format!("synty-event-chunks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let local = root.join("local/edge-m-codex");
+        let bucket = root.join("bucket");
+        let state = root.join("uploads.json");
+        std::fs::create_dir_all(&local).unwrap();
+        let file = local.join("track.2026-07-21.jsonl");
+        std::fs::write(
+            &file,
+            event("a", "s", "session_start", "2026-07-21T10:00:00Z", "")
+                + &event("b", "s", "user_prompt", "2026-07-21T10:01:00Z", "first"),
+        )
+        .unwrap();
+        let bu = bucket.to_str().unwrap();
+        assert_eq!(
+            push_events_with(
+                bu,
+                root.join("local").to_str().unwrap(),
+                state.to_str().unwrap(),
+                None
+            )
+            .unwrap(),
+            1
+        );
+        let b = crate::bucket::LocalFs::new(&bucket);
+        let first = b.list("events").unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("/chunks/"));
+        assert!(
+            !first[0].ends_with("track.2026-07-21.jsonl"),
+            "growing daily file is never the cloud object"
+        );
+        let first_bytes = b.get(&first[0]).unwrap().unwrap();
+
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(
+                event(
+                    "c",
+                    "s",
+                    "assistant_message",
+                    "2026-07-21T10:02:00Z",
+                    "second",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            push_events_with(
+                bu,
+                root.join("local").to_str().unwrap(),
+                state.to_str().unwrap(),
+                None
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            b.list("events").unwrap().len(),
+            2,
+            "append creates one new object"
+        );
+        assert_eq!(
+            b.get(&first[0]).unwrap().unwrap(),
+            first_bytes,
+            "published chunk stays immutable"
+        );
+        assert_eq!(
+            push_events_with(
+                bu,
+                root.join("local").to_str().unwrap(),
+                state.to_str().unwrap(),
+                None
+            )
+            .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn event_upload_boundary_keeps_metadata_across_daily_files() {
+        let root = std::env::temp_dir().join(format!("synty-event-since-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let local = root.join("local/edge-m-codex");
+        let bucket = root.join("bucket");
+        std::fs::create_dir_all(&local).unwrap();
+        let file = local.join("track.2026-07-20.jsonl");
+        std::fs::write(
+            &file,
+            event(
+                "a",
+                "s",
+                "session_start",
+                "2026-07-20T23:50:00Z",
+                "metadata",
+            ) + &event("b", "s", "user_prompt", "2026-07-20T23:55:00Z", "too old"),
+        )
+        .unwrap();
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let state = root.join("uploads.json");
+        assert_eq!(
+            push_events_with(
+                bucket.to_str().unwrap(),
+                root.join("local").to_str().unwrap(),
+                state.to_str().unwrap(),
+                Some(cutoff),
+            )
+            .unwrap(),
+            0,
+            "old-only batch publishes nothing"
+        );
+        std::fs::write(
+            local.join("track.2026-07-21.jsonl"),
+            event(
+                "c",
+                "s",
+                "assistant_message",
+                "2026-07-21T00:05:00Z",
+                "keep me",
+            ),
+        ).unwrap();
+        assert_eq!(
+            push_events_with(
+                bucket.to_str().unwrap(),
+                root.join("local").to_str().unwrap(),
+                state.to_str().unwrap(),
+                Some(cutoff),
+            )
+            .unwrap(),
+            1,
+            "first eligible delta carries staged metadata"
+        );
+        let b = crate::bucket::LocalFs::new(&bucket);
+        let body = b
+            .list("events")
+            .unwrap()
+            .into_iter()
+            .flat_map(|k| b.get(&k).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("metadata") && body.contains("keep me"));
+        assert!(!body.contains("too old"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chunking_never_splits_an_event_line() {
+        let raw = b"aaaa\nbbbb\ncccc\n";
+        assert_eq!(
+            event_chunks(raw, 6),
+            vec![b"aaaa\n".to_vec(), b"bbbb\n".to_vec(), b"cccc\n".to_vec()]
+        );
+    }
 
     // The GitHub corpus travels through the bucket by manifest: a scraping
     // machine pushes changed files; a token-less machine pulls them (and drops

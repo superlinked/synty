@@ -40,6 +40,12 @@ Rust binary.
   steps.
 - The encoder loads the model from `$SYNTY_MODEL` (point it at a local dir for
   offline use; it otherwise downloads the default model on first run).
+- The watcher polls local logs every 30 seconds and publishes only new complete
+  lines as immutable event chunks every 60 seconds by default. `init
+  --capture-since` persists an absolute collection boundary;
+  `--upload-interval` changes only the network cadence. S3 workstations use an
+  explicit rotating `--aws-profile` (normally `credential_process`); AWS
+  workloads omit it and use their role chain.
 - Pipeline: `ingest` → `index` (encode docs + build) → `summarize` (one-line
   summary per unit) → `cluster [--resolution]` (group units by their summary
   embedding) → `summarize` again (reduce each topic from its members) /

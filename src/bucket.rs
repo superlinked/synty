@@ -17,8 +17,8 @@ pub trait Bucket: Send + Sync {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
     fn exists(&self, key: &str) -> Result<bool>;
-    /// Byte size of an object, or None if absent — a cheap change check for
-    /// append-only event files (no full download).
+    /// Byte size of an object, or None if absent — used for legacy mutable
+    /// event compatibility and other metadata-only checks.
     fn size(&self, key: &str) -> Result<Option<u64>>;
     /// All keys under `prefix` (recursive), relative to the bucket root.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;

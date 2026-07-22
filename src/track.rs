@@ -27,12 +27,14 @@ pub struct Opts {
     pub which: String,
     pub out: String,
     pub max_age_days: u64,
+    pub capture_since_ms: Option<i64>,
     pub machine: String,
     pub watch: bool,
     pub poll_secs: u64,
+    pub upload_interval_secs: u64,
     pub install: Option<String>,
     pub cursors: String,
-    /// If set, push drained event files to this bucket under events/ (the
+    /// If set, push drained event chunks to this bucket under events/ (the
     /// shared backplane for a fleet of trackers).
     pub bucket: Option<String>,
 }
@@ -48,13 +50,22 @@ pub fn run(o: Opts) -> Result<()> {
         let n = t.drain()?;
         t.flush_ends(unix_ms(SystemTime::now()), true)?;
         t.save_cursors()?;
-        let pushed = t.push()?;
+        let pushed = t.push(true)?;
         let mut m = crate::metrics::Run::new("track");
-        m.set("events", n).set("sessions", t.session_count()).set("lines_skipped", t.skipped_count());
+        m.set("events", n)
+            .set("sessions", t.session_count())
+            .set("lines_skipped", t.skipped_count());
         m.emit();
-        eprintln!("track: {n} events ({} sessions) → {}", t.session_count(), o.out);
+        eprintln!(
+            "track: {n} events ({} sessions) → {}",
+            t.session_count(),
+            o.out
+        );
         if pushed > 0 {
-            eprintln!("track: pushed {pushed} event files → {}/events/", t.bucket.as_deref().unwrap_or(""));
+            eprintln!(
+                "track: pushed {pushed} event chunks → {}/events/",
+                t.bucket.as_deref().unwrap_or("")
+            );
         }
         Ok(())
     }
@@ -91,6 +102,8 @@ struct Tracker {
     cursors: HashMap<String, i64>,
     out: String,
     bucket: Option<String>,
+    upload_interval: Duration,
+    last_push: Option<std::time::Instant>,
 }
 
 impl Tracker {
@@ -117,9 +130,9 @@ impl Tracker {
         let mut streams = Vec::new();
         for src in sources(&o.which)? {
             let name = format!("edge-{}-{}", machine, src.id());
-            // The stream is a DIR of per-day files (track.<YYYY-MM-DD>.jsonl);
-            // only the active day grows, so push_events re-uploads a day's events,
-            // not the whole append-only history (M9).
+            // The stream is a DIR of per-day files (track.<YYYY-MM-DD>.jsonl).
+            // Sync turns only the newly appended complete lines into immutable
+            // bucket chunks; the local daily file is never uploaded wholesale.
             let out = Path::new(&o.out).join(&name);
             std::fs::create_dir_all(&out)?;
             // Seed offsets from saved cursors so a restart resumes mid-file.
@@ -140,18 +153,42 @@ impl Tracker {
                 src,
             });
         }
-        let cutoff_ms = if o.max_age_days == 0 {
-            0
-        } else {
-            unix_ms(SystemTime::now()) - (o.max_age_days as i64) * 86_400_000
-        };
-        Ok(Self { streams, cutoff_ms, cursors_path, cursors, out: o.out.clone(), bucket: o.bucket.clone() })
+        let cutoff_ms = o.capture_since_ms.unwrap_or_else(|| {
+            if o.max_age_days == 0 {
+                0
+            } else {
+                unix_ms(SystemTime::now()) - (o.max_age_days as i64) * 86_400_000
+            }
+        });
+        Ok(Self {
+            streams,
+            cutoff_ms,
+            cursors_path,
+            cursors,
+            out: o.out.clone(),
+            bucket: o.bucket.clone(),
+            upload_interval: Duration::from_secs(o.upload_interval_secs.max(1)),
+            last_push: None,
+        })
     }
 
-    /// Push drained event files to the shared bucket, if configured.
-    fn push(&self) -> Result<usize> {
+    /// Push drained event chunks to the shared bucket, if configured.
+    fn push(&mut self, force: bool) -> Result<usize> {
+        if !force
+            && self
+                .last_push
+                .is_some_and(|t| t.elapsed() < self.upload_interval)
+        {
+            return Ok(0);
+        }
+        self.last_push = Some(std::time::Instant::now());
         match &self.bucket {
-            Some(b) => crate::sync::push_events(b, &self.out),
+            Some(b) => crate::sync::push_events_with(
+                b,
+                &self.out,
+                ".synty/uploads.json",
+                (self.cutoff_ms > 0).then_some(self.cutoff_ms),
+            ),
             None => Ok(0),
         }
     }
@@ -183,13 +220,15 @@ impl Tracker {
             let now = unix_ms(SystemTime::now());
             let ended = self.flush_ends(now, false)?;
             self.save_cursors()?;
-            let pushed = self.push()?;
+            let pushed = self.push(false)?;
             if n > 0 || ended > 0 || pushed > 0 {
                 let skipped = self.skipped_count();
                 if skipped > 0 {
-                    eprintln!("track: +{n} events, {ended} ended, {pushed} files pushed, {skipped} malformed lines skipped (total)");
+                    eprintln!(
+                        "track: +{n} events, {ended} ended, {pushed} chunks pushed, {skipped} malformed lines skipped (total)"
+                    );
                 } else {
-                    eprintln!("track: +{n} events, {ended} ended, {pushed} files pushed");
+                    eprintln!("track: +{n} events, {ended} ended, {pushed} chunks pushed");
                 }
             }
             if let Some(bucket) = self.bucket.clone() {
@@ -258,17 +297,29 @@ impl Stream {
                 continue;
             }
             let slice = &content[fs.offset as usize..];
-            let Some(last_nl) = slice.iter().rposition(|&b| b == b'\n') else { continue };
+            let Some(last_nl) = slice.iter().rposition(|&b| b == b'\n') else {
+                continue;
+            };
             let complete = &slice[..=last_nl];
             let fallback_ms = file_mtime_ms(&path);
 
             let path_str = path.to_string_lossy();
-            let before = self.started.len();
-            let mut ec = EmitCtx::new(self.name.clone(), &*self.src, &mut self.seq, &mut self.started);
-            let (mut evts, consumed, skipped) = drive(&mut *fs.parser, complete, &path_str, fs.offset, fallback_ms, &mut ec);
+            let mut ec = EmitCtx::new(
+                self.name.clone(),
+                &*self.src,
+                &mut self.seq,
+                &mut self.started,
+            );
+            let (mut evts, consumed, skipped) = drive(
+                &mut *fs.parser,
+                complete,
+                &path_str,
+                fs.offset,
+                fallback_ms,
+                &mut ec,
+            );
             drop(ec);
             fs.offset += consumed;
-            self.n_sessions += self.started.len() - before;
             self.n_skipped += skipped;
 
             for e in &mut evts {
@@ -280,9 +331,23 @@ impl Stream {
                     e.payload["tracker_version"] = json!(env!("CARGO_PKG_VERSION"));
                 }
             }
+            if cutoff_ms > 0 {
+                evts.retain(|e| {
+                    event_time_ms(e).is_none_or(|t| t >= cutoff_ms)
+                        // Stage session metadata locally so the upload ledger
+                        // can attach it if this session later crosses the
+                        // boundary. The upload gate never publishes it alone.
+                        || e.kind == kind::SESSION_START
+                });
+            }
+            self.n_sessions += evts
+                .iter()
+                .filter(|e| e.kind == kind::SESSION_START)
+                .count();
             for e in &evts {
                 if !e.session_id.is_empty() && e.kind != kind::SESSION_END {
-                    self.open.insert(e.session_id.clone(), (fallback_ms, e.ts.clone()));
+                    self.open
+                        .insert(e.session_id.clone(), (fallback_ms, e.ts.clone()));
                 }
             }
             events.extend(evts);
@@ -333,11 +398,17 @@ impl Stream {
         if events.is_empty() {
             return Ok(());
         }
-        // Per-day file in the stream dir — the active day's file is the only one
-        // that grows (and re-uploads); prior days are final and sync once.
+        // Per-day local file in the stream dir. Sync reads only appended bytes
+        // and publishes them as immutable chunks on its own cadence.
         std::fs::create_dir_all(&self.out)?;
-        let path = self.out.join(format!("track.{}.jsonl", day_stamp(unix_ms(SystemTime::now()))));
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let path = self.out.join(format!(
+            "track.{}.jsonl",
+            day_stamp(unix_ms(SystemTime::now()))
+        ));
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         let mut body = String::new();
         for e in events {
             body.push_str(&serde_json::to_string(e).map_err(|e| anyhow!("encode: {e}"))?);
@@ -346,6 +417,12 @@ impl Stream {
         f.write_all(body.as_bytes())?;
         Ok(())
     }
+}
+
+fn event_time_ms(e: &Event) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(&e.ts)
+        .ok()
+        .map(|t| t.timestamp_millis())
 }
 
 /// The started-session-ids file, a sibling of the cursors file.
@@ -397,22 +474,32 @@ fn discover(roots: &[String], cutoff_ms: i64) -> Vec<PathBuf> {
 }
 
 fn file_mtime_ms(p: &Path) -> i64 {
-    std::fs::metadata(p).and_then(|m| m.modified()).map(unix_ms).unwrap_or(0)
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .map(unix_ms)
+        .unwrap_or(0)
 }
 
 fn unix_ms(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-/// Whether a login-time autostart unit has been installed (launchd or systemd).
+const SERVICE_LABEL: &str = "com.superlinked.synty";
+
+/// Whether the login-time tracker is both installed and actually loaded. A
+/// leftover plist/service file is not enough: status must not claim tracking
+/// is active when the service manager has no such job.
 pub fn autostart_enabled() -> bool {
-    let home = std::env::var("HOME").unwrap_or_default();
-    [
-        format!("{home}/Library/LaunchAgents/com.superlinked.synty.plist"),
-        format!("{home}/.config/systemd/user/synty.service"),
-    ]
-    .iter()
-    .any(|p| Path::new(p).exists())
+    let Some((path, kind)) = autostart_unit() else {
+        return false;
+    };
+    autostart_ready(Path::new(&path).exists(), service_loaded(kind))
+}
+
+fn autostart_ready(unit_exists: bool, service_loaded: bool) -> bool {
+    unit_exists && service_loaded
 }
 
 /// The login-time autostart unit path + kind for this platform, if supported.
@@ -427,15 +514,16 @@ pub fn autostart_unit() -> Option<(String, &'static str)> {
     }
 }
 
-/// Turn login-time autostart on or off, then best-effort (un)load it so the
-/// change takes effect now. Quiet (no stdout/stderr) — safe to call from the TUI.
+/// Turn login-time autostart on or off and verify the service manager accepted
+/// it. A failed bootstrap is an error, not a green status badge.
 pub fn autostart_set(on: bool) -> Result<()> {
-    let (path, kind) = autostart_unit().ok_or_else(|| anyhow!("autostart unsupported on this platform"))?;
+    let (path, kind) =
+        autostart_unit().ok_or_else(|| anyhow!("autostart unsupported on this platform"))?;
     if on {
         write_unit(kind, &path, "corpus/local", "local")?;
-        loader(kind, &path, true);
+        loader(kind, &path, true)?;
     } else {
-        loader(kind, &path, false);
+        loader(kind, &path, false)?;
         let _ = std::fs::remove_file(&path);
     }
     Ok(())
@@ -443,14 +531,16 @@ pub fn autostart_set(on: bool) -> Result<()> {
 
 /// Restart the login-time tracker so a freshly installed binary takes over
 /// (called by `synty upgrade`). Ok(false) when no unit is installed — nothing
-/// to restart. Best-effort like `loader`: it reports "tried", not "succeeded".
+/// to restart.
 pub fn restart() -> Result<bool> {
-    let Some((path, kind)) = autostart_unit() else { return Ok(false) };
+    let Some((path, kind)) = autostart_unit() else {
+        return Ok(false);
+    };
     if !Path::new(&path).exists() {
         return Ok(false);
     }
-    loader(kind, &path, false);
-    loader(kind, &path, true);
+    loader(kind, &path, false)?;
+    loader(kind, &path, true)?;
     Ok(true)
 }
 
@@ -468,26 +558,113 @@ fn unit_workdir() -> Result<String> {
     Ok(d.display().to_string())
 }
 
-/// (un)load the unit via launchctl / systemctl, swallowing all output and errors.
-fn loader(kind: &str, path: &str, on: bool) {
-    let run = |cmd: &str, args: &[&str]| {
-        let _ = std::process::Command::new(cmd)
-            .args(args)
+fn launch_domain() -> String {
+    #[cfg(unix)]
+    unsafe {
+        format!("gui/{}", libc::geteuid())
+    }
+    #[cfg(not(unix))]
+    String::new()
+}
+
+fn service_loaded(kind: &str) -> bool {
+    match kind {
+        "launchd" => std::process::Command::new("launchctl")
+            .args(["print", &format!("{}/{}", launch_domain(), SERVICE_LABEL)])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| launchd_report_running(o.status.success(), &o.stdout)),
+        "systemd" => {
+            std::process::Command::new("systemctl")
+                .args(["--user", "is-enabled", "--quiet", "synty.service"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+                && std::process::Command::new("systemctl")
+                    .args(["--user", "is-active", "--quiet", "synty.service"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+        }
+        _ => false,
+    }
+}
+
+fn service_registered(kind: &str) -> bool {
+    kind == "launchd"
+        && std::process::Command::new("launchctl")
+            .args(["print", &format!("{}/{}", launch_domain(), SERVICE_LABEL)])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
-    };
-    match (kind, on) {
-        ("launchd", true) => run("launchctl", &["load", "-w", path]),
-        ("launchd", false) => run("launchctl", &["unload", "-w", path]),
-        ("systemd", true) => {
-            run("systemctl", &["--user", "daemon-reload"]);
-            run("systemctl", &["--user", "enable", "--now", "synty.service"]);
-        }
-        ("systemd", false) => run("systemctl", &["--user", "disable", "--now", "synty.service"]),
-        _ => {}
+            .status()
+            .is_ok_and(|s| s.success())
+}
+
+fn launchd_report_running(success: bool, stdout: &[u8]) -> bool {
+    success
+        && String::from_utf8_lossy(stdout)
+            .lines()
+            .any(|line| line.trim() == "state = running")
+}
+
+fn run_service(cmd: &str, args: &[&str]) -> Result<()> {
+    let out = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| anyhow!("run {cmd}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(anyhow!("{cmd} {} failed: {why}", args.join(" ")))
     }
+}
+
+/// (Un)load the unit via the service manager, then verify activation.
+fn loader(kind: &str, path: &str, on: bool) -> Result<()> {
+    match (kind, on) {
+        ("launchd", true) => {
+            let domain = launch_domain();
+            let target = format!("{domain}/{SERVICE_LABEL}");
+            if service_registered(kind) {
+                let _ = run_service("launchctl", &["bootout", &target]);
+            }
+            run_service("launchctl", &["bootstrap", &domain, path])?;
+            run_service("launchctl", &["kickstart", "-k", &target])?;
+        }
+        ("launchd", false) => {
+            if service_registered(kind) {
+                run_service(
+                    "launchctl",
+                    &["bootout", &format!("{}/{}", launch_domain(), SERVICE_LABEL)],
+                )?;
+            }
+        }
+        ("systemd", true) => {
+            run_service("systemctl", &["--user", "daemon-reload"])?;
+            run_service("systemctl", &["--user", "enable", "--now", "synty.service"])?;
+        }
+        ("systemd", false) => {
+            // `is-active` can be false while an enabled failed service still
+            // has a login symlink. Always disable before removing the unit.
+            run_service(
+                "systemctl",
+                &["--user", "disable", "--now", "synty.service"],
+            )?;
+        }
+        _ => bail!("unknown service manager: {kind}"),
+    }
+    if on && !service_loaded(kind) {
+        bail!("{kind} accepted the unit but {SERVICE_LABEL} is not loaded");
+    }
+    Ok(())
 }
 
 /// UTC day (YYYY-MM-DD) for the per-day output file. Pure (takes the timestamp)
@@ -511,28 +688,56 @@ fn github_due(elapsed_since_last: Option<Duration>, every: Duration) -> bool {
 fn write_unit(kind: &str, path: &str, out: &str, machine: &str) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
     let cwd = unit_workdir()?;
-    let mut args = format!("track --watch --out {out} --machine {machine}");
+    let mut args = vec![
+        "track".to_string(),
+        "--watch".to_string(),
+        "--out".to_string(),
+        out.to_string(),
+        "--machine".to_string(),
+        machine.to_string(),
+    ];
     if let Some(b) = crate::config::resolve_bucket_opt(None) {
-        args.push_str(&format!(" --bucket {b}"));
+        args.push("--bucket".to_string());
+        args.push(b);
     }
+    let log_dir = Path::new(&cwd).join(".synty");
+    std::fs::create_dir_all(&log_dir)?;
+    let log = log_dir.join("track.log").display().to_string();
     let body = match kind {
         "launchd" => format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.superlinked.synty</string>
+  <key>Label</key><string>{SERVICE_LABEL}</string>
   <key>ProgramArguments</key><array>
-    <string>{exe}</string>{}
+    <string>{}</string>{}
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>WorkingDirectory</key><string>{cwd}</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>WorkingDirectory</key><string>{}</string>
+  <key>StandardOutPath</key><string>{}</string>
+  <key>StandardErrorPath</key><string>{}</string>
 </dict></plist>
 "#,
-            args.split_whitespace().map(|a| format!("\n    <string>{a}</string>")).collect::<String>(),
+            xml(&exe),
+            args.iter()
+                .map(|a| format!("\n    <string>{}</string>", xml(a)))
+                .collect::<String>(),
+            xml(&cwd),
+            xml(&log),
+            xml(&log),
         ),
         "systemd" => format!(
-            "[Unit]\nDescription=synty native tracker\n\n[Service]\nExecStart={exe} {args}\nWorkingDirectory={cwd}\nRestart=always\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=synty native tracker\n\n[Service]\nExecStart={} {}\nWorkingDirectory={}\nRestart=always\nRestartSec=5\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+            systemd_arg(&exe),
+            args.iter()
+                .map(|a| systemd_arg(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+            systemd_arg(&cwd),
+            systemd_arg(&log),
+            systemd_arg(&log),
         ),
         _ => bail!("install kind must be launchd or systemd"),
     };
@@ -541,6 +746,24 @@ fn write_unit(kind: &str, path: &str, out: &str, machine: &str) -> Result<()> {
     }
     std::fs::write(path, body)?;
     Ok(())
+}
+
+fn xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Quote one systemd unit argument. `%` must be doubled because systemd
+/// expands specifiers even inside quotes.
+fn systemd_arg(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
 }
 
 /// CLI `track --install <kind>`: write the unit and print the manual load command.
@@ -553,7 +776,10 @@ fn install(kind: &str, o: &Opts) -> Result<()> {
     };
     write_unit(kind, &path, &o.out, &o.machine)?;
     match kind {
-        "launchd" => println!("wrote {path}\nload with:  launchctl load -w {path}"),
+        "launchd" => println!(
+            "wrote {path}\nload with:  launchctl bootstrap {} {path}",
+            launch_domain()
+        ),
         _ => println!("wrote {path}\nenable with:  systemctl --user enable --now synty.service"),
     }
     let _ = ms_to_rfc3339; // reserved for future status output
@@ -564,6 +790,32 @@ fn install(kind: &str, o: &Opts) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn autostart_requires_both_unit_and_loaded_service() {
+        assert!(autostart_ready(true, true));
+        assert!(
+            !autostart_ready(true, false),
+            "orphan plist is not active tracking"
+        );
+        assert!(
+            !autostart_ready(false, true),
+            "loaded stale job needs the managed unit"
+        );
+    }
+
+    #[test]
+    fn launchd_job_must_be_running_not_merely_registered() {
+        assert!(launchd_report_running(
+            true,
+            b"service = {\n\tstate = running\n\tpid = 42\n}"
+        ));
+        assert!(!launchd_report_running(
+            true,
+            b"service = {\n\tstate = waiting\n}"
+        ));
+        assert!(!launchd_report_running(false, b"state = running"));
+    }
+
     // The tracker scrapes GitHub on a slow sub-cadence: immediately on first
     // pass, then only once the interval has elapsed (so the 30s session poll
     // doesn't hammer the API or re-pull the corpus every tick).
@@ -571,16 +823,63 @@ mod tests {
     fn github_cadence_fires_first_then_after_interval() {
         let every = Duration::from_secs(3600);
         assert!(github_due(None, every), "never-run → fire now");
-        assert!(!github_due(Some(Duration::from_secs(30)), every), "30s in → not yet");
-        assert!(github_due(Some(Duration::from_secs(3601)), every), "past the interval → fire");
+        assert!(
+            !github_due(Some(Duration::from_secs(30)), every),
+            "30s in → not yet"
+        );
+        assert!(
+            github_due(Some(Duration::from_secs(3601)), every),
+            "past the interval → fire"
+        );
     }
 
-    // The per-day output filename is the UTC date of the event-write time, so
-    // events bucket into track.<day>.jsonl and only today's file re-uploads.
+    // The per-day output filename is the UTC date of the event-write time;
+    // bucket sync subsequently chunks only newly appended complete lines.
     #[test]
     fn day_stamp_is_the_utc_date() {
         assert_eq!(day_stamp(0), "1970-01-01");
         assert_eq!(day_stamp(1_749_859_200_000), "2025-06-14"); // a fixed 2025-06-14 UTC ms
+    }
+
+    #[test]
+    fn service_unit_arguments_escape_manager_syntax() {
+        assert_eq!(xml("a&<b>\""), "a&amp;&lt;b&gt;&quot;");
+        assert_eq!(systemd_arg("/tmp/a b/%n\\x\""), "\"/tmp/a b/%%n\\\\x\\\"\"");
+    }
+
+    #[test]
+    fn capture_boundary_stages_start_and_keeps_only_new_work() {
+        let dir = std::env::temp_dir().join(format!("synty-track-since-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = r#"{"type":"user","sessionId":"S1","version":"2.1.30","timestamp":"2026-07-20T23:55:00Z","message":{"content":"old prompt"}}"#;
+        let new = r#"{"type":"user","sessionId":"S1","version":"2.1.30","timestamp":"2026-07-21T00:05:00Z","message":{"content":"new prompt"}}"#;
+        std::fs::write(root.join("s.jsonl"), format!("{old}\n{new}\n")).unwrap();
+        let mut st = Stream {
+            src: Box::new(ClaudeCode),
+            roots: vec![root.to_string_lossy().into_owned()],
+            name: "edge-t-claudecode".into(),
+            out: dir.join("out"),
+            seq: Sequencer::new(),
+            started: HashSet::new(),
+            files: HashMap::new(),
+            open: HashMap::new(),
+            n_sessions: 0,
+            n_skipped: 0,
+            actor: "tester".into(),
+        };
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        st.drain(cutoff, &HashMap::new()).unwrap();
+        let body = read_stream(&dir.join("out"));
+        assert!(
+            body.contains("session_start") && body.contains("new prompt"),
+            "{body}"
+        );
+        assert!(!body.contains("old prompt"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Concatenate a stream dir's per-day files — the tracker now writes
@@ -762,8 +1061,26 @@ mod tests {
         };
         track_one("mA", &root.join("mA/sessions"), &root.join("mA/local"));
         track_one("mB", &root.join("mB/sessions"), &root.join("mB/local"));
-        assert!(crate::sync::push_events(bu, root.join("mA/local").to_str().unwrap()).unwrap() > 0);
-        assert!(crate::sync::push_events(bu, root.join("mB/local").to_str().unwrap()).unwrap() > 0);
+        assert!(
+            crate::sync::push_events_with(
+                bu,
+                root.join("mA/local").to_str().unwrap(),
+                root.join("mA/uploads.json").to_str().unwrap(),
+                None,
+            )
+            .unwrap()
+                > 0
+        );
+        assert!(
+            crate::sync::push_events_with(
+                bu,
+                root.join("mB/local").to_str().unwrap(),
+                root.join("mB/uploads.json").to_str().unwrap(),
+                None,
+            )
+            .unwrap()
+                > 0
+        );
 
         // A third machine builds: ingest pulls every device's events from the
         // bucket and turns them into docs — so the build sees both teammates.

@@ -1,7 +1,7 @@
-// synty — passive cross-agent + GitHub work memory. Local-first, nothing leaves
-// the machine: pylate-rs (ColBERT) encodes, next-plaid (PLAID) indexes, and a
+// synty — passive cross-agent + GitHub work memory. Local-first: pylate-rs
+// (ColBERT) encodes, next-plaid (PLAID) indexes, and a
 // small local model (Qwen) writes the one-line summaries; search prints Markdown
-// to stdout for coding agents.
+// to stdout for coding agents. Team mode explicitly syncs through a bucket.
 //
 // Subcommands span the pipeline, the tracker and GitHub backfill, and the read
 // surfaces (CLI + TUI + MCP).
@@ -265,6 +265,17 @@ enum Cmd {
     Init {
         /// Team bucket (s3://… / gs://… / path). Omit for a local-only trial.
         bucket: Option<String>,
+        /// AWS shared-config profile for S3. Prefer a rotating
+        /// credential_process profile such as IAM Roles Anywhere.
+        #[arg(long)]
+        aws_profile: Option<String>,
+        /// Do not collect or upload events before this boundary: `now`,
+        /// YYYY-MM-DD, or RFC3339.
+        #[arg(long)]
+        capture_since: Option<String>,
+        /// Seconds between batched event uploads.
+        #[arg(long)]
+        upload_interval: Option<u64>,
         /// Machine id used in this machine's stream names
         #[arg(long, default_value = "local")]
         machine: String,
@@ -328,6 +339,10 @@ enum Cmd {
         /// Skip files whose mtime is older than this many days (0 = unbounded)
         #[arg(long, default_value_t = 90)]
         max_age_days: u64,
+        /// Absolute collection boundary: `now`, YYYY-MM-DD, or RFC3339. Takes
+        /// precedence over --max-age-days and the persisted init setting.
+        #[arg(long)]
+        since: Option<String>,
         /// Machine id used in the stream name
         #[arg(long, default_value = "local")]
         machine: String,
@@ -337,6 +352,9 @@ enum Cmd {
         /// Poll interval in seconds for --watch
         #[arg(long, default_value_t = 30)]
         poll: u64,
+        /// Seconds between batched bucket uploads (default: config, then 60)
+        #[arg(long)]
+        upload_interval: Option<u64>,
         /// Write an autostart unit and exit: launchd | systemd
         #[arg(long)]
         install: Option<String>,
@@ -529,6 +547,15 @@ fn resolve_home() {
     }
 }
 
+/// Read commands without their own bucket flag use the configured fleet
+/// bucket. Pulling here makes every CLI surface (not only semantic search) see
+/// all machines and detect unpublished event deltas before rendering.
+fn pull_configured_for_read() {
+    if let Some(bucket) = config::resolve_bucket_opt(None) {
+        sync::pull_for_read(&bucket);
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     resolve_home();
@@ -548,6 +575,7 @@ fn main() -> Result<()> {
             topics::run(resolution, &model_id(), &config::resolve_bucket(bucket))?
         }
         Cmd::Topic { query, json } => {
+            pull_configured_for_read();
             let mut topics = units::topic_units(12)?;
             if let Some(q) = query {
                 let ql = q.to_lowercase();
@@ -563,6 +591,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Recent { repo, limit, json } => {
+            pull_configured_for_read();
             let mut us = units::units()?;
             if let Some(r) = repo {
                 us.retain(|u| u.repo == r);
@@ -575,6 +604,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Status { json } => {
+            pull_configured_for_read();
             let s = view::status()?;
             if json {
                 println!("{}", view::status_json(&s));
@@ -583,6 +613,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Stats { weeks, json } => {
+            pull_configured_for_read();
             let s = view::stats(weeks)?;
             if json {
                 println!("{}", view::stats_json(&s));
@@ -591,6 +622,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Tool { name, json } => {
+            pull_configured_for_read();
             if json {
                 let p = units::tool_profile(&name);
                 if p.calls == 0 {
@@ -603,34 +635,97 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Show { id, json } => {
+            pull_configured_for_read();
             if json {
                 println!("{}", view::show_json_report(&id)?);
             } else {
                 print!("{}", view::show_report(&id)?);
             }
         }
-        Cmd::Trace { command } => match command {
-            TraceCmd::List {
-                entity, repo, machine, source, status, operation, has_errors,
-                since, min_ms, sort, limit, json,
-            } => trace::list(
-                entity.as_str(), repo.as_deref(), machine.as_deref(), source.as_deref(),
-                status.as_deref(), operation.as_deref(), has_errors, since.as_deref(),
-                min_ms, sort.as_str(), limit, json,
-            )?,
-            TraceCmd::Show { id, before, after, json } => {
-                trace::show(&id, before, after, json)?
+        Cmd::Trace { command } => {
+            pull_configured_for_read();
+            match command {
+                TraceCmd::List {
+                    entity,
+                    repo,
+                    machine,
+                    source,
+                    status,
+                    operation,
+                    has_errors,
+                    since,
+                    min_ms,
+                    sort,
+                    limit,
+                    json,
+                } => trace::list(
+                    entity.as_str(),
+                    repo.as_deref(),
+                    machine.as_deref(),
+                    source.as_deref(),
+                    status.as_deref(),
+                    operation.as_deref(),
+                    has_errors,
+                    since.as_deref(),
+                    min_ms,
+                    sort.as_str(),
+                    limit,
+                    json,
+                )?,
+                TraceCmd::Show {
+                    id,
+                    before,
+                    after,
+                    json,
+                } => trace::show(&id, before, after, json)?,
+                TraceCmd::Search {
+                    query,
+                    repo,
+                    machine,
+                    source,
+                    kind,
+                    limit,
+                    json,
+                } => trace::search(
+                    &query,
+                    repo.as_deref(),
+                    machine.as_deref(),
+                    source.as_deref(),
+                    kind.as_deref(),
+                    limit,
+                    json,
+                )?,
+                TraceCmd::Compare { left, right, json } => trace::compare(&left, &right, json)?,
             }
-            TraceCmd::Search { query, repo, machine, source, kind, limit, json } => trace::search(
-                &query, repo.as_deref(), machine.as_deref(), source.as_deref(),
-                kind.as_deref(), limit, json,
-            )?,
-            TraceCmd::Compare { left, right, json } => trace::compare(&left, &right, json)?,
-        },
-        Cmd::Init { bucket, machine, no_build } => init::run(bucket, &machine, no_build)?,
+        }
+        Cmd::Init {
+            bucket,
+            aws_profile,
+            capture_since,
+            upload_interval,
+            machine,
+            no_build,
+        } => init::run(
+            bucket,
+            aws_profile,
+            capture_since,
+            upload_interval,
+            &machine,
+            no_build,
+        )?,
         Cmd::Tui { bucket } => tui::run(model_id(), config::resolve_bucket(bucket))?,
-        Cmd::Mcp => mcp::run(model_id())?,
-        Cmd::Summarize { sessions, topics, bucket, cached, dump, sample } => {
+        Cmd::Mcp => {
+            pull_configured_for_read();
+            mcp::run(model_id())?
+        }
+        Cmd::Summarize {
+            sessions,
+            topics,
+            bucket,
+            cached,
+            dump,
+            sample,
+        } => {
             let bucket = config::resolve_bucket(bucket);
             let _ = (cached, sample, &bucket);
             if dump {
@@ -659,29 +754,69 @@ fn main() -> Result<()> {
                 eval::run(&model_id())?;
             }
         }
-        Cmd::Track { source, out, max_age_days, machine, watch, poll, install, cursors, bucket } => {
+        Cmd::Track {
+            source,
+            out,
+            max_age_days,
+            since,
+            machine,
+            watch,
+            poll,
+            upload_interval,
+            install,
+            cursors,
+            bucket,
+        } => {
+            let capture_since_ms = match since {
+                Some(raw) => Some(
+                    chrono::DateTime::parse_from_rfc3339(&config::normalize_capture_since(&raw)?)?
+                        .timestamp_millis(),
+                ),
+                None => config::capture_since_ms(),
+            };
             track::run(track::Opts {
                 which: source,
                 out,
                 max_age_days,
+                capture_since_ms,
                 machine,
                 watch,
                 poll_secs: poll,
+                upload_interval_secs: upload_interval
+                    .unwrap_or_else(config::upload_interval_secs)
+                    .max(1),
                 install,
                 cursors,
                 bucket: config::resolve_bucket_opt(bucket),
             })?
         }
-        Cmd::Build { bucket, machine, resolution, no_track } => {
-            up::build(&config::resolve_bucket(bucket), &machine, resolution, no_track)?
-        }
-        Cmd::Up { bucket, machine, poll, no_github } => {
-            up::run(&config::resolve_bucket(bucket), &machine, poll, !no_github)?
-        }
-        Cmd::Github { owner, repos, since_days, out, bucket } => {
-            let owner = owner
-                .or_else(|| config::load().org)
-                .ok_or_else(|| anyhow::anyhow!("no GitHub org: run `synty init` or pass --owner"))?;
+        Cmd::Build {
+            bucket,
+            machine,
+            resolution,
+            no_track,
+        } => up::build(
+            &config::resolve_bucket(bucket),
+            &machine,
+            resolution,
+            no_track,
+        )?,
+        Cmd::Up {
+            bucket,
+            machine,
+            poll,
+            no_github,
+        } => up::run(&config::resolve_bucket(bucket), &machine, poll, !no_github)?,
+        Cmd::Github {
+            owner,
+            repos,
+            since_days,
+            out,
+            bucket,
+        } => {
+            let owner = owner.or_else(|| config::load().org).ok_or_else(|| {
+                anyhow::anyhow!("no GitHub org: run `synty init` or pass --owner")
+            })?;
             github::run(&owner, repos, since_days, &out)?;
             let n = sync::push_github(&config::resolve_bucket(bucket), &out)?;
             if n > 0 {
@@ -708,6 +843,45 @@ mod tests {
         // The earlier names no longer exist — one onboarding path, no confusion.
         assert!(Cli::try_parse_from(["synty", "setup"]).is_err());
         assert!(Cli::try_parse_from(["synty", "join"]).is_err());
+    }
+
+    #[test]
+    fn init_parses_durable_bucket_settings() {
+        let cli = Cli::try_parse_from([
+            "synty",
+            "init",
+            "s3://team",
+            "--aws-profile",
+            "synty-writer",
+            "--capture-since",
+            "2026-07-21",
+            "--upload-interval",
+            "120",
+        ])
+        .expect("durable init settings parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Init {
+                aws_profile: Some(p), capture_since: Some(s), upload_interval: Some(120), ..
+            } if p == "synty-writer" && s == "2026-07-21"
+        ));
+    }
+
+    #[test]
+    fn track_parses_capture_and_batch_overrides() {
+        let cli = Cli::try_parse_from([
+            "synty",
+            "track",
+            "--since",
+            "now",
+            "--upload-interval",
+            "180",
+        ])
+        .expect("tracker overrides parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Track { since: Some(s), upload_interval: Some(180), .. } if s == "now"
+        ));
     }
 
     // `upgrade` is argument-free: it self-updates from the latest GitHub Release.

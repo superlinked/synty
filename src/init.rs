@@ -9,16 +9,32 @@
 // This is the single onboarding path: one command, not the old interactive
 // `setup` plus something else.
 
-use crate::{config, github, identity, track, up};
-use anyhow::Result;
+use crate::{bucket, config, github, identity, track, up};
+use anyhow::{Context, Result};
 
-pub fn run(bucket: Option<String>, machine: &str, no_build: bool) -> Result<()> {
+pub fn run(
+    bucket: Option<String>,
+    aws_profile: Option<String>,
+    capture_since: Option<String>,
+    upload_interval: Option<u64>,
+    machine: &str,
+    no_build: bool,
+) -> Result<()> {
     let mut cfg = config::load();
 
     // 1. Bucket: setting it is the local→bucket switch; absent → stay local
     //    (resolve_bucket falls back to the local .synty store).
     if let Some(b) = &bucket {
         cfg.bucket = Some(b.clone());
+    }
+    if let Some(profile) = aws_profile {
+        cfg.aws_profile = Some(profile);
+    }
+    if let Some(raw) = capture_since {
+        cfg.capture_since = Some(config::normalize_capture_since(&raw)?);
+    }
+    if let Some(secs) = upload_interval {
+        cfg.upload_interval_secs = Some(secs.max(1));
     }
 
     // 2. GitHub identity — best-effort, no prompts. With a token, pin the login
@@ -28,7 +44,7 @@ pub fn run(bucket: Option<String>, machine: &str, no_build: bool) -> Result<()> 
     //    identity (see identity::actor).
     match github::accounts() {
         Ok(accounts) if !accounts.is_empty() => {
-            identity::cache_github_login(&accounts[0]);
+            cfg.github_login = Some(accounts[0].clone());
             if cfg.org.is_none() {
                 cfg.org = Some(accounts[0].clone());
             }
@@ -40,17 +56,27 @@ pub fn run(bucket: Option<String>, machine: &str, no_build: bool) -> Result<()> 
     }
     config::save(&cfg)?;
 
-    // 3. Track at login.
-    match track::autostart_set(true) {
-        Ok(()) => eprintln!("init: login-time tracker enabled"),
-        Err(e) => eprintln!("init: autostart unavailable ({e}) — run `synty up` to track in the foreground"),
+    // Fail before installing a watcher when this binary lacks the cloud
+    // backend, the durable provider cannot mint credentials, or the role
+    // cannot list/read/write the bucket. The config stays saved so the error is fixable
+    // in place by re-running init.
+    if let Some(b) = &cfg.bucket {
+        verify_bucket_access(b, machine).with_context(|| format!("verify team bucket {b}"))?;
+        eprintln!("init: verified read/write access to {b}");
     }
 
-    // 4. First build: track → ingest → index → summarize → cluster, so the
-    //    viewer has something to show immediately.
+    // 3. First build: its one-shot tracker drains and uploads before the
+    //    long-lived watcher exists, so two processes never race the cursor or
+    //    upload ledgers during initialization.
     if !no_build {
         up::build(&config::resolve_bucket(bucket), machine, 1.0, false)?;
     }
+
+    // 4. Track at login after the initial one-shot has completed.
+    track::autostart_set(true).context(
+        "enable login-time tracker (configuration was saved, but initialization is not complete)",
+    )?;
+    eprintln!("init: login-time tracker enabled");
 
     // 5. Tell the user where they stand on the local→bucket ramp.
     match &cfg.bucket {
@@ -60,4 +86,41 @@ pub fn run(bucket: Option<String>, machine: &str, no_build: bool) -> Result<()> 
         ),
     }
     Ok(())
+}
+
+/// Exercise the operations a fleet member needs before declaring activation:
+/// recursive event listing, conditional immutable writes, and reads. The
+/// machine-scoped marker is useful bucket metadata and never contains session
+/// content or overwrites another member's object.
+fn verify_bucket_access(bucket_uri: &str, machine: &str) -> Result<()> {
+    let store = bucket::open(bucket_uri)?;
+    store.list("events")?;
+    let machine = identity::resolve_machine(machine);
+    let key = format!("members/{machine}/activation.json");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "machine": machine,
+        "actor": identity::actor(),
+        "synty_version": env!("CARGO_PKG_VERSION"),
+    }))?;
+    store.put_if_absent(&key, &body)?;
+    store
+        .get(&key)?
+        .with_context(|| format!("activation marker {key} was not readable"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_activation_markers_are_machine_scoped() {
+        let root = std::env::temp_dir().join(format!("synty-init-access-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        verify_bucket_access(root.to_str().unwrap(), "dev-a").unwrap();
+        verify_bucket_access(root.to_str().unwrap(), "dev-b").unwrap();
+        assert!(root.join("members/dev-a/activation.json").is_file());
+        assert!(root.join("members/dev-b/activation.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

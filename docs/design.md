@@ -8,7 +8,8 @@ the result searchable and readable by both humans and agents. The pivot from v1
 (`superlinked/synty-legacy`) is to a **single self-contained Rust binary** built
 on **late-interaction retrieval, with generation only for local summaries and
 topic names**.
-Nothing leaves the machine, no API keys, runs offline.
+Retrieval and generation run locally and require no remote model API. Solo mode
+runs offline; team mode explicitly moves data through the configured bucket.
 
 This document owns the architecture and the target end-state, and marks what is
 already built. `evals/` holds the eval suite that validates the kernel on real
@@ -18,13 +19,14 @@ data.
 
 ## Principles
 
-- **Nothing leaves the machine.** The core (retrieval via ColBERT
+- **Local computation.** The core (retrieval via ColBERT
   late-interaction, clustering, and keyphrases) is deterministic and
   embedding-only, never an LLM. Session summaries and topic names are the
   exception: a small local model (Qwen3-0.6B on candle, the `llm` feature)
   generates them offline.
-  No data leaves the machine either way; that is the actual feature, and a local
-  model preserves it.
+  No prompt or summary is sent to a model service. A configured team bucket is
+  the one deliberate data boundary: members with bucket access can read its raw
+  sessions.
 - **Local-first, self-contained.** One static binary. The model downloads once
   and runs offline thereafter. No server, no Python, no Docker required to get
   value.
@@ -74,7 +76,12 @@ the bucket; `docs.jsonl` + the index are derived.
 
 `synty track` is the source of truth for sessions: a `Source` per tool detects
 the file format version and builds a parser; a shared driver mints canonical
-envelopes with deterministic event_ids (so a re-parse never duplicates). The
+envelopes with deterministic event_ids (so a re-parse never duplicates). It
+polls source logs every 30 seconds and batches network publication separately
+(60 seconds by default): only newly appended complete lines become immutable,
+line-safe objects under `events/<stream>/chunks/`. An absolute `capture_since`
+gate applies both at tailing and again at upload/derivation, retaining only the
+session-start metadata needed for a session that crosses the boundary. The
 GitHub path pulls PRs/issues straight from the GraphQL API with a token, so it
 runs on CI or a server without a developer machine.
 
@@ -147,7 +154,9 @@ runs on CI or a server without a developer machine.
 
 - **CLI → stdout (agents):** `search`, `related`, `topic`, `recent`, `status`,
   `stats`, `tool`, `show`, and `trace` print Markdown an agent reads over the shell: no
-  server, no auth, no network. `related` takes no query: it derives one from the
+  server or application auth. In team mode a read first syncs the fleet's raw
+  chunks and latest published read-model; offline it keeps using the last
+  complete local snapshot. `related` takes no query: it derives one from the
   repo's recent commits + changed files and searches cross-repo, so an agent can
   pull prior work on its current task for free. Stable ids ride inline (sessions
   `[id8]`, PRs `repo#N`, topics `[key8]`), and `show <id>` drills into any of
@@ -209,7 +218,8 @@ view is the fleet-coverage roster, which names who runs agents untracked so a
 lead can close the install gap.
 
 **Onboarding & the local→bucket ramp.** One command does it: `synty init
-[bucket]` pins the GitHub identity, enables the login-time tracker, and runs the
+[bucket]` validates bucket access, pins the GitHub identity, enables and verifies
+the login-time tracker, and runs the
 first build (one onboarding path, not the old interactive `setup` plus more).
 Omit the bucket to trial synty against local sessions (invisible to the fleet,
 since it pushes no events); re-run with a bucket and that same `init` is the
@@ -218,6 +228,11 @@ the rest, no migration). A machine is **activated**, a real fleet member,
 exactly when a bucket is set; the bucket is the only thing that moves the badge.
 Autostart (the login-time tracker) is turned on by `init`/install and is on by
 default thereafter, reported in its own indicator, not a second activation gate.
+An orphan plist/unit is not reported as active, and initialization fails visibly
+if the service manager does not load the watcher. `--capture-since` persists an
+absolute event boundary and `--upload-interval` sets the network batching
+cadence. A systemd user service starts at boot on a headless developer VM when
+the administrator enables lingering for that user (`loginctl enable-linger`).
 The state shows on `status` and the TUI footer (`◐ local`, accent → `✓
 <bucket>`, sage), so the ramp is legible. The install one-liner carries the
 bucket and drops into the viewer, so a paste goes from nothing to tracking.
@@ -225,9 +240,11 @@ bucket and drops into the viewer, so a paste goes from nothing to tracking.
 ## Storage layout (bucket)
 
 ```
-events/<stream>/…                     append-only envelopes (source of truth);
+events/<stream>/chunks/<track-day>/<range-hash>.jsonl
+                                      immutable append deltas (source of truth);
                                         stream = edge-<machine>-<source>, so many
                                         trackers' files coexist without collision
+members/<machine>/activation.json     immutable init access marker (no session data)
 embeddings/<hash[..2]>/<hash>.emb      content-addressed f16 vectors (write-once)
 summaries/<kh[..2]>/<kh>-<ihash>.json  per-(unit, input-hash) LLM summaries
                                         (write-once: first viewer generates for
@@ -244,7 +261,10 @@ lease/build                            soft TTL lease electing one index builder
 A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
 `--features s3/gcs`, with conditional PUT for write-once and the lease). The
 fleet model is **no designated builder**: every tracker pushes events; whoever
-opens a viewer pulls the published read-model, then contributes a build.
+opens a viewer pulls all raw streams and the published read-model, then
+contributes a build. All CLI/MCP readers perform the same pull; commands can
+therefore inspect every machine, while semantic results cover the latest
+published build and warn when newer raw chunks are pending.
 Write-once stores are the collaboration primitive: a viewer encodes and
 summarizes only what no other machine has (pending lists shuffle per machine,
 so concurrent viewers split the work). The lease only prevents duplicate index
@@ -254,6 +274,15 @@ immutable-prefix + pointer-swap. The local layout mirrors this:
 incremental appends clone the previous build (CoW), so a reader's live mmap is
 never mutated under it. `synty up` loops locally; `synty build` is the
 one-shot fleet-aware build.
+
+**S3 credentials.** synty never persists access keys. With no named profile,
+the S3 backend uses environment, web-identity, container, or instance metadata
+credentials, which is the intended VM/container path. `init --aws-profile
+<name>` instead loads that AWS shared-config profile through the SDK's rotating
+provider chain; unattended workstations should make it a direct
+`credential_process` profile (for example IAM Roles Anywhere), not an AWS SSO
+session that requires periodic interactive login. The generated launchd/systemd
+unit reads the same config and therefore needs no temporary CLI environment.
 
 The **binary distributes through GitHub Releases**, kept off the data bucket on
 purpose: CI builds a per-platform artifact on each version tag and attaches
