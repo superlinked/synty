@@ -12,6 +12,7 @@ use crate::bucket::{self, Bucket};
 use anyhow::{anyhow, Result};
 use half::f16;
 use ndarray::Array2;
+use std::collections::HashSet;
 
 pub struct EmbStore {
     bucket: Box<dyn Bucket>,
@@ -38,14 +39,50 @@ impl EmbStore {
         }
     }
 
+    /// Fetch an explicit batch in order. This is used for small known sets
+    /// such as a topic's representative members, where every hash is expected
+    /// to exist and cloud request latency should overlap.
+    pub fn get_many(&self, hashes: &[u64]) -> Result<Vec<Option<Array2<f32>>>> {
+        let keys: Vec<String> = hashes.iter().map(|&hash| self.key(hash)).collect();
+        decode_many(self.bucket.get_many(&keys)?)
+    }
+
+    /// Resolve a corpus-sized batch from one listing, then fetch only objects
+    /// that exist. A missing hash is an encode candidate, not 100 ms of remote
+    /// negative lookup repeated for every new document.
+    pub fn get_known(&self, hashes: &[u64]) -> Result<Vec<Option<Array2<f32>>>> {
+        let known: HashSet<String> = self.bucket.list(&format!("embeddings/{}", self.ns))?.into_iter().collect();
+        let mut positions = Vec::new();
+        let mut keys = Vec::new();
+        for (i, &hash) in hashes.iter().enumerate() {
+            let key = self.key(hash);
+            if known.contains(&key) {
+                positions.push(i);
+                keys.push(key);
+            }
+        }
+        let fetched = decode_many(self.bucket.get_many(&keys)?)?;
+        let mut out = vec![None; hashes.len()];
+        for (i, value) in positions.into_iter().zip(fetched) {
+            out[i] = value;
+        }
+        Ok(out)
+    }
+
     /// Store an embedding if absent (write-once; another device may have raced
     /// to write the same content, which is fine — the bytes are identical).
     pub fn put(&self, hash: u64, emb: &Array2<f32>) -> Result<()> {
-        let k = self.key(hash);
-        if self.bucket.exists(&k)? {
-            return Ok(());
-        }
-        self.bucket.put(&k, &encode(emb))
+        self.bucket.put_if_absent(&self.key(hash), &encode(emb))?;
+        Ok(())
+    }
+
+    /// Share one encoder batch with bounded cloud concurrency. The entries are
+    /// still conditional write-once objects, so fleet races remain harmless.
+    pub fn put_many(&self, entries: &[(u64, Array2<f32>)]) -> Result<()> {
+        let objects: Vec<(String, Vec<u8>)> =
+            entries.iter().map(|(hash, emb)| (self.key(*hash), encode(emb))).collect();
+        self.bucket.put_many_if_absent(&objects)?;
+        Ok(())
     }
 
     /// Sharded key so a directory/prefix never holds the whole fleet's vectors.
@@ -173,6 +210,14 @@ fn decode(b: &[u8]) -> Result<Array2<f32>> {
     Array2::from_shape_vec((rows, cols), data).map_err(|e| anyhow!("embedding shape: {e}"))
 }
 
+fn decode_many(values: Vec<Option<Vec<u8>>>) -> Result<Vec<Option<Array2<f32>>>> {
+    Ok(values
+        .into_iter()
+        // Corruption remains a cache miss, matching `get`.
+        .map(|value| value.and_then(|bytes| decode(&bytes).ok()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +244,27 @@ mod tests {
         // separate namespace, never a silent hit on the default's.
         let other = EmbStore::open(dir.to_str().unwrap(), "some/other-encoder").unwrap();
         assert!(other.get(42).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corpus_batch_reuses_known_vectors_and_leaves_misses_for_encoding() {
+        let dir = std::env::temp_dir().join(format!("synty-store-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = EmbStore::open(dir.to_str().unwrap(), crate::DEFAULT_MODEL).unwrap();
+        let a = Array2::from_shape_vec((1, 2), vec![7.0, 8.0]).unwrap();
+        let b = Array2::from_shape_vec((1, 2), vec![9.0, 10.0]).unwrap();
+        s.put_many(&[(42, a.clone()), (7, b.clone())]).unwrap();
+
+        let found = s.get_known(&[7, 99, 42]).unwrap();
+        assert_eq!(found[0].as_ref(), Some(&b));
+        assert!(found[1].is_none(), "an absent corpus hash remains an encode candidate");
+        assert_eq!(found[2].as_ref(), Some(&a));
+
+        // Conditional batch writes preserve the first fleet writer.
+        let replacement = Array2::from_shape_vec((1, 2), vec![1.0, 2.0]).unwrap();
+        s.put_many(&[(42, replacement)]).unwrap();
+        assert_eq!(s.get(42).unwrap().as_ref(), Some(&a));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

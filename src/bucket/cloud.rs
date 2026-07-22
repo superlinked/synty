@@ -11,6 +11,10 @@ use object_store::{path::Path as OPath, ObjectStore};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+/// Enough overlap to hide object-store request latency without turning a
+/// workstation build into an unbounded connection or memory spike.
+const OBJECT_CONCURRENCY: usize = 32;
+
 struct Cloud {
     store: Arc<dyn ObjectStore>,
     rt: Runtime,
@@ -190,6 +194,27 @@ impl Bucket for Cloud {
             .map_err(|e| anyhow!("get {key}: {e}"))
     }
 
+    fn get_many(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+        let requests = futures::stream::iter(keys.iter().cloned().enumerate()).map(|(i, key)| {
+            let store = self.store.clone();
+            let path = self.full(&key);
+            async move {
+                let value = match store.get(&path).await {
+                    Ok(res) => res.bytes().await.map(|b| Some(b.to_vec())),
+                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                };
+                (i, key, value)
+            }
+        });
+        let results = self.rt.block_on(requests.buffer_unordered(OBJECT_CONCURRENCY).collect::<Vec<_>>());
+        let mut out = vec![None; keys.len()];
+        for (i, key, value) in results {
+            out[i] = value.map_err(|e| anyhow!("get {key}: {e}"))?;
+        }
+        Ok(out)
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         Ok(self.size(key)?.is_some())
     }
@@ -250,6 +275,30 @@ impl Bucket for Cloud {
             Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
             Err(e) => Err(anyhow!("put_if_absent {key}: {e}")),
         }
+    }
+
+    fn put_many_if_absent(&self, objects: &[(String, Vec<u8>)]) -> Result<usize> {
+        use object_store::{PutMode, PutOptions};
+        let requests = futures::stream::iter(objects.iter()).map(|(key, bytes)| {
+            let store = self.store.clone();
+            let path = self.full(key);
+            let key = key.clone();
+            let payload = bytes.clone().into();
+            async move {
+                let result = match store.put_opts(&path, payload, PutOptions::from(PutMode::Create)).await {
+                    Ok(_) => Ok(true),
+                    Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+                    Err(e) => Err(e),
+                };
+                (key, result)
+            }
+        });
+        let results = self.rt.block_on(requests.buffer_unordered(OBJECT_CONCURRENCY).collect::<Vec<_>>());
+        let mut created = 0;
+        for (key, result) in results {
+            created += usize::from(result.map_err(|e| anyhow!("put_if_absent {key}: {e}"))?);
+        }
+        Ok(created)
     }
 
     fn delete(&self, key: &str) -> Result<()> {

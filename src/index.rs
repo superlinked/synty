@@ -83,14 +83,9 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     // Pull every known embedding from the store; encode only the rest.
     let store = EmbStore::open(bucket, model_id)?;
     let n_new = texts.len() - start;
-    let mut embeddings: Vec<Option<Array2<f32>>> = vec![None; n_new];
-    let mut miss: Vec<usize> = Vec::new();
-    for i in start..texts.len() {
-        match store.get(hashes[i])? {
-            Some(e) => embeddings[i - start] = Some(e),
-            None => miss.push(i),
-        }
-    }
+    let mut embeddings = store.get_known(&hashes[start..])?;
+    let miss: Vec<usize> =
+        (start..texts.len()).filter(|&i| embeddings[i - start].is_none()).collect();
     let reused = n_new - miss.len();
 
     let t0 = Instant::now();
@@ -103,8 +98,11 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
         let mut done = 0;
         for chunk in miss.chunks(64) {
             let chunk_texts: Vec<String> = chunk.iter().map(|&i| texts[i].clone()).collect();
-            for (&i, e) in chunk.iter().zip(enc.encode_docs(&chunk_texts)?) {
-                store.put(hashes[i], &e)?; // share to the fleet
+            let encoded = enc.encode_docs(&chunk_texts)?;
+            let entries: Vec<(u64, Array2<f32>)> =
+                chunk.iter().zip(encoded).map(|(&i, emb)| (hashes[i], emb)).collect();
+            store.put_many(&entries)?; // share one write-once batch with the fleet
+            for (&i, (_, e)) in chunk.iter().zip(entries) {
                 embeddings[i - start] = Some(e);
             }
             done += chunk.len();

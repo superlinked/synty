@@ -885,13 +885,8 @@ fn score_name(name: &Array2<f32>, members: &[Array2<f32>]) -> NameVerdict {
 /// (centrality-ordered, dup-excluded by `topic_member_embed_hashes`). Missing
 /// vectors (summaries drifted since `cluster` encoded them) are dropped.
 fn load_members(store: &crate::store::EmbStore, hashes: &[u64]) -> Result<Vec<Array2<f32>>> {
-    let mut mem = Vec::new();
-    for h in hashes.iter().take(GATE_MEMBERS) {
-        if let Some(e) = store.get(*h)? {
-            mem.push(e);
-        }
-    }
-    Ok(mem)
+    let wanted: Vec<u64> = hashes.iter().take(GATE_MEMBERS).copied().collect();
+    Ok(store.get_many(&wanted)?.into_iter().flatten().collect())
 }
 
 /// The self-calibrating gate is the default semantic backstop (each name judged
@@ -933,10 +928,8 @@ fn embed_gate_names(tjobs: &[Job], cache: &mut units::SummaryCache, bucket: &str
         return Ok((0, 0));
     }
 
-    let mut embs: Vec<Option<Array2<f32>>> = Vec::with_capacity(cand.len());
-    for (_, name) in &cand {
-        embs.push(store.get(crate::index::fnv1a(name.as_bytes()))?);
-    }
+    let name_hashes: Vec<u64> = cand.iter().map(|(_, name)| crate::index::fnv1a(name.as_bytes())).collect();
+    let mut embs = store.get_many(&name_hashes)?;
     let miss: Vec<usize> = (0..cand.len()).filter(|&i| embs[i].is_none()).collect();
     if !miss.is_empty() {
         let mut enc = crate::encode::Encoder::load(&model)?;
@@ -1043,10 +1036,8 @@ pub(crate) fn eval_names(bucket: &str) -> Result<Vec<NameRow>> {
             (!c.summary.is_empty()).then(|| (j, c.summary.clone(), c.summary == fallback_name(j)))
         })
         .collect();
-    let mut embs: Vec<Option<Array2<f32>>> = Vec::with_capacity(cands.len());
-    for (_, name, _) in &cands {
-        embs.push(store.get(crate::index::fnv1a(name.as_bytes()))?);
-    }
+    let name_hashes: Vec<u64> = cands.iter().map(|(_, name, _)| crate::index::fnv1a(name.as_bytes())).collect();
+    let mut embs = store.get_many(&name_hashes)?;
     let miss: Vec<usize> = (0..cands.len()).filter(|&i| embs[i].is_none()).collect();
     if !miss.is_empty() {
         let mut enc = crate::encode::Encoder::load(&model)?;

@@ -16,6 +16,11 @@ use std::path::{Path, PathBuf};
 pub trait Bucket: Send + Sync {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    /// Fetch a batch while preserving input order. Cloud backends override
+    /// this to overlap request latency; the local/test default stays simple.
+    fn get_many(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+        keys.iter().map(|key| self.get(key)).collect()
+    }
     fn exists(&self, key: &str) -> Result<bool>;
     /// Byte size of an object, or None if absent — used for legacy mutable
     /// event compatibility and other metadata-only checks.
@@ -35,6 +40,15 @@ pub trait Bucket: Send + Sync {
     /// someone else holds it. The atomic primitive under leases and write-once
     /// stores (local: hard-link-if-absent; cloud: conditional PUT).
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool>;
+    /// Write a batch with the same write-once contract. Returns how many this
+    /// caller created; racing writers of identical content are harmless.
+    fn put_many_if_absent(&self, objects: &[(String, Vec<u8>)]) -> Result<usize> {
+        let mut created = 0;
+        for (key, bytes) in objects {
+            created += usize::from(self.put_if_absent(key, bytes)?);
+        }
+        Ok(created)
+    }
     /// Remove an object; absent is not an error.
     fn delete(&self, key: &str) -> Result<()>;
 }
@@ -185,6 +199,12 @@ mod tests {
         assert!(b.exists("events/a/x.jsonl").unwrap());
         assert_eq!(b.get("events/a/x.jsonl").unwrap().as_deref(), Some(&b"hi"[..]));
         assert_eq!(b.get("missing").unwrap(), None);
+        assert_eq!(
+            b.get_many(&["events/a/y.jsonl".into(), "missing".into(), "events/a/x.jsonl".into()])
+                .unwrap(),
+            vec![Some(b"yo".to_vec()), None, Some(b"hi".to_vec())],
+            "batched reads preserve requested order and missing entries"
+        );
         let keys = b.list("events").unwrap();
         assert_eq!(keys, vec!["events/a/x.jsonl", "events/a/y.jsonl"]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -216,6 +236,13 @@ mod tests {
         assert!(b.put_if_absent("once", b"a").unwrap());
         assert!(!b.put_if_absent("once", b"b").unwrap(), "second creation refused");
         assert_eq!(b.get("once").unwrap().as_deref(), Some(&b"a"[..]), "first writer's bytes win");
+        assert_eq!(
+            b.put_many_if_absent(&[("once".into(), b"b".to_vec()), ("twice".into(), b"c".to_vec())])
+                .unwrap(),
+            1,
+            "a batch creates only absent objects"
+        );
+        assert_eq!(b.get("twice").unwrap().as_deref(), Some(&b"c"[..]));
 
         // A leftover `.part` temp file is invisible to list (and get).
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
