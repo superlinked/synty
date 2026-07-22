@@ -1,6 +1,6 @@
 # synty: System Design
 
-**Status:** v0.1.0 (fleet, OSS launch) · **Owner:** Daniel Svonava
+**Status:** v0.2.0 (durable fleet rollout) · **Owner:** Daniel Svonava
 
 synty is a passively-collected memory of how work actually happens: it ingests
 coding-agent sessions (Claude Code, Codex, Cowork) and GitHub activity, and makes
