@@ -5,6 +5,7 @@
 
 use crate::event::{Event, deterministic_ulid, kind};
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -63,11 +64,27 @@ pub fn run(opts: Opts) -> Result<Report> {
     };
     let stream = format!("edge-{}-{source}", opts.machine);
     let out_dir = Path::new(crate::units::LOCAL_DIR).join(&stream);
-    let mut seen = existing_ids(&out_dir)?;
-    let mut started: HashSet<String> = HashSet::new();
+    let _lock = if opts.dry_run {
+        None
+    } else {
+        std::fs::create_dir_all(&out_dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(out_dir.join(".import.lock"))?;
+        file.lock_exclusive()?;
+        Some(file)
+    };
+    let existing = existing_state(&out_dir)?;
+    let mut seen = existing.ids;
+    let mut started = existing.started;
+    let mut next_seq = existing.max_seq.saturating_add(1);
     let mut per_day: BTreeMap<String, Vec<Event>> = BTreeMap::new();
     let mut report = Report::default();
-    let mut quarantine = quarantine_writer(opts.quarantine.as_deref())?;
+    let mut quarantine = quarantine_writer(opts.quarantine.as_deref(), opts.dry_run)?;
+    let capture_repos = crate::config::load().capture_repos;
     let reader: Box<dyn BufRead> = if opts.input == "-" {
         Box::new(std::io::BufReader::new(std::io::stdin()))
     } else {
@@ -94,7 +111,7 @@ pub fn run(opts: Opts) -> Result<Report> {
             Ok(event) => event,
             Err(error) => {
                 report.rejected += 1;
-                write_reject(&mut quarantine, line_index, &error.to_string(), &line)?;
+                write_reject(&mut quarantine, line_index, &error.to_string(), &line, opts.redaction)?;
                 continue;
             }
         };
@@ -106,16 +123,15 @@ pub fn run(opts: Opts) -> Result<Report> {
         if let Some(expected) = opts.repo.as_deref() {
             if !event_repo.is_empty() && event_repo != expected {
                 report.rejected += 1;
-                write_reject(&mut quarantine, line_index, "repo_mismatch", &line)?;
+                write_reject(&mut quarantine, line_index, "repo_mismatch", &line, opts.redaction)?;
                 continue;
             }
             ensure_payload_string(&mut event.payload, "repo", expected);
         }
-        let capture_repos = &crate::config::load().capture_repos;
         let event_repo = event.payload["repo"].as_str().unwrap_or("");
         if !capture_repos.is_empty() && !capture_repos.iter().any(|repo| repo == event_repo) {
             report.rejected += 1;
-            write_reject(&mut quarantine, line_index, "repo_denied", &line)?;
+            write_reject(&mut quarantine, line_index, "repo_denied", &line, opts.redaction)?;
             continue;
         }
         crate::redact::value(&mut event.payload, opts.redaction);
@@ -127,19 +143,22 @@ pub fn run(opts: Opts) -> Result<Report> {
             && event.kind != kind::SESSION_START
             && started.insert(event.session_id.clone())
         {
-            let start = synthetic_start(&event, &opts, &stream);
+            let mut start = synthetic_start(&event, &opts, &stream);
             if seen.insert(start.event_id.clone()) {
+                start.seq = next_seq;
+                next_seq = next_seq.saturating_add(1);
                 push_day(&mut per_day, start);
             }
         } else if event.kind == kind::SESSION_START {
             started.insert(event.session_id.clone());
         }
+        event.seq = next_seq;
+        next_seq = next_seq.saturating_add(1);
         push_day(&mut per_day, event);
         report.imported += 1;
     }
 
     if !opts.dry_run {
-        std::fs::create_dir_all(&out_dir)?;
         for (day, events) in per_day {
             let path = out_dir.join(format!("track.{day}.jsonl"));
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
@@ -159,10 +178,13 @@ pub fn run(opts: Opts) -> Result<Report> {
             )?;
         }
     }
-    eprintln!(
-        "[metrics import]\nread={}\nimported={}\nduplicate={}\nrejected={}\nbefore_boundary={}",
-        report.read, report.imported, report.duplicate, report.rejected, report.before_boundary
-    );
+    crate::metrics::Run::new("import")
+        .set("read", report.read)
+        .set("imported", report.imported)
+        .set("duplicate", report.duplicate)
+        .set("rejected", report.rejected)
+        .set("before_boundary", report.before_boundary)
+        .emit();
     Ok(report)
 }
 
@@ -180,8 +202,9 @@ fn normalize(
             event.stream = stream.to_string();
             stamp(&mut event, opts);
             if event.event_id.is_empty() {
-                event.event_id = stable_id(&opts.input, line_index, &event.ts, source);
+                event.event_id = stable_event_id(&event, "");
             }
+            validate_timestamp(&event.ts)?;
             Ok(event)
         }
         Format::Harness => normalize_harness(line, line_index, source, stream, opts),
@@ -244,8 +267,9 @@ fn normalize_harness(
     };
     stamp(&mut event, opts);
     if event.event_id.is_empty() {
-        event.event_id = stable_id(&opts.input, line_index, &event.ts, source);
+        event.event_id = stable_event_id(&event, "");
     }
+    validate_timestamp(&event.ts)?;
     Ok(event)
 }
 
@@ -271,10 +295,10 @@ fn normalize_devin(
         _ => kind::AGENT_META,
     };
     let mut payload = row["payload"].as_object().cloned().unwrap_or_default();
-    if !payload.contains_key("text") {
-        if let Some(text) = first_string(&row, &["text", "content", "message"]) {
-            payload.insert("text".into(), Value::String(text.into()));
-        }
+    if !payload.contains_key("text")
+        && let Some(text) = first_string(&row, &["text", "content", "message"])
+    {
+        payload.insert("text".into(), Value::String(text.into()));
     }
     if let Some(id) = first_string(&row, &["event_id", "eventId", "id"]) {
         payload.insert("devin_event_id".into(), Value::String(id.into()));
@@ -296,11 +320,8 @@ fn normalize_devin(
     };
     stamp(&mut event, opts);
     let foreign = first_string(&row, &["event_id", "eventId", "id"]).unwrap_or("");
-    event.event_id = if foreign.is_empty() {
-        stable_id(&opts.input, line_index, &event.ts, source)
-    } else {
-        stable_id(foreign, 0, &event.ts, source)
-    };
+    event.event_id = stable_event_id(&event, foreign);
+    validate_timestamp(&event.ts)?;
     Ok(event)
 }
 
@@ -332,7 +353,7 @@ fn synthetic_start(event: &Event, opts: &Opts, stream: &str) -> Event {
     crate::redact::value(&mut payload, opts.redaction);
     Event {
         v: crate::event::ENVELOPE_V,
-        event_id: stable_id(&event.session_id, 0, &event.ts, "session_start"),
+        event_id: deterministic_id(&event.ts, &format!("{}\0{}\0session_start", event.source, event.session_id)),
         stream: stream.into(),
         seq: event.seq.saturating_sub(1),
         ts: event.ts.clone(),
@@ -344,17 +365,45 @@ fn synthetic_start(event: &Event, opts: &Opts, stream: &str) -> Event {
     }
 }
 
-fn stable_id(key: &str, line: usize, ts: &str, source: &str) -> String {
-    let ts_ms = chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|value| value.timestamp_millis().max(0) as u64)
-        .unwrap_or(0);
-    deterministic_ulid(ts_ms, &format!("{source}\0{key}\0{line}"))
+fn stable_event_id(event: &Event, foreign_id: &str) -> String {
+    let identity = if foreign_id.is_empty() {
+        format!(
+            "{}\0{}\0{}\0{}",
+            event.source,
+            event.session_id,
+            event.kind,
+            serde_json::to_string(&event.payload).unwrap_or_default(),
+        )
+    } else {
+        format!("{}\0foreign\0{foreign_id}", event.source)
+    };
+    deterministic_id(&event.ts, &identity)
 }
 
-fn existing_ids(dir: &Path) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
+fn deterministic_id(ts: &str, identity: &str) -> String {
+    let ts_ms = chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|value| value.timestamp_millis().max(0) as u64)
+        .unwrap_or_default();
+    deterministic_ulid(ts_ms, identity)
+}
+
+fn validate_timestamp(ts: &str) -> Result<()> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .with_context(|| format!("timestamp is not RFC3339: {ts}"))?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct ExistingState {
+    ids: HashSet<String>,
+    started: HashSet<String>,
+    max_seq: i64,
+}
+
+fn existing_state(dir: &Path) -> Result<ExistingState> {
+    let mut state = ExistingState { max_seq: -1, ..Default::default() };
     if !dir.is_dir() {
-        return Ok(ids);
+        return Ok(state);
     }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -363,11 +412,15 @@ fn existing_ids(dir: &Path) -> Result<HashSet<String>> {
         }
         for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
             if let Ok(event) = serde_json::from_str::<Event>(&line?) {
-                ids.insert(event.event_id);
+                state.max_seq = state.max_seq.max(event.seq);
+                state.ids.insert(event.event_id);
+                if event.kind == kind::SESSION_START && !event.session_id.is_empty() {
+                    state.started.insert(event.session_id);
+                }
             }
         }
     }
-    Ok(ids)
+    Ok(state)
 }
 
 fn push_day(days: &mut BTreeMap<String, Vec<Event>>, event: Event) {
@@ -407,7 +460,10 @@ fn ensure_payload_string(payload: &mut Value, key: &str, value: &str) {
     payload[key] = Value::String(value.into());
 }
 
-fn quarantine_writer(path: Option<&Path>) -> Result<Option<std::fs::File>> {
+fn quarantine_writer(path: Option<&Path>, dry_run: bool) -> Result<Option<std::fs::File>> {
+    if dry_run {
+        return Ok(None);
+    }
     path.map(|path| {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -423,11 +479,12 @@ fn write_reject(
     line: usize,
     reason: &str,
     raw: &str,
+    profile: crate::redact::Profile,
 ) -> Result<()> {
     if let Some(writer) = writer {
         serde_json::to_writer(
             &mut *writer,
-            &json!({"line": line + 1, "reason": reason, "raw": raw}),
+            &json!({"line": line + 1, "reason": reason, "raw": crate::redact::text(raw, profile)}),
         )?;
         writer.write_all(b"\n")?;
     }
@@ -488,9 +545,57 @@ mod tests {
     }
 
     #[test]
-    fn stable_ids_make_reimport_idempotent() {
-        let a = stable_id("foreign", 7, "2026-07-22T12:00:00Z", "harness");
-        let b = stable_id("foreign", 7, "2026-07-22T12:00:00Z", "harness");
-        assert_eq!(a, b);
+    fn content_ids_survive_reordering_without_colliding_at_the_same_line() {
+        let first = json!({
+            "ts": "2026-07-22T12:00:00Z", "session_id": "s", "kind": "user_prompt",
+            "payload": {"text": "first"}
+        });
+        let second = json!({
+            "ts": "2026-07-22T12:00:00Z", "session_id": "s", "kind": "user_prompt",
+            "payload": {"text": "second"}
+        });
+        let a = normalize_harness(&first.to_string(), 0, "harness", "edge-w-harness", &opts(Format::Harness)).unwrap();
+        let reordered = normalize_harness(&first.to_string(), 9, "harness", "edge-w-harness", &opts(Format::Harness)).unwrap();
+        let b = normalize_harness(&second.to_string(), 0, "harness", "edge-w-harness", &opts(Format::Harness)).unwrap();
+        assert_eq!(a.event_id, reordered.event_id);
+        assert_ne!(a.event_id, b.event_id);
+    }
+
+    #[test]
+    fn malformed_timestamps_are_quarantinable_instead_of_minting_epoch_ids() {
+        let row = json!({"ts": "yesterday", "session_id": "s", "kind": "user_prompt"});
+        assert!(normalize_harness(&row.to_string(), 0, "harness", "edge-w-harness", &opts(Format::Harness)).is_err());
+    }
+
+    #[test]
+    fn dry_run_does_not_create_a_quarantine_file() {
+        let path = std::env::temp_dir().join(format!("synty-import-dry-quarantine-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(quarantine_writer(Some(&path), true).unwrap().is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn existing_state_remembers_started_sessions_and_sequence_tail() {
+        let root = std::env::temp_dir().join(format!("synty-import-existing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let event = Event {
+            v: 1,
+            event_id: "start".into(),
+            stream: "edge-w-harness".into(),
+            seq: 41,
+            ts: "2026-07-22T12:00:00Z".into(),
+            source: "harness".into(),
+            session_id: "session-1".into(),
+            kind: kind::SESSION_START.into(),
+            payload: json!({}),
+            rollup_dim: String::new(),
+        };
+        std::fs::write(root.join("track.2026-07-22.jsonl"), format!("{}\n", serde_json::to_string(&event).unwrap())).unwrap();
+        let state = existing_state(&root).unwrap();
+        assert!(state.started.contains("session-1"));
+        assert_eq!(state.max_seq, 41);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

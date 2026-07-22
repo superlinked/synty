@@ -15,32 +15,45 @@ spec:
             app.kubernetes.io/instance: {{ .Release.Name }}
             app.kubernetes.io/component: builder
         spec:
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
           serviceAccountName: {{ include "synty.serviceAccountName" . }}
           restartPolicy: OnFailure
           containers:
             - name: builder
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              image: {{ include "synty.image" . | quote }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
-              command: ["/bin/sh", "-ec"]
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              command: ["synty"]
               args:
-                - |
-                  synty init "$SYNTY_BUCKET" --machine "$SYNTY_MACHINE" \
-                    --no-build --no-autostart \
-                    {{- if .Values.awsProfile }} --aws-profile "$SYNTY_AWS_PROFILE"{{- end }}
-                  synty build --bucket "$SYNTY_BUCKET" --machine "$SYNTY_MACHINE" --no-track
+                - build
+                - --bucket
+                - {{ required "bucket is required" .Values.bucket | quote }}
+                - --machine
+                - {{ printf "%s-builder" .Values.machine | quote }}
+                - --no-track
               env:
                 - { name: SYNTY_HOME, value: /var/synty }
-                - { name: SYNTY_BUCKET, value: {{ required "bucket is required" .Values.bucket | quote }} }
-                - { name: SYNTY_MACHINE, value: {{ printf "%s-builder" .Values.machine | quote }} }
+                {{- if .Values.bucketRegion }}
+                - { name: AWS_REGION, value: {{ .Values.bucketRegion | quote }} }
+                - { name: AWS_DEFAULT_REGION, value: {{ .Values.bucketRegion | quote }} }
+                {{- end }}
                 {{- if .Values.awsProfile }}
-                - { name: SYNTY_AWS_PROFILE, value: {{ .Values.awsProfile | quote }} }
+                - { name: AWS_PROFILE, value: {{ .Values.awsProfile | quote }} }
                 {{- end }}
               volumeMounts:
                 - { name: synty-home, mountPath: /var/synty }
+                - { name: tmp, mountPath: /tmp }
               resources:
                 {{- toYaml .Values.builder.resources | nindent 16 }}
           volumes:
+            - { name: tmp, emptyDir: {} }
             - name: synty-home
+              {{- if .Values.persistence.enabled }}
               persistentVolumeClaim:
                 claimName: {{ include "synty.claimName" . }}
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
 {{- end }}

@@ -16,6 +16,11 @@ use std::path::{Path, PathBuf};
 pub trait Bucket: Send + Sync {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    /// Fetch a batch while preserving input order. Cloud backends override
+    /// this to overlap request latency; the local/test default stays simple.
+    fn get_many(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+        keys.iter().map(|key| self.get(key)).collect()
+    }
     fn exists(&self, key: &str) -> Result<bool>;
     /// Byte size of an object, or None if absent — used for legacy mutable
     /// event compatibility and other metadata-only checks.
@@ -35,6 +40,15 @@ pub trait Bucket: Send + Sync {
     /// someone else holds it. The atomic primitive under leases and write-once
     /// stores (local: hard-link-if-absent; cloud: conditional PUT).
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool>;
+    /// Write a batch with the same write-once contract. Returns how many this
+    /// caller created; racing writers of identical content are harmless.
+    fn put_many_if_absent(&self, objects: &[(String, Vec<u8>)]) -> Result<usize> {
+        let mut created = 0;
+        for (key, bytes) in objects {
+            created += usize::from(self.put_if_absent(key, bytes)?);
+        }
+        Ok(created)
+    }
     /// Remove an object; absent is not an error.
     fn delete(&self, key: &str) -> Result<()>;
 }
@@ -63,21 +77,15 @@ impl LocalFs {
     fn path(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }
-    /// A process-unique temp sibling for `p` — a fixed name would let two
-    /// concurrent writers of the same key rename each other's half-written tmp
-    /// into place.
-    fn tmp_for(p: &Path) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        p.with_file_name(format!("{name}.part.{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
-    }
 }
 
 /// Tmp-file marker — `list` skips these so a killed writer's leftovers never
 /// read as real objects.
 fn is_part(name: &str) -> bool {
-    name.ends_with(".part") || name.contains(".part.")
+    name.ends_with(".part")
+        || name.contains(".part.")
+        || name.ends_with(".tmp")
+        || name.contains(".tmp.")
 }
 
 impl Bucket for LocalFs {
@@ -88,10 +96,7 @@ impl Bucket for LocalFs {
         }
         // Write to a temp sibling then rename, so a reader never sees a partial
         // object (atomic on the same filesystem).
-        let tmp = Self::tmp_for(&p);
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &p)?;
-        Ok(())
+        crate::write_atomic(&p.to_string_lossy(), bytes)
     }
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         match std::fs::read(self.path(key)) {
@@ -133,8 +138,7 @@ impl Bucket for LocalFs {
         }
         // hard_link is atomic fail-if-exists on APFS/ext4 — the local stand-in
         // for a conditional PUT.
-        let tmp = Self::tmp_for(&p);
-        std::fs::write(&tmp, bytes)?;
+        let tmp = crate::write_unique_temp(&p, bytes)?;
         let created = match std::fs::hard_link(&tmp, &p) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -185,6 +189,12 @@ mod tests {
         assert!(b.exists("events/a/x.jsonl").unwrap());
         assert_eq!(b.get("events/a/x.jsonl").unwrap().as_deref(), Some(&b"hi"[..]));
         assert_eq!(b.get("missing").unwrap(), None);
+        assert_eq!(
+            b.get_many(&["events/a/y.jsonl".into(), "missing".into(), "events/a/x.jsonl".into()])
+                .unwrap(),
+            vec![Some(b"yo".to_vec()), None, Some(b"hi".to_vec())],
+            "batched reads preserve requested order and missing entries"
+        );
         let keys = b.list("events").unwrap();
         assert_eq!(keys, vec!["events/a/x.jsonl", "events/a/y.jsonl"]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -216,11 +226,19 @@ mod tests {
         assert!(b.put_if_absent("once", b"a").unwrap());
         assert!(!b.put_if_absent("once", b"b").unwrap(), "second creation refused");
         assert_eq!(b.get("once").unwrap().as_deref(), Some(&b"a"[..]), "first writer's bytes win");
+        assert_eq!(
+            b.put_many_if_absent(&[("once".into(), b"b".to_vec()), ("twice".into(), b"c".to_vec())])
+                .unwrap(),
+            1,
+            "a batch creates only absent objects"
+        );
+        assert_eq!(b.get("twice").unwrap().as_deref(), Some(&b"c"[..]));
 
         // A leftover `.part` temp file is invisible to list (and get).
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
         std::fs::write(dir.join("blobs/real"), b"x").unwrap();
         std::fs::write(dir.join("blobs/real.part.123-0"), b"half").unwrap();
+        std::fs::write(dir.join("blobs/real.tmp.1-0"), b"half").unwrap();
         assert_eq!(b.list("blobs").unwrap(), vec!["blobs/real"], "part files never read as objects");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -230,9 +248,7 @@ mod tests {
         assert!(open("/tmp/x").is_ok());
         assert!(open("file:///tmp/x").is_ok());
         // Cloud schemes only resolve when their feature is built in.
-        let s3 = open("s3://bucket/prefix");
         #[cfg(not(feature = "s3"))]
-        assert!(s3.is_err());
-        let _ = s3;
+        assert!(open("s3://bucket/prefix").is_err());
     }
 }

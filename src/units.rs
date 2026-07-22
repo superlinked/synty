@@ -40,6 +40,8 @@ pub struct Session {
     pub tool_err: usize,
     pub by_model: Vec<ModelUsage>, // per-model split of the same totals, tok_out desc
     pub source: String, // envelope source: claude_code | codex_cli | cowork
+    pub campaign_id: String,
+    pub campaign_role: String,
     pub summary: Option<String>, // abstractive one-liner (local LLM), if cached
     /// The actor the tracker stamped on session_start; empty for sessions
     /// tracked before stamping (callers fall back to the local actor).
@@ -157,6 +159,9 @@ pub struct Unit {
     pub author: String,    // PR/issue author, or the resolved actor for sessions
     pub doc_id: Option<i64>,    // for PR/issue → docs.jsonl
     pub session_id: Option<String>, // for sessions
+    pub campaign_id: String,
+    pub campaign_role: String,
+    pub source: String, // native producer, suitable for read-scope checks
 }
 
 /// A topic with its work units, time span, activity over weeks, and type mix.
@@ -227,6 +232,8 @@ struct Agg {
     tool_errs: HashMap<String, usize>, // per-name errors (Claude only: codex results carry no error flag)
     tool_chars: HashMap<String, u64>, // per-name payload volume: args + result content, chars
     source: String, // envelope source, first seen wins (a session has one tailer)
+    campaign_id: String,
+    campaign_role: String,
     model_usage: HashMap<String, ModelUsage>, // per-model split, same msg_id dedup
     /// Codex reports cumulative (input_total, cached, output) snapshots; the
     /// last one is the session total. Kept raw here, normalized in sessions().
@@ -279,6 +286,17 @@ fn fold_line_since(
         if let Some(src) = ev["source"].as_str().filter(|s| !s.is_empty()) {
             a.source = src.to_string();
         }
+    }
+    if a.campaign_id.is_empty() {
+        a.campaign_id = ev["rollup_dim"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .or_else(|| ev["payload"]["campaign_id"].as_str())
+            .unwrap_or("")
+            .to_string();
+    }
+    if a.campaign_role.is_empty() {
+        a.campaign_role = ev["payload"]["campaign_role"].as_str().unwrap_or("").to_string();
     }
     if visible && !ts.is_empty() {
         if a.first.is_empty() || ts < a.first.as_str() {
@@ -929,6 +947,8 @@ pub fn sessions() -> Result<Vec<Session>> {
                 tool_err: a.tool_err,
                 by_model,
                 source: a.source.clone(),
+                campaign_id: a.campaign_id.clone(),
+                campaign_role: a.campaign_role.clone(),
                 topic: topic_of.get(id).map(|t| t.cluster),
                 struggle: scores[i],
                 summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
@@ -963,6 +983,9 @@ pub fn units() -> Result<Vec<Unit>> {
             author: if s.author.is_empty() { local_actor.clone() } else { s.author.clone() },
             doc_id: None,
             session_id: Some(s.id),
+            campaign_id: s.campaign_id,
+            campaign_role: s.campaign_role,
+            source: s.source,
         })
         .collect();
 
@@ -990,6 +1013,13 @@ pub fn units() -> Result<Vec<Unit>> {
                 author: d.meta.author.clone(),
                 doc_id: Some(d.id),
                 session_id: None,
+                campaign_id: d.meta.campaign_id.clone(),
+                campaign_role: d.meta.campaign_role.clone(),
+                source: if d.meta.capture_source.is_empty() {
+                    d.meta.source.clone()
+                } else {
+                    d.meta.capture_source.clone()
+                },
             });
         }
     }
@@ -1028,6 +1058,49 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
         .collect();
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));
     Ok(out)
+}
+
+/// Apply every read-scope dimension before rebuilding topic facets. Cached
+/// names and summaries describe the full cluster, so restricted views replace
+/// them with an extractive label from an allowed member.
+pub fn topic_units_scoped(weeks: usize, scope: &crate::policy::ReadScope) -> Result<Vec<TopicUnits>> {
+    Ok(scope_topic_units(topic_units(weeks)?, weeks, scope))
+}
+
+fn scope_topic_units(
+    mut topics: Vec<TopicUnits>,
+    weeks: usize,
+    scope: &crate::policy::ReadScope,
+) -> Vec<TopicUnits> {
+    if !scope.restricted() {
+        return topics;
+    }
+    topics = topics
+        .into_iter()
+        .filter_map(|mut topic| {
+            topic.units.retain(|unit| scope.allows_unit(unit));
+            if topic.units.is_empty() {
+                return None;
+            }
+            let days: Vec<String> = topic.units.iter().map(|unit| unit.when.clone()).collect();
+            topic.last_active = days.iter().max().cloned().unwrap_or_default();
+            topic.activity = weekly_buckets(&days, weeks);
+            topic.mix = unit_mix(&topic.units);
+            topic.repos = by_count(
+                topic.units.iter().filter(|unit| !unit.repo.is_empty()).map(|unit| unit.repo.clone()),
+            );
+            topic.authors = by_count(
+                topic.units.iter().filter(|unit| !unit.author.is_empty()).map(|unit| unit.author.clone()),
+            );
+            topic.span = day_span(&days);
+            topic.label = topic.units.iter().min_by_key(|unit| unit.rank).map(|unit| unit.title.clone()).unwrap_or_default();
+            topic.summary = None;
+            topic.name = None;
+            Some(topic)
+        })
+        .collect();
+    topics.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));
+    topics
 }
 
 // ── struggle ────────────────────────────────────────────────────────────────
@@ -1458,6 +1531,48 @@ mod tests {
         aggs
     }
 
+    #[test]
+    fn restricted_topics_rebuild_facets_and_drop_full_corpus_summaries() {
+        let unit = |repo: &str, title: &str, rank: i64| Unit {
+            kind: Kind::Session,
+            when: "2026-07-22".into(),
+            repo: repo.into(),
+            title: title.into(),
+            outcome: String::new(),
+            summary: None,
+            topic: Some(0),
+            rank,
+            dup: false,
+            struggle: 0.0,
+            author: repo.into(),
+            doc_id: None,
+            session_id: Some(repo.into()),
+            campaign_id: "campaign".into(),
+            campaign_role: "primary".into(),
+            source: "harness".into(),
+        };
+        let topics = vec![TopicUnits {
+            id: 0,
+            cache_key: "topic".into(),
+            label: "secret full label".into(),
+            units: vec![unit("allowed", "Allowed task", 1), unit("hidden", "Hidden task", 0)],
+            last_active: "2026-07-22".into(),
+            activity: vec![2],
+            mix: (0, 2, 0),
+            repos: vec!["allowed".into(), "hidden".into()],
+            authors: vec!["allowed".into(), "hidden".into()],
+            summary: Some("secret full summary".into()),
+            name: Some("Secret name".into()),
+            span: None,
+        }];
+        let scope = crate::policy::ReadScope { repos: vec!["allowed".into()], ..Default::default() };
+        let scoped = scope_topic_units(topics, 1, &scope);
+        assert_eq!(scoped[0].units.len(), 1);
+        assert_eq!(scoped[0].repos, ["allowed"]);
+        assert_eq!(scoped[0].label, "Allowed task");
+        assert!(scoped[0].summary.is_none() && scoped[0].name.is_none());
+    }
+
     fn aggs_since(text: &str, cutoff: i64) -> HashMap<String, Agg> {
         let known = std::collections::HashSet::new();
         let mut seen = std::collections::HashSet::new();
@@ -1536,6 +1651,9 @@ mod tests {
             author: String::new(),
             doc_id: None,
             session_id: None,
+            campaign_id: String::new(),
+            campaign_role: String::new(),
+            source: String::new(),
         };
         let day: HashMap<String, DayStat> = [(
             "2026-06-01".to_string(),
@@ -1712,6 +1830,8 @@ mod tests {
             tool_err: 0,
             by_model: vec![],
             source: "cowork".into(),
+            campaign_id: String::new(),
+            campaign_role: String::new(),
             summary: None,
             author: String::new(),
         };

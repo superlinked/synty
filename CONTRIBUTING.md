@@ -51,10 +51,26 @@ git tag v0.2.0 && git push origin v0.2.0
 ```
 
 The matrix builds `macos-14` (`--features metal,s3,gcs`, Apple Silicon) and
-`ubuntu-latest` (`--features s3,gcs`, Linux x64); the `s3`/`gcs` features read
+`ubuntu-latest` (`--features s3,gcs,mcp-http`, Linux x64); the `s3`/`gcs` features read
 the team's data bucket and are independent of where the binary ships. Add rows
 for more platforms (Intel Mac `macos-13`, `ubuntu-24.04-arm`) as needed. Users
 then update with `synty upgrade`, which reads the same release.
+
+The same tag publishes an immutable `linux/amd64` container to
+`851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty:<version>`.
+Deploy `deploy/aws/ecr-publisher.yaml` once in account `851725219920`, then set
+the GitHub Actions repository variable `AWS_ECR_PUBLISH_ROLE_ARN` to the stack's
+`PublisherRoleArn` output. The role trusts only version tags from
+`superlinked/synty` and can push only the retained `synty` repository. The Helm
+chart's empty image tag resolves to `Chart.appVersion`, so bump it with the
+Cargo version before tagging.
+
+```sh
+aws cloudformation deploy --region eu-central-1 \
+  --stack-name synty-ecr-publisher \
+  --template-file deploy/aws/ecr-publisher.yaml \
+  --capabilities CAPABILITY_NAMED_IAM
+```
 
 ## Writing style
 

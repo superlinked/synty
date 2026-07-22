@@ -28,7 +28,7 @@ pub fn subset_for_scope(
     append_scope_clause(&mut clauses, &mut params, "repo", &scope.repos);
     append_scope_clause(&mut clauses, &mut params, "campaign_id", &scope.campaigns);
     append_scope_clause(&mut clauses, &mut params, "campaign_role", &scope.roles);
-    append_scope_clause(&mut clauses, &mut params, "source", &scope.sources);
+    append_source_scope_clause(&mut clauses, &mut params, &scope.sources);
     if clauses.is_empty() {
         return Ok(None);
     }
@@ -39,6 +39,20 @@ pub fn subset_for_scope(
     )
     .map_err(|e| anyhow!("filter: {e}"))?;
     Ok(Some(ids))
+}
+
+fn append_source_scope_clause(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<serde_json::Value>,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    let placeholders = std::iter::repeat_n("?", values.len()).collect::<Vec<_>>().join(",");
+    clauses.push(format!("(capture_source IN ({placeholders}) OR (capture_source = '' AND source IN ({placeholders})))"));
+    params.extend(values.iter().map(|value| serde_json::json!(value)));
+    params.extend(values.iter().map(|value| serde_json::json!(value)));
 }
 
 fn append_scope_clause(

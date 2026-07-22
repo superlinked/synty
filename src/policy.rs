@@ -2,7 +2,7 @@
 // remain in synty's documented high-trust tier; MCP clients receive only tools
 // and records allowed by this scope.
 
-use crate::event::Event;
+use crate::{Meta, event::Event, units::{Session, Unit}};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -35,6 +35,40 @@ impl ReadScope {
         allowed(&self.sources, source)
     }
 
+    /// Source scopes name the capture producer (`harness`, `codex_cli`,
+    /// `github`), while indexed agent documents retain the broad `agent`
+    /// source used by search filters. `capture_source` carries the producer;
+    /// `backend` independently identifies the campaign execution backend.
+    pub fn allows_fields(&self, repo: &str, campaign: &str, role: &str, source: &str) -> bool {
+        self.allows_repo(repo)
+            && self.allows_source(source)
+            && allowed(&self.campaigns, campaign)
+            && allowed(&self.roles, role)
+    }
+
+    pub fn allows_doc(&self, meta: &Meta) -> bool {
+        let source = if meta.capture_source.is_empty() { &meta.source } else { &meta.capture_source };
+        self.allows_fields(&meta.repo, &meta.campaign_id, &meta.campaign_role, source)
+    }
+
+    pub fn allows_session(&self, session: &Session) -> bool {
+        self.allows_fields(
+            &session.repo,
+            &session.campaign_id,
+            &session.campaign_role,
+            &session.source,
+        )
+    }
+
+    pub fn allows_unit(&self, unit: &Unit) -> bool {
+        self.allows_fields(
+            &unit.repo,
+            &unit.campaign_id,
+            &unit.campaign_role,
+            &unit.source,
+        )
+    }
+
     pub fn allows_event(&self, event: &Event, repo: &str) -> bool {
         self.allows_repo(repo)
             && self.allows_source(&event.source)
@@ -47,6 +81,38 @@ impl ReadScope {
             || !self.campaigns.is_empty()
             || !self.roles.is_empty()
             || !self.sources.is_empty()
+    }
+
+    pub fn exposes_tool(&self, tool: &str) -> bool {
+        match tool_scope(tool) {
+            Some(ToolScope::Filtered) => true,
+            Some(ToolScope::Global) => !self.restricted(),
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolScope {
+    /// The implementation receives the scope and filters before rendering.
+    Filtered,
+    /// Fleet aggregates cannot be safely reconstructed for a partial corpus.
+    Global,
+}
+
+pub(crate) fn tool_scope(tool: &str) -> Option<ToolScope> {
+    match tool {
+        "synty_search"
+        | "synty_related"
+        | "synty_topics"
+        | "synty_recent"
+        | "synty_show"
+        | "synty_trace_list"
+        | "synty_trace_show"
+        | "synty_trace_search"
+        | "synty_trace_compare" => Some(ToolScope::Filtered),
+        "synty_status" | "synty_stats" | "synty_tool" => Some(ToolScope::Global),
+        _ => None,
     }
 }
 
@@ -101,7 +167,18 @@ impl McpRole {
                     | "synty_status"
                     | "synty_show"
             ),
-            Self::Investigator => true,
+            Self::Investigator => matches!(
+                tool,
+                "synty_search"
+                    | "synty_topics"
+                    | "synty_recent"
+                    | "synty_status"
+                    | "synty_show"
+                    | "synty_trace_list"
+                    | "synty_trace_show"
+                    | "synty_trace_search"
+                    | "synty_trace_compare"
+            ),
             Self::Validator => matches!(
                 tool,
                 "synty_search"
@@ -129,11 +206,33 @@ mod tests {
 
     #[test]
     fn roles_have_narrow_default_tool_surfaces() {
-        assert!(McpRole::Primary.allows_tool("synty_related"));
-        assert!(!McpRole::Primary.allows_tool("synty_trace_search"));
-        assert!(McpRole::Investigator.allows_tool("synty_trace_search"));
-        assert!(!McpRole::Validator.allows_tool("synty_related"));
-        assert!(McpRole::Operator.allows_tool("synty_stats"));
+        let tools = [
+            "synty_search", "synty_related", "synty_topics", "synty_recent",
+            "synty_status", "synty_stats", "synty_tool", "synty_show",
+            "synty_trace_list", "synty_trace_show", "synty_trace_search",
+            "synty_trace_compare",
+        ];
+        let matrix = [
+            (McpRole::Primary, &[
+                "synty_search", "synty_related", "synty_topics", "synty_recent",
+                "synty_status", "synty_show",
+            ][..]),
+            (McpRole::Investigator, &[
+                "synty_search", "synty_topics", "synty_recent", "synty_status",
+                "synty_show", "synty_trace_list", "synty_trace_show",
+                "synty_trace_search", "synty_trace_compare",
+            ][..]),
+            (McpRole::Validator, &[
+                "synty_search", "synty_status", "synty_show", "synty_trace_list",
+                "synty_trace_show", "synty_trace_search", "synty_trace_compare",
+            ][..]),
+            (McpRole::Operator, &tools[..]),
+        ];
+        for (role, allowed) in matrix {
+            for tool in tools {
+                assert_eq!(role.allows_tool(tool), allowed.contains(&tool), "{role:?} × {tool}");
+            }
+        }
     }
 
     #[test]
@@ -154,5 +253,73 @@ mod tests {
         assert!(scope.allows_event(&event, "sie-internal"));
         event.rollup_dim = "other".into();
         assert!(!scope.allows_event(&event, "sie-internal"));
+    }
+
+    #[test]
+    fn indexed_agent_docs_use_their_capture_source_for_source_scope() {
+        let scope = ReadScope { sources: vec!["harness".into()], ..Default::default() };
+        let meta = Meta {
+            source: "agent".into(),
+            kind: "user_prompt".into(),
+            repo: "synty".into(),
+            author: String::new(),
+            session_id: "s".into(),
+            campaign_id: String::new(),
+            campaign_role: String::new(),
+            backend: "codex".into(),
+            capture_source: "harness".into(),
+            ts: String::new(),
+            number: None,
+            url: None,
+            state: None,
+            labels: vec![],
+            agent_attr: None,
+        };
+        assert!(scope.allows_doc(&meta));
+    }
+
+    #[test]
+    fn every_tool_has_a_policy_for_every_scope_dimension() {
+        let tools = [
+            "synty_search", "synty_related", "synty_topics", "synty_recent",
+            "synty_status", "synty_stats", "synty_tool", "synty_show",
+            "synty_trace_list", "synty_trace_show", "synty_trace_search",
+            "synty_trace_compare",
+        ];
+        let scopes = [
+            ReadScope { repos: vec!["repo".into()], ..Default::default() },
+            ReadScope { campaigns: vec!["campaign".into()], ..Default::default() },
+            ReadScope { roles: vec!["role".into()], ..Default::default() },
+            ReadScope { sources: vec!["source".into()], ..Default::default() },
+        ];
+        for scope in scopes {
+            for tool in tools {
+                let expected = !matches!(tool_scope(tool), Some(ToolScope::Global));
+                assert_eq!(scope.exposes_tool(tool), expected, "{tool} with {scope:?}");
+            }
+        }
+        assert!(!ReadScope::default().exposes_tool("synty_future_tool"));
+    }
+
+    #[test]
+    fn all_record_dimensions_are_conjunctive() {
+        let matching = ("repo", "campaign", "role", "source");
+        let dimensions = [
+            ReadScope { repos: vec![matching.0.into()], ..Default::default() },
+            ReadScope { campaigns: vec![matching.1.into()], ..Default::default() },
+            ReadScope { roles: vec![matching.2.into()], ..Default::default() },
+            ReadScope { sources: vec![matching.3.into()], ..Default::default() },
+        ];
+        for scope in dimensions {
+            assert!(scope.allows_fields(matching.0, matching.1, matching.2, matching.3));
+        }
+        assert!(!ReadScope { repos: vec!["other".into()], ..Default::default() }
+            .allows_fields(matching.0, matching.1, matching.2, matching.3));
+        assert!(!ReadScope { campaigns: vec!["other".into()], ..Default::default() }
+            .allows_fields(matching.0, matching.1, matching.2, matching.3));
+        assert!(!ReadScope { roles: vec!["other".into()], ..Default::default() }
+            .allows_fields(matching.0, matching.1, matching.2, matching.3));
+        assert!(!ReadScope { sources: vec!["other".into()], ..Default::default() }
+            .allows_fields(matching.0, matching.1, matching.2, matching.3));
     }
 }

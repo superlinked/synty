@@ -38,7 +38,10 @@ Rust binary.
   (+ `.sha256`).
   `synty upgrade` self-updates from the latest release (sha256-verified, via the
   GitHub token); a cached nag flags when behind. These are ops, not pipeline
-  steps.
+  steps. The same tag builds Linux amd64 and arm64 on native hosted runners,
+  then publishes a verified multi-architecture manifest to the dedicated
+  private ECR `851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty`; the Helm
+  chart follows `Chart.appVersion`.
 - The encoder loads the model from `$SYNTY_MODEL` (point it at a local dir for
   offline use; it otherwise downloads the default model on first run).
 - The watcher polls local logs every 30 seconds and publishes only new complete

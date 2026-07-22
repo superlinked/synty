@@ -81,7 +81,7 @@ plain files under `~/.synty`, so you can build on it directly:
   (and `events/<stream>/` in a shared bucket).
 - **Documents**: `corpus/docs.jsonl`, one object per line with `meta`
   (`source`, `kind`, `repo`, `author`, `session_id`, `campaign_id`,
-  `campaign_role`, `backend`, `ts`).
+  `campaign_role`, `backend`, `capture_source`, `ts`).
 - **Metadata**: a SQLite database under `index/`, queryable with any SQLite tool.
 
 ```sh
@@ -112,12 +112,24 @@ synty init s3://my-team-synty --capture-since 2026-07-21
 
 # Container / supervisor: skip launchd/systemd; run track --watch yourself
 synty init s3://my-team-synty --capture-since now --no-build --no-autostart
+
+# Upload only named repositories. Repeat --capture-repo as needed.
+synty init s3://my-team-synty --capture-repo api --capture-repo web
+
+# Raw events remain the rebuildable bucket source of truth by default.
+# Redaction before upload is explicit and irreversible for those chunks.
+synty init s3://my-team-synty --upload-redaction standard
 ```
 
 Codex and Claude Code session roots honor `$CODEX_HOME` and `$CLAUDE_CONFIG_DIR`
-when set (otherwise `~/.codex` / `~/.claude`). Upload sync and remote MCP
-responses apply built-in redaction profiles (`standard` / `mcp_safe`); operators
-with raw bucket credentials still see the stored objects.
+when set (otherwise `~/.codex` / `~/.claude`). MCP responses default to the
+`mcp_safe` redaction profile. Upload redaction defaults to `off`, preserving raw
+events as the rebuildable source of truth; opt in with `init
+--upload-redaction standard`. A repository allowlist is enforced before upload
+and during import. Unknown sessions fail closed. Changing upload redaction or
+the repository allowlist after offsets advance requires a new bucket prefix or
+an intentional ledger reset, because already-uploaded chunks are immutable and
+filtered history cannot be backfilled from an advanced cursor.
 
 On a systemd-based EC2 developer VM, enable lingering once so the per-user
 tracker starts at boot without an SSH login, then run `init` normally:
@@ -154,11 +166,40 @@ For S3, scope each writer/reader role to the chosen bucket (or URI prefix):
 `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, and
 `s3:DeleteObject` on its objects. Delete is used only to release the soft build
 lease; event chunks and content-addressed derived objects are immutable.
+An MCP-only workload needs no writes: `deploy/aws/mcp-reader.yaml` creates an
+IRSA role with only bucket location/list and object get permissions. Use it
+with the tracker and builder disabled. If EKS and S3 are in different regions,
+set Helm's `bucketRegion` to the bucket's region so requests are signed for the
+correct endpoint.
 
 > **Heads up:** every member with raw bucket credentials can read every stored
 > object. Mediated MCP clients are narrower: role/tool policy, optional read
 > scope, and response redaction. If neither fit, stay local, or scope the bucket
 > to people who already see each other's work.
+
+For HTTP MCP, use a random token of at least 32 bytes and terminate TLS at an
+Ingress or service mesh. Browser callers also need an exact `--allowed-origin`;
+server-side callers normally send no Origin header. A scope's `sources` values
+name native producers such as `harness`, `codex_cli`, or `github`. Restricted
+scopes omit fleet-wide status/stat/tool surfaces and rebuild topic facets only
+from allowed members. HTTP `synty_related` accepts client-supplied `context`
+and never reads a caller-provided path on the server.
+MCP pulls the published read-model before serving. It then refreshes the model
+and raw events on a background thread, so a large trace history cannot hold the
+semantic-search dispatcher or delay search startup. Raw-derived tools remain
+serialized on their own dispatcher. HTTP work is bounded by separate semantic
+and raw queues, a 120-second response deadline, 32 in-flight connections, and a
+per-client 120-request/minute window; queued work whose client timed out is
+dropped before execution.
+
+The Helm chart under `deploy/helm/synty` defaults to the private image
+`851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty:<appVersion>`. Version
+tags build each architecture on a native GitHub runner, then publish a verified
+`linux/amd64` + `linux/arm64` manifest through GitHub OIDC. Deploy
+`deploy/aws/ecr-publisher.yaml` once and set the repository variable
+`AWS_ECR_PUBLISH_ROLE_ARN` to its role output. The MCP Service is cluster-internal. Its
+default NetworkPolicy accepts same-namespace callers only; configure TLS and
+`mcp.allowedOrigins` at the ingress boundary.
 
 ## How it works
 

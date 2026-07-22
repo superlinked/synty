@@ -1,6 +1,6 @@
 # synty: System Design
 
-**Status:** v0.2.3 (durable fleet rollout) · **Owner:** Daniel Svonava
+**Status:** v0.2.4 (durable fleet rollout) · **Owner:** Daniel Svonava
 
 synty is a passively-collected memory of how work actually happens: it ingests
 coding-agent sessions (Claude Code, Codex, Cowork) and GitHub activity, and makes
@@ -48,7 +48,9 @@ data.
   if the GPU can't init), `accelerate` (macOS CPU BLAS), `mkl` (Linux CPU BLAS).
 - **Index / search:** `next-plaid` (PLAID multi-vector index + MaxSim scoring,
   SQLite metadata store). Filtered search resolves a `column=value` predicate to
-  a doc-id subset via the metadata DB, then runs MaxSim over it.
+  a doc-id subset via the metadata DB, then runs MaxSim over it. Fleet builds
+  inventory shared vectors once, then fetch, encode, and append bounded document
+  batches so a long retention window never holds every token matrix in RAM.
 - **Why late interaction:** one ~128-dim vector per token (not per document)
   means a specific term still carries its own signal instead of being averaged
   into a single pooled vector; that advantage over single-vector embeddings
@@ -169,11 +171,24 @@ runs on CI or a server without a developer machine.
   stdio by default (hand-rolled JSON-RPC): search, related, topics, recent,
   status, stats, tool, show, plus forensic `synty_trace_*` tools. Role/tool
   policy and optional read scope bound mediated clients; responses apply a
-  redaction profile. `--http` (feature `mcp-http`) exposes the same dispatcher
-  as authenticated Streamable HTTP at `/mcp` for remote agents. *Built.*
+  redaction profile. A restricted scope is applied before topics and detail
+  aggregates are built; global health surfaces are unavailable. `sources`
+  names native producers, matching both indexed and trace data. `--http`
+  (feature `mcp-http`) exposes the same dispatcher as authenticated Streamable
+  HTTP at `/mcp` for remote agents. It requires a 32-byte bearer token,
+  validates exact browser origins and protocol versions, bounds requests, and
+  keeps health responsive while tool calls run. It pulls the published query
+  model before serving and continues potentially large raw-event transfers in
+  the background. Raw-history analysis is serialized separately so it cannot
+  block semantic search. Each dispatcher has a bounded queue; HTTP clients have
+  a 120-second response deadline and a per-client 120-request/minute window,
+  while stale queued work is cancelled before execution. Remote related-work
+  queries accept context text rather than server filesystem paths. *Built.*
 - **Harness import:** `synty import` normalizes campaign/Devin NDJSON into
   owned envelope streams with deterministic ids, capture boundaries, and
-  import-time redaction. *Built.*
+  import-time redaction. Identity derives from native ids or canonical event
+  content, independent of input path and line order; concurrent writers lock
+  the owned stream. Dry runs write neither streams nor quarantine files. *Built.*
 - **JSON output:** `--json` on every read command, one versioned envelope
   (`{"v": 1, "kind": …, "data": …}`) so scripts check the format once. *Built.*
 
@@ -218,7 +233,13 @@ until corpus-scale use demonstrates one is needed. *Built.*
   enforced on a client with that access. A separate mediated path exists for
   agents: `synty mcp` (stdio or authenticated HTTP) applies role/tool policy,
   optional read scope, and response redaction; upload sync can also redact
-  before writing team event chunks.
+  before writing team event chunks. Upload redaction is off by default so raw
+  events remain a rebuildable source of truth. Opting in records the profile in
+  the upload ledger and refuses a later profile change after offsets advance.
+  `init --capture-repo` is enforced at upload and import boundaries; a session
+  without an allowed start record is not uploaded. Repository policy is also
+  fixed once offsets advance because immutable chunks cannot be retracted and
+  newly allowed history cannot be recovered from an advanced cursor.
 
 Usage and topic rollups are by work (topic, repo, period); the one per-person
 view is the fleet-coverage roster, which names who runs agents untracked so a
@@ -240,7 +261,9 @@ Containers and process supervisors pass `--no-autostart` and run
 active, and initialization fails visibly if the service manager does not load
 the watcher. `--capture-since` persists an absolute event boundary and
 `--upload-interval` sets the network batching cadence. Optional `--campaign` /
-`--role` persist campaign stamps used by later track/import runs. A systemd
+`--role` persist campaign stamps used by later track/import runs.
+`--capture-repo`, `--upload-redaction`, and `--mcp-redaction` persist the
+corresponding privacy policy. A systemd
 user service starts at boot on a headless developer VM when the administrator
 enables lingering for that user (`loginctl enable-linger`).
 The state shows on `status` and the TUI footer (`◐ local`, accent → `✓
@@ -308,6 +331,15 @@ and restarts the tracker; each machine gets the fastest build for its platform
 choosing. A passive, cached nag (`status`, footer, `up`) flags when a machine is
 behind; the install one-liner bootstraps from the same public release asset (or
 `gh` for a private repo).
+
+The container image is a separate release artifact. Tag builds publish a
+`linux/amd64` + `linux/arm64` manifest to
+`851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty:<version>` as an immutable tag
+through a GitHub OIDC role. Each architecture builds on a native hosted runner;
+the release verifies both platforms after composing the index. The Helm chart
+follows `Chart.appVersion`, runs each container as UID 10001 with a read-only
+root filesystem, and exposes MCP only as a cluster Service. TLS belongs at the
+Ingress or service-mesh boundary.
 
 ## Data compatibility
 

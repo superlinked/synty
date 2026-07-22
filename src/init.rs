@@ -12,17 +12,36 @@
 use crate::{bucket, config, github, identity, track, up};
 use anyhow::{Context, Result};
 
-pub fn run(
-    bucket: Option<String>,
-    aws_profile: Option<String>,
-    capture_since: Option<String>,
-    upload_interval: Option<u64>,
-    campaign: Option<String>,
-    role: Option<String>,
-    machine: &str,
-    no_build: bool,
-    no_autostart: bool,
-) -> Result<()> {
+pub struct Opts {
+    pub bucket: Option<String>,
+    pub aws_profile: Option<String>,
+    pub capture_since: Option<String>,
+    pub upload_interval: Option<u64>,
+    pub capture_repos: Vec<String>,
+    pub upload_redaction: Option<String>,
+    pub mcp_redaction: Option<String>,
+    pub campaign: Option<String>,
+    pub role: Option<String>,
+    pub machine: String,
+    pub no_build: bool,
+    pub no_autostart: bool,
+}
+
+pub fn run(opts: Opts) -> Result<()> {
+    let Opts {
+        bucket,
+        aws_profile,
+        capture_since,
+        upload_interval,
+        capture_repos,
+        upload_redaction,
+        mcp_redaction,
+        campaign,
+        role,
+        machine,
+        no_build,
+        no_autostart,
+    } = opts;
     let mut cfg = config::load();
 
     // 1. Bucket: setting it is the local→bucket switch; absent → stay local
@@ -38,6 +57,15 @@ pub fn run(
     }
     if let Some(secs) = upload_interval {
         cfg.upload_interval_secs = Some(secs.max(1));
+    }
+    if !capture_repos.is_empty() {
+        cfg.capture_repos = capture_repos;
+    }
+    if let Some(profile) = upload_redaction {
+        cfg.upload_redaction = Some(profile.parse::<crate::redact::Profile>()?.as_str().into());
+    }
+    if let Some(profile) = mcp_redaction {
+        cfg.mcp_redaction = Some(profile.parse::<crate::redact::Profile>()?.as_str().into());
     }
     if let Some(campaign) = campaign.filter(|value| !value.is_empty()) {
         cfg.campaign_id = Some(campaign);
@@ -70,7 +98,7 @@ pub fn run(
     // cannot list/read/write the bucket. The config stays saved so the error is fixable
     // in place by re-running init.
     if let Some(b) = &cfg.bucket {
-        verify_bucket_access(b, machine).with_context(|| format!("verify team bucket {b}"))?;
+        verify_bucket_access(b, &machine).with_context(|| format!("verify team bucket {b}"))?;
         eprintln!("init: verified read/write access to {b}");
     }
 
@@ -78,7 +106,7 @@ pub fn run(
     //    long-lived watcher exists, so two processes never race the cursor or
     //    upload ledgers during initialization.
     if !no_build {
-        up::build(&config::resolve_bucket(bucket), machine, 1.0, false)?;
+        up::build(&config::resolve_bucket(bucket), &machine, 1.0, false)?;
     }
 
     // 4. Track at login after the initial one-shot has completed. Containers

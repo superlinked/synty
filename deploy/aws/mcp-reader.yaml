@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Read-only Synty bucket role for one EKS MCP service account
+
+Parameters:
+  BucketName:
+    Type: String
+  EksOidcProviderArn:
+    Type: String
+  EksOidcIssuer:
+    Type: String
+    Description: OIDC issuer without https://
+  KubernetesNamespace:
+    Type: String
+    Default: synty
+  KubernetesServiceAccount:
+    Type: String
+    Default: synty-mcp-reader
+  RoleName:
+    Type: String
+    Default: synty-mcp-reader
+
+Resources:
+  ReaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Read-only access from the Synty MCP gateway to its team bucket
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - >-
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Principal":{"Federated":"${ProviderArn}"},
+            "Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{
+            "${Issuer}:aud":"sts.amazonaws.com",
+            "${Issuer}:sub":"system:serviceaccount:${Namespace}:${ServiceAccount}"}}}]}
+          - ProviderArn: !Ref EksOidcProviderArn
+            Issuer: !Ref EksOidcIssuer
+            Namespace: !Ref KubernetesNamespace
+            ServiceAccount: !Ref KubernetesServiceAccount
+      Policies:
+        - PolicyName: read-synty-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/*
+
+Outputs:
+  ReaderRoleArn:
+    Value: !GetAtt ReaderRole.Arn

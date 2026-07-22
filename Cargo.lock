@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "synty"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3997,6 +3997,7 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "clap",
+ "fs2",
  "futures",
  "half",
  "libc",

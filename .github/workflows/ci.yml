@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo test --locked --features s3,gcs,mcp-http
+      - name: Exercise the HTTP MCP listener
+        run: |
+          cargo build --locked --features s3,gcs,mcp-http
+          scripts/mcp-http-smoke.sh target/debug/synty
+      - run: git diff --check
+
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint and render defaults
+        run: |
+          helm lint deploy/helm/synty --set bucket=s3://example/synty
+          helm template synty deploy/helm/synty --set bucket=s3://example/synty >/tmp/synty.yaml
+      - name: Render every optional branch
+        run: >-
+          helm template synty deploy/helm/synty
+          --set bucket=s3://example/synty
+          --set bucketRegion=us-west-2
+          --set awsProfile=workload
+          --set tracker.campaign=campaign-1
+          --set tracker.role=primary
+          --set mcp.allowedOrigins[0]=https://memory.example.com
+          --set persistence.enabled=false >/tmp/synty-options.yaml
+      - name: Build the shipped image
+        run: |
+          docker build -t synty-ci .
+          docker run --rm synty-ci --version
+          docker run --rm synty-ci mcp --help

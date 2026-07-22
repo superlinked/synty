@@ -473,6 +473,7 @@ mod tests {
                 campaign_id: String::new(),
                 campaign_role: String::new(),
                 backend: String::new(),
+                capture_source: String::new(),
                 ts: ts.into(),
                 number: None,
                 url: None,

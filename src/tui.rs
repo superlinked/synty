@@ -1999,6 +1999,7 @@ mod tests {
                 campaign_id: String::new(),
                 campaign_role: String::new(),
                 backend: String::new(),
+                capture_source: String::new(),
                 ts: "2026-05-31T10:00:00Z".into(),
                 number: Some(7),
                 url: None,
@@ -2035,12 +2036,14 @@ mod tests {
             tool_err: 1,
             by_model: vec![units::ModelUsage { model: "claude-fable-5".into(), tok_in: 4_200, tok_out: 18_900, cache_read: 310_000, cache_create: 12_000, turns: 7 }],
             source: "claude_code".into(),
+            campaign_id: String::new(),
+            campaign_role: String::new(),
             summary: Some("Added an OCR adapter to the sie pipeline.".into()),
             author: String::new(),
         };
         let work = vec![
-            Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), rank: i64::MAX, dup: false, struggle: 0.6, author: String::new(), doc_id: None, session_id: Some("S1".into()) },
-            Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), summary: None, topic: Some(0), rank: i64::MAX, dup: false, struggle: 0.0, author: "alice".into(), doc_id: Some(0), session_id: None },
+            Unit { kind: Kind::Session, when: "2026-05-31".into(), repo: "sie".into(), title: "add OCR adapter".into(), outcome: "1 files".into(), summary: Some("Added an OCR adapter to the sie pipeline.".into()), topic: Some(0), rank: i64::MAX, dup: false, struggle: 0.6, author: String::new(), doc_id: None, session_id: Some("S1".into()), campaign_id: String::new(), campaign_role: String::new(), source: "claude_code".into() },
+            Unit { kind: Kind::Pr, when: "2026-05-31".into(), repo: "sie-web".into(), title: "sie-web#7 fix docs search".into(), outcome: "OPEN".into(), summary: None, topic: Some(0), rank: i64::MAX, dup: false, struggle: 0.0, author: "alice".into(), doc_id: Some(0), session_id: None, campaign_id: String::new(), campaign_role: String::new(), source: "github".into() },
         ];
         let topics = vec![TopicUnits { id: 0, cache_key: "t0".into(), label: "ocr, docs".into(), units: work.iter().map(clone_unit).collect(), last_active: "2026-05-31".into(), activity: vec![1, 0, 2, 3], mix: (1, 5, 3), repos: vec!["sie".into(), "sie-web".into()], authors: vec!["alice".into()], summary: Some("OCR adapter work across the sie pipeline and docs search.".into()), name: Some("OCR & Document Extraction".into()), span: Some(("2026-05-29".into(), "2026-05-31".into())) }];
         App {
@@ -2087,14 +2090,14 @@ mod tests {
     }
 
     fn clone_unit(u: &Unit) -> Unit {
-        Unit { kind: u.kind, when: u.when.clone(), repo: u.repo.clone(), title: u.title.clone(), outcome: u.outcome.clone(), summary: u.summary.clone(), topic: u.topic, rank: u.rank, dup: u.dup, struggle: u.struggle, author: u.author.clone(), doc_id: u.doc_id, session_id: u.session_id.clone() }
+        Unit { kind: u.kind, when: u.when.clone(), repo: u.repo.clone(), title: u.title.clone(), outcome: u.outcome.clone(), summary: u.summary.clone(), topic: u.topic, rank: u.rank, dup: u.dup, struggle: u.struggle, author: u.author.clone(), doc_id: u.doc_id, session_id: u.session_id.clone(), campaign_id: u.campaign_id.clone(), campaign_role: u.campaign_role.clone(), source: u.source.clone() }
     }
 
     // app() plus a second, unrelated topic and its work unit, so filters have
     // something to narrow against (infra/bob vs the fixture's sie/alice).
     fn app2() -> App {
         let mut a = app();
-        let infra = Unit { kind: Kind::Pr, when: "2026-05-30".into(), repo: "infra".into(), title: "infra#3 terraform runner".into(), outcome: "MERGED".into(), summary: Some("Terraform runner IAM work.".into()), topic: Some(1), rank: i64::MAX, dup: false, struggle: 0.0, author: "bob".into(), doc_id: None, session_id: None };
+        let infra = Unit { kind: Kind::Pr, when: "2026-05-30".into(), repo: "infra".into(), title: "infra#3 terraform runner".into(), outcome: "MERGED".into(), summary: Some("Terraform runner IAM work.".into()), topic: Some(1), rank: i64::MAX, dup: false, struggle: 0.0, author: "bob".into(), doc_id: None, session_id: None, campaign_id: String::new(), campaign_role: String::new(), source: "github".into() };
         a.work.push(clone_unit(&infra));
         a.topics.push(TopicUnits {
             id: 1,

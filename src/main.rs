@@ -77,12 +77,16 @@ pub struct Meta {
     pub author: String,
     #[serde(default)]
     pub session_id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub campaign_id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub campaign_role: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub backend: String,
+    /// Native envelope producer for agent docs (`harness`, `codex_cli`, ...).
+    /// GitHub docs leave this empty and use `source` directly.
+    #[serde(default)]
+    pub capture_source: String,
     #[serde(default)]
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,12 +145,42 @@ pub fn short(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
-/// Write via a sibling tmp file + rename: readers never see a half-written
-/// read-model, and concurrent writers can't interleave (last full write wins).
+/// Reserve a process-safe sibling temporary file. Kubernetes containers often
+/// share PID 1 while mounting the same volume, so the PID alone is not a unique
+/// name during a rolling handoff.
+pub(crate) fn write_unique_temp(path: &std::path::Path, data: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    loop {
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_file_name(format!("{name}.tmp.{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(data) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(error.into());
+                }
+                return Ok(tmp);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Write via a uniquely reserved sibling tmp file + rename: readers never see
+/// a half-written read-model, and concurrent writers cannot steal one another's
+/// temporary file (last full write wins).
 pub fn write_atomic(path: &str, data: &[u8]) -> Result<()> {
-    let tmp = format!("{path}.tmp.{}", std::process::id());
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
+    let path = std::path::Path::new(path);
+    let tmp = write_unique_temp(path, data)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -320,6 +354,16 @@ enum Cmd {
         /// Seconds between batched event uploads.
         #[arg(long)]
         upload_interval: Option<u64>,
+        /// Repository eligible for team upload/import (repeatable).
+        #[arg(long = "capture-repo")]
+        capture_repos: Vec<String>,
+        /// Team-upload redaction: off, standard, or mcp_safe. Off preserves
+        /// raw events as the rebuildable source of truth.
+        #[arg(long)]
+        upload_redaction: Option<String>,
+        /// Default MCP response redaction: off, standard, or mcp_safe.
+        #[arg(long)]
+        mcp_redaction: Option<String>,
         /// Campaign id stamped into rollup_dim and session metadata.
         #[arg(long)]
         campaign: Option<String>,
@@ -352,6 +396,10 @@ enum Cmd {
     /// Read-only MCP server. Stdio is the local default; --http enables an
     /// authenticated Streamable HTTP endpoint for remote agents.
     Mcp {
+        /// Bucket to pull before serving. Explicit container deployments need
+        /// not mutate shared configuration during startup.
+        #[arg(long)]
+        bucket: Option<String>,
         /// Serve HTTP at /mcp instead of stdio.
         #[arg(long)]
         http: bool,
@@ -364,6 +412,10 @@ enum Cmd {
         /// Permit a non-loopback bind. Put the endpoint behind TLS.
         #[arg(long)]
         listen_public: bool,
+        /// Exact browser Origin allowed to call HTTP MCP (repeatable). Clients
+        /// without an Origin header, such as server-side agents, are allowed.
+        #[arg(long = "allowed-origin")]
+        allowed_origins: Vec<String>,
         /// Tool policy: operator (all), primary, investigator, or validator.
         #[arg(long, default_value = "operator")]
         role: String,
@@ -852,33 +904,44 @@ fn main() -> Result<()> {
             aws_profile,
             capture_since,
             upload_interval,
+            capture_repos,
+            upload_redaction,
+            mcp_redaction,
             campaign,
             role,
             machine,
             no_build,
             no_autostart,
-        } => init::run(
+        } => init::run(init::Opts {
             bucket,
             aws_profile,
             capture_since,
             upload_interval,
+            capture_repos,
+            upload_redaction,
+            mcp_redaction,
             campaign,
             role,
-            &machine,
+            machine,
             no_build,
             no_autostart,
-        )?,
+        })?,
         Cmd::Tui { bucket } => tui::run(model_id(), config::resolve_bucket(bucket))?,
         Cmd::Mcp {
+            bucket,
             http,
             bind,
             token,
             listen_public,
+            allowed_origins,
             role,
             scope,
             redaction,
         } => {
-            pull_configured_for_read();
+            let bucket = config::resolve_bucket_opt(bucket);
+            if let Some(bucket) = &bucket {
+                sync::pull_read_model_for_read(bucket);
+            }
             policy::validate_scope_path(scope.as_deref())?;
             let scope = policy::ReadScope::load(scope.as_deref())?;
             let role = role.parse()?;
@@ -890,9 +953,19 @@ fn main() -> Result<()> {
                 let token = token
                     .or_else(|| std::env::var("SYNTY_MCP_TOKEN").ok())
                     .unwrap_or_default();
-                mcp_http::run(model_id(), &bind, &token, listen_public, role, scope, redaction)?
+                mcp_http::run(mcp_http::Opts {
+                    model_id: model_id(),
+                    bind,
+                    token,
+                    listen_public,
+                    role,
+                    scope,
+                    redaction,
+                    allowed_origins,
+                    bucket,
+                })?
             } else {
-                mcp::run(model_id(), role, scope, redaction)?
+                mcp::run(model_id(), role, scope, redaction, bucket)?
             }
         }
         Cmd::Summarize {
@@ -1035,6 +1108,12 @@ mod tests {
             "2026-07-21",
             "--upload-interval",
             "120",
+            "--capture-repo",
+            "synty",
+            "--upload-redaction",
+            "off",
+            "--mcp-redaction",
+            "mcp_safe",
             "--campaign",
             "camp-1",
             "--role",
@@ -1048,11 +1127,15 @@ mod tests {
                 aws_profile: Some(p),
                 capture_since: Some(s),
                 upload_interval: Some(120),
+                capture_repos,
+                upload_redaction: Some(u),
+                mcp_redaction: Some(m),
                 campaign: Some(c),
                 role: Some(r),
                 no_autostart: true,
                 ..
-            } if p == "synty-writer" && s == "2026-07-21" && c == "camp-1" && r == "primary"
+            } if p == "synty-writer" && s == "2026-07-21" && capture_repos == ["synty"]
+                && u == "off" && m == "mcp_safe" && c == "camp-1" && r == "primary"
         ));
     }
 
@@ -1061,6 +1144,8 @@ mod tests {
         let cli = Cli::try_parse_from([
             "synty",
             "mcp",
+            "--bucket",
+            "s3://team",
             "--http",
             "--bind",
             "127.0.0.1:9000",
@@ -1072,23 +1157,28 @@ mod tests {
             "scope.json",
             "--redaction",
             "mcp_safe",
+            "--allowed-origin",
+            "https://memory.example.com",
         ])
         .expect("mcp http settings parse");
         assert!(matches!(
             cli.cmd,
             Cmd::Mcp {
+                bucket: Some(b),
                 http: true,
                 bind,
                 token: Some(t),
                 role,
                 scope: Some(s),
                 redaction: Some(r),
+                allowed_origins,
                 ..
-            } if bind == "127.0.0.1:9000"
+            } if b == "s3://team" && bind == "127.0.0.1:9000"
                 && t == "secret"
                 && role == "investigator"
                 && s == "scope.json"
                 && r == "mcp_safe"
+                && allowed_origins == ["https://memory.example.com"]
         ));
     }
 
@@ -1200,5 +1290,28 @@ mod tests {
     fn excerpt_collapses_whitespace_and_caps() {
         assert_eq!(excerpt("a  b\n c", 100), "a b c");
         assert_eq!(excerpt("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_publish_only_complete_values() {
+        let root = std::env::temp_dir().join(format!("synty-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("shared.json");
+        let values: Vec<Vec<u8>> = (0..32).map(|i| vec![b'a' + i; 64 * 1024]).collect();
+        std::thread::scope(|scope| {
+            for value in &values {
+                let path = &path;
+                scope.spawn(move || crate::write_atomic(&path.to_string_lossy(), value).unwrap());
+            }
+        });
+        let published = std::fs::read(&path).unwrap();
+        assert!(values.contains(&published), "a writer exposed mixed or partial bytes");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "successful writers leave no temporary siblings"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

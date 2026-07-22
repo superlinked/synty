@@ -1,11 +1,17 @@
 image:
-  repository: ghcr.io/superlinked/synty
-  tag: "0.2.3"
+  repository: 851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty
+  # Empty follows Chart.appVersion. Release tags publish this version to ECR.
+  tag: ""
   pullPolicy: IfNotPresent
 
 bucket: ""
+# Set when the bucket is outside the workload's AWS region. The S3 signer must
+# use the bucket region; EKS otherwise injects its own region into the pod.
+bucketRegion: ""
 captureSince: now
 uploadInterval: 60
+uploadRedaction: "off"
+captureRepos: []
 machine: k8s
 awsProfile: ""
 
@@ -13,6 +19,17 @@ serviceAccount:
   create: true
   name: ""
   annotations: {}
+
+podSecurityContext:
+  fsGroup: 10001
+  seccompProfile: { type: RuntimeDefault }
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: { drop: [ALL] }
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
 
 persistence:
   enabled: true
@@ -50,7 +67,10 @@ mcp:
   port: 8765
   role: investigator
   existingSecret: synty-mcp
+  # The selected key must contain a random bearer token of at least 32 bytes.
   tokenKey: token
+  # Exact browser origins. Server-side clients normally omit Origin.
+  allowedOrigins: []
   scope:
     repos: []
     campaigns: []
@@ -62,3 +82,6 @@ mcp:
 
 networkPolicy:
   enabled: true
+  # By default only pods in this namespace can reach MCP.
+  ingressFrom:
+    - podSelector: {}

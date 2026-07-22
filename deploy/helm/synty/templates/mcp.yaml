@@ -5,6 +5,13 @@ metadata:
   name: {{ include "synty.fullname" . }}-mcp
 spec:
   replicas: 1
+  # The single replica mounts a ReadWriteOnce cache. Never surge a replacement
+  # until the old pod releases the claim, including when scheduling moves nodes.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "synty.name" . }}
@@ -17,55 +24,68 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: mcp
     spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       serviceAccountName: {{ include "synty.serviceAccountName" . }}
       containers:
         - name: mcp
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "synty.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           command: ["/bin/sh", "-ec"]
           args:
             - |
-              synty init "$SYNTY_BUCKET" --machine "$SYNTY_MACHINE" \
-                --no-build --no-autostart \
-                {{- if .Values.awsProfile }} --aws-profile "$SYNTY_AWS_PROFILE"{{- end }}
-              exec synty mcp --http --listen-public \
-                --bind "0.0.0.0:{{ .Values.mcp.port }}" \
-                --token "$SYNTY_MCP_TOKEN" \
-                --role "$SYNTY_MCP_ROLE" \
-                --scope /etc/synty/scope.json \
-                --redaction mcp_safe
+              set -- synty mcp --bucket "$SYNTY_BUCKET" --http --listen-public --bind "0.0.0.0:{{ .Values.mcp.port }}" --role "$SYNTY_MCP_ROLE" --scope /etc/synty/scope.json --redaction mcp_safe
+              {{- range .Values.mcp.allowedOrigins }}
+              set -- "$@" --allowed-origin {{ . | quote }}
+              {{- end }}
+              exec "$@"
           env:
             - { name: SYNTY_HOME, value: /var/synty }
             - { name: SYNTY_BUCKET, value: {{ required "bucket is required" .Values.bucket | quote }} }
-            - { name: SYNTY_MACHINE, value: {{ printf "%s-mcp" .Values.machine | quote }} }
             - { name: SYNTY_MCP_ROLE, value: {{ .Values.mcp.role | quote }} }
+            {{- if .Values.bucketRegion }}
+            - { name: AWS_REGION, value: {{ .Values.bucketRegion | quote }} }
+            - { name: AWS_DEFAULT_REGION, value: {{ .Values.bucketRegion | quote }} }
+            {{- end }}
             - name: SYNTY_MCP_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ required "mcp.existingSecret is required" .Values.mcp.existingSecret }}
                   key: {{ .Values.mcp.tokenKey }}
             {{- if .Values.awsProfile }}
-            - { name: SYNTY_AWS_PROFILE, value: {{ .Values.awsProfile | quote }} }
+            - { name: AWS_PROFILE, value: {{ .Values.awsProfile | quote }} }
             {{- end }}
           ports:
             - { name: mcp, containerPort: {{ .Values.mcp.port }} }
           volumeMounts:
             - { name: synty-home, mountPath: /var/synty }
+            - { name: tmp, mountPath: /tmp }
             - { name: scope, mountPath: /etc/synty, readOnly: true }
+          # Startup includes a read-only pull of the published query model; raw
+          # trace chunks continue in the background after the service is ready.
+          startupProbe:
+            httpGet: { path: /health, port: mcp }
+            periodSeconds: 10
+            failureThreshold: 120
           livenessProbe:
             httpGet: { path: /health, port: mcp }
-            initialDelaySeconds: 10
             periodSeconds: 30
           readinessProbe:
             httpGet: { path: /health, port: mcp }
-            initialDelaySeconds: 5
             periodSeconds: 10
           resources:
             {{- toYaml .Values.mcp.resources | nindent 12 }}
       volumes:
+        - { name: tmp, emptyDir: {} }
         - name: synty-home
+          {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "synty.claimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
         - name: scope
           configMap:
             name: {{ include "synty.fullname" . }}
@@ -95,7 +115,9 @@ spec:
       app.kubernetes.io/component: mcp
   policyTypes: [Ingress, Egress]
   ingress:
-    - ports:
+    - from:
+        {{- toYaml .Values.networkPolicy.ingressFrom | nindent 8 }}
+      ports:
         - { protocol: TCP, port: {{ .Values.mcp.port }} }
   egress:
     - {}

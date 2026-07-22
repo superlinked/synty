@@ -1,0 +1,35 @@
+# Internal read-only MCP deployment. The tracker and builder are deliberately
+# separate writers and remain disabled in this release.
+bucket: s3://superlinked-synty-851725219920-us-west-2
+bucketRegion: us-west-2
+
+serviceAccount:
+  name: synty-mcp-reader
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::851725219920:role/synty-mcp-reader-sie-gw-cfg
+
+persistence:
+  accessModes: [ReadWriteOnce]
+  size: 20Gi
+
+tracker:
+  enabled: false
+
+builder:
+  enabled: false
+
+mcp:
+  role: operator
+  # Empty allowlists deliberately expose all internal bucket records. The MCP
+  # surface remains read-only and applies mcp_safe response redaction.
+  scope:
+    repos: []
+    campaigns: []
+    roles: []
+    sources: []
+
+networkPolicy:
+  enabled: true
+  # ClusterIP + bearer authentication remain in force; any namespace may call.
+  ingressFrom:
+    - namespaceSelector: {}

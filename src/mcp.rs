@@ -11,13 +11,19 @@ use next_plaid::{MmapIndex, SearchParameters};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
+pub(crate) const PROTOCOL_VERSION: &str = "2025-11-25";
+pub(crate) const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &[PROTOCOL_VERSION, "2025-06-18", "2025-03-26"];
+
 pub fn run(
     model_id: String,
     role: crate::policy::McpRole,
     scope: crate::policy::ReadScope,
     redaction: crate::redact::Profile,
+    bucket: Option<String>,
 ) -> Result<()> {
-    let mut srv = Server::new(model_id, role, scope, redaction);
+    start_bucket_refresh(bucket.clone());
+    let mut srv = Server::new(model_id, role, scope, redaction, true, bucket);
     eprintln!("synty mcp: serving tools over stdio");
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -40,6 +46,7 @@ pub(crate) struct Server {
     role: crate::policy::McpRole,
     scope: crate::policy::ReadScope,
     redaction: crate::redact::Profile,
+    allow_repo_paths: bool,
     /// The build the engine serves + encoder + index — loaded on the first
     /// search call, kept warm, reopened when the pointer moves.
     engine: Option<(readmodel::Current, Encoder, MmapIndex)>,
@@ -51,8 +58,17 @@ impl Server {
         role: crate::policy::McpRole,
         scope: crate::policy::ReadScope,
         redaction: crate::redact::Profile,
+        allow_repo_paths: bool,
+        _bucket: Option<String>,
     ) -> Self {
-        Self { model_id, role, scope, redaction, engine: None }
+        Self {
+            model_id,
+            role,
+            scope,
+            redaction,
+            allow_repo_paths,
+            engine: None,
+        }
     }
 
     /// One JSON-RPC message → one response, or None for notifications.
@@ -64,12 +80,12 @@ impl Server {
         let method = req["method"].as_str().unwrap_or("");
         let result = match method {
             "initialize" => Ok(json!({
-                "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-03-26"),
+                "protocolVersion": negotiate_protocol(req["params"]["protocolVersion"].as_str()),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "synty", "version": env!("CARGO_PKG_VERSION")},
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_defs(self.role)})),
+            "tools/list" => Ok(json!({"tools": tool_defs(self.role, &self.scope, self.allow_repo_paths)})),
             "tools/call" => self.call(&req["params"]),
             other => Err(format!("method not found: {other}")),
         };
@@ -84,10 +100,13 @@ impl Server {
     fn call(&mut self, p: &Value) -> std::result::Result<Value, String> {
         let name = p["name"].as_str().unwrap_or("");
         let a = &p["arguments"];
+        if crate::policy::tool_scope(name).is_none() {
+            return Err(format!("unknown tool: {name}"));
+        }
         if !self.role.allows_tool(name) {
             return Err(format!("tool not allowed for {:?} role: {name}", self.role));
         }
-        if self.scope.restricted() && matches!(name, "synty_stats" | "synty_tool") {
+        if !self.scope.exposes_tool(name) {
             return Err(format!("tool unavailable with a restricted read scope: {name}"));
         }
         let out = match name {
@@ -96,7 +115,7 @@ impl Server {
             "synty_topics" => topics_text(a, &self.scope),
             "synty_recent" => recent_text(a, &self.scope),
             "synty_status" => view::status().map(|s| view::status_md(&s)),
-            "synty_stats" => view::stats(a["weeks"].as_u64().unwrap_or(4) as usize).map(|s| view::stats_md(&s)),
+            "synty_stats" => view::stats(bounded_positive(a, "weeks", 4, 52)).map(|s| view::stats_md(&s)),
             "synty_tool" => {
                 let name = a["name"].as_str().unwrap_or("");
                 if name.is_empty() {
@@ -129,7 +148,7 @@ impl Server {
                         string_arg(a, "since"),
                         a["min_ms"].as_u64(),
                         a["sort"].as_str().unwrap_or("recent"),
-                        a["limit"].as_u64().unwrap_or(20) as usize,
+                        bounded_positive(a, "limit", 20, 100),
                         false,
                         Some(&self.scope),
                     )
@@ -142,8 +161,8 @@ impl Server {
                 } else {
                     trace::show_text(
                         id,
-                        a["before"].as_u64().unwrap_or(6) as usize,
-                        a["after"].as_u64().unwrap_or(12) as usize,
+                        bounded(a, "before", 6, 100),
+                        bounded(a, "after", 12, 100),
                         false,
                         Some(&self.scope),
                     )
@@ -153,6 +172,8 @@ impl Server {
                 let query = a["query"].as_str().unwrap_or("");
                 if query.is_empty() {
                     Err(anyhow::anyhow!("query is required"))
+                } else if query.chars().count() > 4096 {
+                    Err(anyhow::anyhow!("query exceeds 4096 characters"))
                 } else {
                     trace::search_text(
                         query,
@@ -160,7 +181,7 @@ impl Server {
                         string_arg(a, "machine"),
                         string_arg(a, "source"),
                         string_arg(a, "kind"),
-                        a["limit"].as_u64().unwrap_or(20) as usize,
+                        bounded_positive(a, "limit", 20, 100),
                         false,
                         Some(&self.scope),
                     )
@@ -196,26 +217,33 @@ impl Server {
     fn search(&mut self, a: &Value) -> Result<String> {
         let query = a["query"].as_str().unwrap_or("");
         anyhow::ensure!(!query.is_empty(), "query is required");
-        let k = a["k"].as_u64().unwrap_or(5) as usize;
+        anyhow::ensure!(query.chars().count() <= 4096, "query exceeds 4096 characters");
+        let k = bounded_positive(a, "k", 5, 100);
         let filter = a["filter"].as_str().filter(|f| !f.is_empty());
         self.search_query(query, k, filter)
     }
 
-    /// `synty_related`: derive the query from a git repo (the `repo` path, or the
-    /// server's cwd) and search cross-repo. The agent knows its own working
-    /// directory; passing it lets the daemon find prior work for that task.
+    /// `synty_related`: local stdio clients may derive context from a repo;
+    /// remote clients must send context text and cannot make the server read an
+    /// arbitrary filesystem path.
     fn related(&mut self, a: &Value) -> Result<String> {
-        let cwd = match a["repo"].as_str().filter(|r| !r.is_empty()) {
-            Some(r) => std::path::PathBuf::from(r),
-            None => std::env::current_dir()?,
+        let query = if let Some(context) = a["context"].as_str().filter(|value| !value.is_empty()) {
+            anyhow::ensure!(context.chars().count() <= 4096, "context exceeds 4096 characters");
+            context.to_string()
+        } else {
+            anyhow::ensure!(self.allow_repo_paths, "remote synty_related requires `context`; repo paths are disabled over HTTP");
+            let cwd = match a["repo"].as_str().filter(|r| !r.is_empty()) {
+                Some(r) => std::path::PathBuf::from(r),
+                None => std::env::current_dir()?,
+            };
+            crate::related::context_query(&cwd).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no git context at {} — pass `repo` as the path to a git repo you're working in, or use synty_search",
+                    cwd.display()
+                )
+            })?
         };
-        let query = crate::related::context_query(&cwd).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no git context at {} — pass `repo` as the path to a git repo you're working in, or use synty_search",
-                cwd.display()
-            )
-        })?;
-        let k = a["k"].as_u64().unwrap_or(5) as usize;
+        let k = bounded_positive(a, "k", 5, 100);
         self.search_query(&query, k, None)
     }
 
@@ -247,22 +275,40 @@ impl Server {
     }
 }
 
+/// Keep the read model and raw trace snapshot fresh without holding the MCP
+/// dispatcher lock. The initial read-model pull happens in `main`; this thread
+/// immediately starts the potentially long raw-history transfer and then
+/// repeats incremental checks.
+pub(crate) fn start_bucket_refresh(bucket: Option<String>) {
+    let Some(bucket) = bucket else { return };
+    std::thread::spawn(move || loop {
+        crate::sync::pull_for_read(&bucket);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+}
+
 fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args[key].as_str().filter(|value| !value.is_empty())
 }
 
+fn bounded(args: &Value, key: &str, default: usize, max: usize) -> usize {
+    args[key].as_u64().unwrap_or(default as u64).min(max as u64) as usize
+}
+
+fn bounded_positive(args: &Value, key: &str, default: usize, max: usize) -> usize {
+    bounded(args, key, default, max).max(1)
+}
+
+fn negotiate_protocol(requested: Option<&str>) -> &str {
+    requested
+        .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+        .unwrap_or(PROTOCOL_VERSION)
+}
+
 fn topics_text(a: &Value, scope: &crate::policy::ReadScope) -> Result<String> {
-    let mut topics = units::topic_units(12)?;
-    if scope.restricted() {
-        topics = topics
-            .into_iter()
-            .filter_map(|mut topic| {
-                topic.units.retain(|unit| scope.allows_repo(&unit.repo));
-                (!topic.units.is_empty()).then_some(topic)
-            })
-            .collect();
-    }
+    let mut topics = units::topic_units_scoped(12, scope)?;
     if let Some(q) = a["query"].as_str().filter(|q| !q.is_empty()) {
+        anyhow::ensure!(q.chars().count() <= 4096, "query exceeds 4096 characters");
         let ql = q.to_lowercase();
         topics.retain(|t| {
             t.label.to_lowercase().contains(&ql)
@@ -274,39 +320,40 @@ fn topics_text(a: &Value, scope: &crate::policy::ReadScope) -> Result<String> {
 
 fn recent_text(a: &Value, scope: &crate::policy::ReadScope) -> Result<String> {
     let mut us = units::units()?;
-    us.retain(|unit| scope.allows_repo(&unit.repo));
+    us.retain(|unit| scope.allows_unit(unit));
     if let Some(r) = a["repo"].as_str().filter(|r| !r.is_empty()) {
         us.retain(|u| u.repo == r);
     }
-    us.truncate(a["limit"].as_u64().unwrap_or(20) as usize);
+    us.truncate(bounded_positive(a, "limit", 20, 100));
     Ok(view::work_md(&us))
 }
 
-fn tool_defs(role: crate::policy::McpRole) -> Value {
+fn tool_defs(role: crate::policy::McpRole, scope: &crate::policy::ReadScope, allow_repo_paths: bool) -> Value {
     let obj = |props: Value, required: Value| json!({"type": "object", "properties": props, "required": required});
-    let all = json!([
+    let mut all = json!([
         {
             "name": "synty_search",
             "description": "Semantic search over this machine's coding-agent sessions and GitHub activity (PRs, issues, prompts). Use before starting work to find prior attempts, decisions, and related PRs. Ids in the output ([a1b2c3d4], repo#123) feed synty_show.",
             "inputSchema": obj(json!({
-                "query": {"type": "string", "description": "What to look for, in natural language"},
-                "k": {"type": "integer", "description": "Number of results (default 5)"},
+                "query": {"type": "string", "maxLength": 4096, "description": "What to look for, in natural language"},
+                "k": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results (default 5)"},
                 "filter": {"type": "string", "description": "Optional metadata filter, column=value (e.g. repo=sie-web, kind=pull_request, source=agent)"}
             }), json!(["query"])),
         },
         {
             "name": "synty_related",
-            "description": "Prior work related to what you're doing now, with NO query: synty derives one from the repo's recent commits and changed files, then searches every repo the fleet has seen. Call at the start of a task to find earlier attempts, decisions, and related PRs. Ids in the output feed synty_show.",
+            "description": "Prior work related to what you're doing now. Local clients may derive context from a repository; remote clients supply context text. Searches every repository the fleet has seen, and returned ids feed synty_show.",
             "inputSchema": obj(json!({
+                "context": {"type": "string", "maxLength": 4096, "description": "Task/repository context text; required for remote HTTP clients"},
                 "repo": {"type": "string", "description": "Absolute path to the git repo you're working in (defaults to the server's working directory)"},
-                "k": {"type": "integer", "description": "Number of results (default 5)"}
+                "k": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results (default 5)"}
             }), json!([])),
         },
         {
             "name": "synty_topics",
             "description": "Emergent topics of recent work (clustered sessions, PRs, issues) with summaries and members. Topic keys and member ids in the output feed synty_show.",
             "inputSchema": obj(json!({
-                "query": {"type": "string", "description": "Optional substring to filter topics"}
+                "query": {"type": "string", "maxLength": 4096, "description": "Optional substring to filter topics"}
             }), json!([])),
         },
         {
@@ -314,7 +361,7 @@ fn tool_defs(role: crate::policy::McpRole) -> Value {
             "description": "Recent work units (sessions, PRs, issues), newest first. Ids in the output feed synty_show.",
             "inputSchema": obj(json!({
                 "repo": {"type": "string", "description": "Optional repo name to filter"},
-                "limit": {"type": "integer", "description": "Max units (default 20)"}
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max units (default 20)"}
             }), json!([])),
         },
         {
@@ -326,7 +373,7 @@ fn tool_defs(role: crate::policy::McpRole) -> Value {
             "name": "synty_stats",
             "description": "Usage and output over time: tokens, cache, tool calls, sessions, merged LOC, PRs, issues per Mon-aligned week, anchored to the most recent day with data.",
             "inputSchema": obj(json!({
-                "weeks": {"type": "integer", "description": "Trailing weeks (default 4)"}
+                "weeks": {"type": "integer", "minimum": 1, "maximum": 52, "description": "Trailing weeks (default 4)"}
             }), json!([])),
         },
         {
@@ -353,24 +400,24 @@ fn tool_defs(role: crate::policy::McpRole) -> Value {
                 "operation": {"type": "string"}, "has_errors": {"type": "boolean"},
                 "since": {"type": "string"}, "min_ms": {"type": "integer", "minimum": 0},
                 "sort": {"type": "string", "enum": ["recent", "duration", "wait"]},
-                "limit": {"type": "integer", "minimum": 1}
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100}
             }), json!(["type"])),
         },
         {
             "name": "synty_trace_show",
             "description": "Show bounded execution evidence around one trace turn, span, job, event, or session id.",
             "inputSchema": obj(json!({
-                "id": {"type": "string"}, "before": {"type": "integer", "minimum": 0},
-                "after": {"type": "integer", "minimum": 0}
+                "id": {"type": "string"}, "before": {"type": "integer", "minimum": 0, "maximum": 100},
+                "after": {"type": "integer", "minimum": 0, "maximum": 100}
             }), json!(["id"])),
         },
         {
             "name": "synty_trace_search",
             "description": "Literal case-insensitive search over raw execution events with optional repo, machine, source, and kind filters.",
             "inputSchema": obj(json!({
-                "query": {"type": "string"}, "repo": {"type": "string"},
+                "query": {"type": "string", "maxLength": 4096}, "repo": {"type": "string"},
                 "machine": {"type": "string"}, "source": {"type": "string"},
-                "kind": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}
+                "kind": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}
             }), json!(["query"])),
         },
         {
@@ -381,11 +428,21 @@ fn tool_defs(role: crate::policy::McpRole) -> Value {
             }), json!(["left", "right"])),
         }
     ]);
+    if !allow_repo_paths
+        && let Some(related) = all.as_array_mut().and_then(|tools| tools.iter_mut().find(|tool| tool["name"] == "synty_related"))
+    {
+        related["inputSchema"]["properties"].as_object_mut().expect("related properties").remove("repo");
+        related["inputSchema"]["required"] = json!(["context"]);
+    }
     Value::Array(
         all.as_array()
             .expect("tool definitions are an array")
             .iter()
-            .filter(|tool| tool["name"].as_str().is_some_and(|name| role.allows_tool(name)))
+            .filter(|tool| {
+                tool["name"].as_str().is_some_and(|name| {
+                    role.allows_tool(name) && scope.exposes_tool(name)
+                })
+            })
             .cloned()
             .collect(),
     )
@@ -401,6 +458,8 @@ mod tests {
             crate::policy::McpRole::Operator,
             crate::policy::ReadScope::default(),
             crate::redact::Profile::Off,
+            true,
+            None,
         )
     }
 
@@ -409,12 +468,52 @@ mod tests {
     #[test]
     fn initialize_declares_tools() {
         let req = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "x"}}});
+            "params": {"protocolVersion": "2025-11-25", "clientInfo": {"name": "x"}}});
         let resp = srv().handle(&req).expect("response");
         assert_eq!(resp["id"], 1);
-        assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(resp["result"]["protocolVersion"], "2025-11-25");
         assert!(resp["result"]["capabilities"]["tools"].is_object());
         assert_eq!(resp["result"]["serverInfo"]["name"], "synty");
+    }
+
+    #[test]
+    fn initialize_negotiates_unknown_protocol_to_the_latest_supported_version() {
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2099-01-01"}});
+        let resp = srv().handle(&req).unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn restricted_scopes_do_not_advertise_or_dispatch_global_health_tools() {
+        let mut server = Server::new(
+            "m".into(),
+            crate::policy::McpRole::Operator,
+            crate::policy::ReadScope { repos: vec!["synty".into()], ..Default::default() },
+            crate::redact::Profile::Off,
+            true,
+            None,
+        );
+        let listed = server.handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap();
+        let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter()
+            .filter_map(|tool| tool["name"].as_str()).collect();
+        assert!(!names.contains(&"synty_status"));
+        let called = server.handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"synty_status","arguments":{}}})).unwrap();
+        assert!(called["error"]["message"].as_str().unwrap().contains("restricted"));
+    }
+
+    #[test]
+    fn remote_related_schema_requires_context_and_hides_server_paths() {
+        let tools = tool_defs(
+            crate::policy::McpRole::Operator,
+            &crate::policy::ReadScope::default(),
+            false,
+        );
+        let related = tools.as_array().unwrap().iter()
+            .find(|tool| tool["name"] == "synty_related").unwrap();
+        assert_eq!(related["inputSchema"]["required"], json!(["context"]));
+        assert!(related["inputSchema"]["properties"]["repo"].is_null());
     }
 
     // Notifications (no id) get no response — writing one would corrupt the stream.

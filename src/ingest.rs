@@ -197,6 +197,7 @@ pub fn github_docs(json: &str, kind: &str, repo: &str) -> Result<Vec<Doc>> {
                 campaign_id: String::new(),
                 campaign_role: String::new(),
                 backend: String::new(),
+                capture_source: String::new(),
                 ts: it["createdAt"].as_str().unwrap_or("").into(),
                 number: it["number"].as_i64(),
                 url: it["url"].as_str().map(String::from),
@@ -220,6 +221,7 @@ pub struct SessionMaps {
     campaign: HashMap<String, String>,
     role: HashMap<String, String>,
     backend: HashMap<String, String>,
+    capture_source: HashMap<String, String>,
     pub skipped: usize,
 }
 
@@ -264,6 +266,9 @@ pub fn scan_starts(text: &str, known: &std::collections::HashSet<String>, maps: 
                         {
                             maps.backend.insert(sid.to_string(), backend.to_string());
                         }
+                        if let Some(source) = v["source"].as_str().filter(|value| !value.is_empty()) {
+                            maps.capture_source.insert(sid.to_string(), source.to_string());
+                        }
                     }
                 }
             }
@@ -304,6 +309,7 @@ pub fn docs_from_events(
         let campaign_id = maps.campaign.get(&sid).cloned().unwrap_or_default();
         let campaign_role = maps.role.get(&sid).cloned().unwrap_or_default();
         let backend = maps.backend.get(&sid).cloned().unwrap_or_default();
+        let capture_source = maps.capture_source.get(&sid).cloned().unwrap_or_default();
         out.push(Doc {
             id: 0,
             text: trunc(text, MAX_TEXT),
@@ -316,6 +322,7 @@ pub fn docs_from_events(
                 campaign_id,
                 campaign_role,
                 backend,
+                capture_source,
                 ts: v["ts"].as_str().unwrap_or("").into(),
                 number: None,
                 url: None,
@@ -372,7 +379,7 @@ fn derivation_config(cfg: &crate::config::Config) -> String {
     // Doc-derivation format: bump whenever the derivation itself changes (new
     // Meta fields, new detectors) so a binary upgrade regenerates docs.jsonl
     // once even though the input files are unchanged.
-    out.push_str("fmt=3\n");
+    out.push_str("fmt=4\n");
     out
 }
 
@@ -522,7 +529,7 @@ mod tests {
     #[test]
     fn session_messages_become_docs_with_repo_from_cwd() {
         let lines = [
-            r#"{"kind":"session_start","session_id":"S1","payload":{"cwd":"/Users/d/c/sie-internal/x"}}"#,
+            r#"{"kind":"session_start","source":"harness","session_id":"S1","payload":{"cwd":"/Users/d/c/sie-internal/x","backend":"codex"}}"#,
             r#"{"kind":"user_prompt","session_id":"S1","ts":"2026-05-02T09:00:00Z","payload":{"text":"fix the login redirect bug"}}"#,
             r#"{"kind":"assistant_message","session_id":"S1","ts":"2026-05-02T09:01:00Z","payload":{"text":"I'll inspect auth.ts and the redirect handler"}}"#,
             r#"{"kind":"assistant_message","session_id":"S1","ts":"2026-05-02T09:02:00Z","payload":{"text":"ok"}}"#,
@@ -535,6 +542,8 @@ mod tests {
         assert!(docs.iter().all(|d| d.meta.session_id == "S1"));
         assert!(docs.iter().all(|d| d.meta.repo == "sie-internal"));
         assert!(docs.iter().all(|d| d.meta.source == "agent"));
+        assert!(docs.iter().all(|d| d.meta.backend == "codex"));
+        assert!(docs.iter().all(|d| d.meta.capture_source == "harness"));
     }
 
     // Starting collection at an absolute boundary removes older local session
@@ -708,6 +717,7 @@ mod tests {
                 campaign_id: String::new(),
                 campaign_role: String::new(),
                 backend: String::new(),
+                capture_source: String::new(),
                 ts: ts.into(),
                 number: None,
                 url: None,
@@ -780,6 +790,7 @@ mod tests {
                 campaign_id: String::new(),
                 campaign_role: String::new(),
                 backend: String::new(),
+                capture_source: String::new(),
                 ts: ts.into(),
                 number: None,
                 url: None,

@@ -25,6 +25,14 @@ impl Profile {
             Self::McpSafe => Some(4 * 1024),
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Standard => "standard",
+            Self::McpSafe => "mcp_safe",
+        }
+    }
 }
 
 impl FromStr for Profile {
@@ -43,11 +51,14 @@ impl FromStr for Profile {
 static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}",
+        r"(?i)\bBasic\s+[A-Za-z0-9+/=]{12,}",
         r"\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{12,}",
+        r"\bxox[baprs]-[A-Za-z0-9-]{10,}",
         r"\bsk-[A-Za-z0-9_-]{16,}",
         r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
         r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
-        r"(?i)\b(?:AWS_SECRET_ACCESS_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN)\s*=\s*[^\s]+",
+        r"(?i)\b[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)\s*=\s*[^\s]+",
+        r"(?s)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
     ]
     .into_iter()
     .map(|pattern| Regex::new(pattern).expect("static redaction regex"))
@@ -80,12 +91,39 @@ pub fn value(node: &mut Value, profile: Profile) {
             }
         }
         Value::Object(values) => {
-            for item in values.values_mut() {
-                value(item, profile);
+            for (key, item) in values {
+                if sensitive_key(key) && !item.is_null() {
+                    *item = Value::String("[REDACTED]".into());
+                } else {
+                    value(item, profile);
+                }
             }
         }
         _ => {}
     }
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    if matches!(
+        key.as_str(),
+        "password"
+            | "passwd"
+            | "secret"
+            | "client_secret"
+            | "private_key"
+            | "access_token"
+            | "refresh_token"
+            | "authorization"
+            | "api_key"
+            | "apikey"
+            | "aws_secret_access_key"
+            | "aws_session_token"
+    ) {
+        return true;
+    }
+    (key.ends_with("_token") || key.ends_with("_secret") || key.ends_with("_password"))
+        && !matches!(key.as_str(), "input_token" | "output_token" | "token_count" | "max_token")
 }
 
 /// Redact one canonical envelope line without changing its identity fields.
@@ -118,5 +156,17 @@ mod tests {
         let output = text(&"x".repeat(8 * 1024), Profile::McpSafe);
         assert!(output.ends_with("[TRUNCATED]"));
         assert!(output.len() < 5 * 1024);
+    }
+
+    #[test]
+    fn structured_secret_fields_are_redacted_without_hiding_usage_counts() {
+        let mut value = serde_json::json!({
+            "client_secret": "short-but-secret",
+            "nested": {"refresh_token": "also-secret", "token_count": 42}
+        });
+        super::value(&mut value, Profile::Standard);
+        assert_eq!(value["client_secret"], "[REDACTED]");
+        assert_eq!(value["nested"]["refresh_token"], "[REDACTED]");
+        assert_eq!(value["nested"]["token_count"], 42);
     }
 }
