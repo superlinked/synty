@@ -599,6 +599,24 @@ fn service_loaded(kind: &str) -> bool {
     }
 }
 
+/// Service managers may accept a job before reporting it active. Poll briefly
+/// so initialization reflects the eventual startup result instead of racing it.
+fn poll_service_ready(
+    mut ready: impl FnMut() -> bool,
+    attempts: usize,
+    mut wait: impl FnMut(),
+) -> bool {
+    for attempt in 0..attempts {
+        if ready() {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            wait();
+        }
+    }
+    false
+}
+
 fn service_registered(kind: &str) -> bool {
     kind == "launchd"
         && std::process::Command::new("launchctl")
@@ -633,39 +651,62 @@ fn run_service(cmd: &str, args: &[&str]) -> Result<()> {
 
 /// (Un)load the unit via the service manager, then verify activation.
 fn loader(kind: &str, path: &str, on: bool) -> Result<()> {
+    loader_with(
+        kind,
+        path,
+        on,
+        run_service,
+        service_registered,
+        || service_loaded(kind),
+        || std::thread::sleep(Duration::from_millis(100)),
+    )
+}
+
+/// Loader flow with injectable service operations so lifecycle ordering and
+/// readiness behavior can be exercised without touching the host manager.
+fn loader_with(
+    kind: &str,
+    path: &str,
+    on: bool,
+    mut run: impl FnMut(&str, &[&str]) -> Result<()>,
+    mut registered: impl FnMut(&str) -> bool,
+    mut ready: impl FnMut() -> bool,
+    wait: impl FnMut(),
+) -> Result<()> {
     match (kind, on) {
         ("launchd", true) => {
             let domain = launch_domain();
             let target = format!("{domain}/{SERVICE_LABEL}");
-            if service_registered(kind) {
-                let _ = run_service("launchctl", &["bootout", &target]);
+            if registered(kind) {
+                let _ = run("launchctl", &["bootout", &target]);
             }
-            run_service("launchctl", &["bootstrap", &domain, path])?;
-            run_service("launchctl", &["kickstart", "-k", &target])?;
+            run("launchctl", &["bootstrap", &domain, path])?;
+            run("launchctl", &["kickstart", "-k", &target])?;
         }
         ("launchd", false) => {
-            if service_registered(kind) {
-                run_service(
+            if registered(kind) {
+                run(
                     "launchctl",
                     &["bootout", &format!("{}/{}", launch_domain(), SERVICE_LABEL)],
                 )?;
             }
         }
         ("systemd", true) => {
-            run_service("systemctl", &["--user", "daemon-reload"])?;
-            run_service("systemctl", &["--user", "enable", "--now", "synty.service"])?;
+            for args in SYSTEMD_LOAD_SEQUENCE {
+                run("systemctl", args)?;
+            }
         }
         ("systemd", false) => {
             // `is-active` can be false while an enabled failed service still
             // has a login symlink. Always disable before removing the unit.
-            run_service(
+            run(
                 "systemctl",
                 &["--user", "disable", "--now", "synty.service"],
             )?;
         }
         _ => bail!("unknown service manager: {kind}"),
     }
-    if on && !service_loaded(kind) {
+    if on && !poll_service_ready(&mut ready, 21, wait) {
         bail!("{kind} accepted the unit but {SERVICE_LABEL} is not loaded");
     }
     Ok(())
@@ -739,9 +780,9 @@ fn write_unit(kind: &str, path: &str, out: &str, machine: &str) -> Result<()> {
                 .map(|a| systemd_arg(a))
                 .collect::<Vec<_>>()
                 .join(" "),
-            systemd_arg(&cwd),
-            systemd_arg(&log),
-            systemd_arg(&log),
+            systemd_path(&cwd),
+            systemd_path(&log),
+            systemd_path(&log),
         ),
         _ => bail!("install kind must be launchd or systemd"),
     };
@@ -769,6 +810,32 @@ fn systemd_arg(s: &str) -> String {
             .replace('%', "%%")
     )
 }
+
+/// Escape a standalone systemd directive path without wrapping it in quotes.
+/// Directives such as WorkingDirectory= treat quote characters as path bytes;
+/// hex escapes preserve spaces and other syntax-significant bytes instead.
+fn systemd_path(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b == b'%' {
+            out.push_str("%%");
+        } else if b.is_ascii_alphanumeric() || b"/._:-".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    out
+}
+
+/// `enable --now` leaves an already-active old process untouched. Reload,
+/// enable, then restart so an idempotent init actually adopts the new binary,
+/// bucket, and capture configuration.
+const SYSTEMD_LOAD_SEQUENCE: &[&[&str]] = &[
+    &["--user", "daemon-reload"],
+    &["--user", "enable", "synty.service"],
+    &["--user", "restart", "synty.service"],
+];
 
 /// CLI `track --install <kind>`: write the unit and print the manual load command.
 fn install(kind: &str, o: &Opts) -> Result<()> {
@@ -849,6 +916,56 @@ mod tests {
     fn service_unit_arguments_escape_manager_syntax() {
         assert_eq!(xml("a&<b>\""), "a&amp;&lt;b&gt;&quot;");
         assert_eq!(systemd_arg("/tmp/a b/%n\\x\""), "\"/tmp/a b/%%n\\\\x\\\"\"");
+        assert_eq!(
+            systemd_path("/tmp/a b/%n\\x\""),
+            "/tmp/a\\x20b/%%n\\x5cx\\x22"
+        );
+    }
+
+    #[test]
+    fn autostart_waits_for_normal_manager_startup_latency() {
+        let mut states = [false, false, true].into_iter();
+        let mut waits = 0;
+        assert!(poll_service_ready(
+            || states.next().unwrap_or(false),
+            3,
+            || waits += 1,
+        ));
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn systemd_reinstall_restarts_the_active_watcher() {
+        let mut operations = Vec::new();
+        let mut readiness = [false, false, true].into_iter();
+        let mut probes = 0;
+        let mut waits = 0;
+        loader_with(
+            "systemd",
+            "/tmp/synty.service",
+            true,
+            |command, args| {
+                operations.push(format!("{command} {}", args.join(" ")));
+                Ok(())
+            },
+            |_| false,
+            || {
+                probes += 1;
+                readiness.next().unwrap_or(false)
+            },
+            || waits += 1,
+        )
+        .unwrap();
+        assert_eq!(
+            operations,
+            &[
+                "systemctl --user daemon-reload",
+                "systemctl --user enable synty.service",
+                "systemctl --user restart synty.service",
+            ]
+        );
+        assert_eq!(probes, 3, "loader polls until the service is ready");
+        assert_eq!(waits, 2, "loader waits between failed readiness probes");
     }
 
     #[test]
