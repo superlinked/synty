@@ -45,6 +45,14 @@ pub fn resolve_machine(arg: &str) -> String {
     }
 }
 
+/// Parse the canonical `edge-<machine>-<source>` stream grammar from the
+/// source suffix, so dashes inside machine ids stay unambiguous.
+pub fn stream_parts(stream: &str) -> Option<(&str, &str)> {
+    let rest = stream.strip_prefix("edge-")?;
+    let (machine, source) = rest.rsplit_once('-')?;
+    (!machine.is_empty() && !source.is_empty()).then_some((machine, source))
+}
+
 fn machine_name(host: &str, nonce: u64) -> String {
     format!("{}-{:04x}", sanitize(host), nonce & 0xffff)
 }
@@ -145,6 +153,12 @@ mod tests {
     fn resolve_machine_passes_explicit_through() {
         assert_eq!(resolve_machine("sie-ci"), "sie-ci");
         assert_eq!(resolve_machine("runner/7"), "runner-7");
+    }
+
+    #[test]
+    fn stream_identity_keeps_dashed_machine_ids_whole() {
+        assert_eq!(stream_parts("edge-a-b-codex"), Some(("a-b", "codex")));
+        assert_ne!(stream_parts("edge-a-b-codex").map(|p| p.0), Some("a"));
     }
 
     #[test]

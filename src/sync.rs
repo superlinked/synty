@@ -127,20 +127,37 @@ struct UploadState {
 /// Only stream directories owned by this resolved machine id are eligible;
 /// pulled fleet streams below the same local corpus remain read-only.
 pub fn push_events(bucket_uri: &str, local_dir: &str, machine: &str) -> Result<usize> {
-    let prefix = format!("edge-{machine}-");
+    push_events_for_machine(
+        bucket_uri,
+        local_dir,
+        ".synty/uploads.json",
+        crate::config::capture_since_ms(),
+        machine,
+    )
+}
+
+fn push_events_for_machine(
+    bucket_uri: &str,
+    local_dir: &str,
+    state_path: &str,
+    capture_since_ms: Option<i64>,
+    machine: &str,
+) -> Result<usize> {
     let owned: BTreeSet<String> = std::fs::read_dir(local_dir)
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_dir())
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with(&prefix))
+        .filter(|name| {
+            crate::identity::stream_parts(name).is_some_and(|(owner, _)| owner == machine)
+        })
         .collect();
     push_events_for_streams(
         bucket_uri,
         local_dir,
-        ".synty/uploads.json",
-        crate::config::capture_since_ms(),
+        state_path,
+        capture_since_ms,
         &owned,
     )
 }
@@ -869,6 +886,51 @@ mod tests {
         assert!(
             uploaded[0].starts_with("events/edge-mine-codex/chunks/"),
             "pulled fleet data must stay read-only: {uploaded:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn public_event_upload_does_not_confuse_colliding_machine_prefixes() {
+        let root = std::env::temp_dir().join(format!("synty-event-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let local = root.join("local");
+        let mine = local.join("edge-a-codex");
+        let pulled = local.join("edge-a-b-codex");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&pulled).unwrap();
+        for (dir, id) in [(&mine, "mine"), (&pulled, "theirs")] {
+            std::fs::write(
+                dir.join("track.2026-07-21.jsonl"),
+                event(id, id, "user_prompt", "2026-07-21T10:00:00Z", id),
+            )
+            .unwrap();
+        }
+
+        let bucket = root.join("bucket");
+        assert_eq!(
+            push_events_for_machine(
+                bucket.to_str().unwrap(),
+                local.to_str().unwrap(),
+                root.join("uploads.json").to_str().unwrap(),
+                None,
+                "a",
+            )
+            .unwrap(),
+            1
+        );
+        let b = crate::bucket::LocalFs::new(&bucket);
+        assert_eq!(
+            b.list(EVENT_STREAMS).unwrap(),
+            vec!["event-streams/edge-a-codex"],
+            "machine a must not claim machine a-b's stream"
+        );
+        assert!(
+            b.list(EVENTS)
+                .unwrap()
+                .iter()
+                .all(|key| key.starts_with("events/edge-a-codex/chunks/")),
+            "only the exact machine identity is uploaded"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
