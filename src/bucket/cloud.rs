@@ -315,7 +315,64 @@ impl Bucket for Cloud {
 mod tests {
     use super::*;
     use aws_credential_types::provider::{ProvideCredentials, future};
+    use futures::stream::BoxStream;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts,
+        PutOptions, PutPayload, PutResult,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_cloud(store: Arc<dyn ObjectStore>) -> Cloud {
+        Cloud {
+            store,
+            rt: tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap(),
+            prefix: String::new(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingGet(object_store::memory::InMemory);
+
+    impl std::fmt::Display for FailingGet {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("failing-get")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingGet {
+        async fn put_opts(&self, location: &OPath, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+            self.0.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OPath,
+            opts: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, _location: &OPath, _options: GetOptions) -> object_store::Result<GetResult> {
+            Err(object_store::Error::Generic {
+                store: "scenario",
+                source: Box::new(std::io::Error::other("injected get failure")),
+            })
+        }
+        async fn delete(&self, location: &OPath) -> object_store::Result<()> {
+            self.0.delete(location).await
+        }
+        fn list(&self, prefix: Option<&OPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+            self.0.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&OPath>) -> object_store::Result<ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &OPath, to: &OPath) -> object_store::Result<()> {
+            self.0.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &OPath, to: &OPath) -> object_store::Result<()> {
+            self.0.copy_if_not_exists(from, to).await
+        }
+    }
 
     #[derive(Debug)]
     struct CountingProvider(Arc<AtomicUsize>);
@@ -366,5 +423,34 @@ mod tests {
             1,
             "one helper invocation serves repeated batches"
         );
+    }
+
+    #[test]
+    fn cloud_batches_preserve_order_missing_values_and_create_only_counts() {
+        let cloud = test_cloud(Arc::new(object_store::memory::InMemory::new()));
+        cloud.put("a", b"first").unwrap();
+        cloud.put("c", b"third").unwrap();
+
+        let values = cloud.get_many(&["c".into(), "missing".into(), "a".into()]).unwrap();
+        assert_eq!(values, vec![Some(b"third".to_vec()), None, Some(b"first".to_vec())]);
+
+        let created = cloud
+            .put_many_if_absent(&[
+                ("a".into(), b"replacement".to_vec()),
+                ("b".into(), b"second".to_vec()),
+                ("c".into(), b"replacement".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(created, 1, "AlreadyExists objects do not inflate the creation count");
+        assert_eq!(cloud.get("a").unwrap().as_deref(), Some(&b"first"[..]));
+        assert_eq!(cloud.get("b").unwrap().as_deref(), Some(&b"second"[..]));
+        assert_eq!(cloud.get("c").unwrap().as_deref(), Some(&b"third"[..]));
+    }
+
+    #[test]
+    fn cloud_batch_get_propagates_non_not_found_errors() {
+        let cloud = test_cloud(Arc::new(FailingGet(object_store::memory::InMemory::new())));
+        let error = cloud.get_many(&["broken".into()]).unwrap_err().to_string();
+        assert!(error.contains("injected get failure"), "backend error must remain actionable: {error}");
     }
 }
