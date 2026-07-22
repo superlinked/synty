@@ -676,14 +676,23 @@ fn loader_with(
     mut run: impl FnMut(&str, &[&str]) -> Result<()>,
     mut registered: impl FnMut(&str) -> bool,
     mut ready: impl FnMut() -> bool,
-    wait: impl FnMut(),
+    mut wait: impl FnMut(),
 ) -> Result<()> {
     match (kind, on) {
         ("launchd", true) => {
             let domain = launch_domain();
             let target = format!("{domain}/{SERVICE_LABEL}");
             if registered(kind) {
+                // The job may disappear between the registration probe and
+                // bootout. The state transition below is authoritative.
                 let _ = run("launchctl", &["bootout", &target]);
+                if !poll_service_ready(
+                    || !registered(kind),
+                    SERVICE_READY_ATTEMPTS,
+                    &mut wait,
+                ) {
+                    bail!("launchd did not finish unloading {SERVICE_LABEL}");
+                }
             }
             run("launchctl", &["bootstrap", &domain, path])?;
             run("launchctl", &["kickstart", "-k", &target])?;
@@ -711,7 +720,7 @@ fn loader_with(
         }
         _ => bail!("unknown service manager: {kind}"),
     }
-    if on && !poll_service_ready(&mut ready, SERVICE_READY_ATTEMPTS, wait) {
+    if on && !poll_service_ready(&mut ready, SERVICE_READY_ATTEMPTS, &mut wait) {
         bail!("{kind} accepted the unit but {SERVICE_LABEL} is not loaded");
     }
     Ok(())
@@ -970,6 +979,38 @@ mod tests {
         );
         assert_eq!(probes, 51, "loader tolerates a five-second startup");
         assert_eq!(waits, 50, "loader waits between failed readiness probes");
+    }
+
+    #[test]
+    fn launchd_reinstall_waits_for_bootout_before_bootstrap() {
+        let mut operations = Vec::new();
+        let mut registrations = [true, true, false].into_iter();
+        let mut waits = 0;
+        loader_with(
+            "launchd",
+            "/tmp/com.superlinked.synty.plist",
+            true,
+            |command, args| {
+                operations.push(format!(
+                    "{command} {}",
+                    args.first().copied().unwrap_or_default()
+                ));
+                Ok(())
+            },
+            |_| registrations.next().unwrap_or(false),
+            || true,
+            || waits += 1,
+        )
+        .unwrap();
+        assert_eq!(
+            operations,
+            &[
+                "launchctl bootout",
+                "launchctl bootstrap",
+                "launchctl kickstart",
+            ]
+        );
+        assert_eq!(waits, 1, "bootstrap waits until bootout is complete");
     }
 
     #[test]
