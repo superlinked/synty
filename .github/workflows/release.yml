@@ -1,7 +1,7 @@
 # Cut a release on a version tag: run the (pure) test suite, then build the
 # per-platform artifacts and attach them to a GitHub Release. `synty upgrade`
 # and install.sh read from this release. Tag with the Cargo.toml version, e.g.
-# `git tag v0.2.3 && git push --tags`.
+# `git tag v0.2.4 && git push --tags`.
 name: release
 
 on:
