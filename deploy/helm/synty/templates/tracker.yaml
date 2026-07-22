@@ -31,7 +31,6 @@ spec:
           args:
             - |
               set -- synty init "$SYNTY_BUCKET" --capture-since "$SYNTY_CAPTURE_SINCE" --upload-interval "$SYNTY_UPLOAD_INTERVAL" --upload-redaction "$SYNTY_UPLOAD_REDACTION" --machine "$SYNTY_MACHINE" --no-build --no-autostart
-              if [ -n "$SYNTY_AWS_PROFILE" ]; then set -- "$@" --aws-profile "$SYNTY_AWS_PROFILE"; fi
               {{- range .Values.captureRepos }}
               set -- "$@" --capture-repo {{ . | quote }}
               {{- end }}
@@ -50,7 +49,6 @@ spec:
             - { name: SYNTY_MACHINE, value: {{ .Values.machine | quote }} }
             - { name: SYNTY_SOURCE, value: {{ .Values.tracker.source | quote }} }
             - { name: SYNTY_POLL, value: {{ .Values.tracker.poll | quote }} }
-            - { name: SYNTY_AWS_PROFILE, value: {{ .Values.awsProfile | quote }} }
             {{- if .Values.bucketRegion }}
             - { name: AWS_REGION, value: {{ .Values.bucketRegion | quote }} }
             - { name: AWS_DEFAULT_REGION, value: {{ .Values.bucketRegion | quote }} }

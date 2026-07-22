@@ -6,11 +6,22 @@
 {{- fail "networkPolicy.ingressFrom must select at least one trusted MCP caller" }}
 {{- end }}
 {{- range .Values.networkPolicy.ingressFrom }}
-{{- if empty . }}
-{{- fail "networkPolicy.ingressFrom entries must contain a podSelector or restricted namespaceSelector" }}
+{{- $hasPodSelector := hasKey . "podSelector" }}
+{{- $hasNamespaceSelector := hasKey . "namespaceSelector" }}
+{{- if not (or $hasPodSelector $hasNamespaceSelector) }}
+{{- fail "networkPolicy.ingressFrom entries must contain a constrained podSelector or namespaceSelector" }}
 {{- end }}
-{{- if and (hasKey . "namespaceSelector") (empty .namespaceSelector) }}
-{{- fail "an empty namespaceSelector would expose MCP to every namespace" }}
+{{- if $hasPodSelector }}
+{{- $selector := .podSelector | default dict }}
+{{- if or (not (kindIs "map" $selector)) (and (empty $selector.matchLabels) (empty $selector.matchExpressions)) }}
+{{- fail "networkPolicy podSelector must contain non-empty matchLabels or matchExpressions" }}
+{{- end }}
+{{- end }}
+{{- if $hasNamespaceSelector }}
+{{- $selector := .namespaceSelector | default dict }}
+{{- if or (not (kindIs "map" $selector)) (and (empty $selector.matchLabels) (empty $selector.matchExpressions)) }}
+{{- fail "networkPolicy namespaceSelector must contain non-empty matchLabels or matchExpressions" }}
+{{- end }}
 {{- end }}
 {{- end }}
 apiVersion: apps/v1
@@ -68,9 +79,6 @@ spec:
                 secretKeyRef:
                   name: {{ required "mcp.existingSecret is required" .Values.mcp.existingSecret }}
                   key: {{ .Values.mcp.tokenKey }}
-            {{- if .Values.awsProfile }}
-            - { name: AWS_PROFILE, value: {{ .Values.awsProfile | quote }} }
-            {{- end }}
           ports:
             - { name: mcp, containerPort: {{ .Values.mcp.port }} }
           volumeMounts:

@@ -56,7 +56,8 @@ the team's data bucket and are independent of where the binary ships. Add rows
 for more platforms (Intel Mac `macos-13`, `ubuntu-24.04-arm`) as needed. Users
 then update with `synty upgrade`, which reads the same release.
 
-The same tag publishes an immutable `linux/amd64` container to
+The same tag publishes a verified multi-architecture (`linux/amd64` +
+`linux/arm64`) container to
 `851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty:<version>`.
 Deploy `deploy/aws/ecr-publisher.yaml` once in account `851725219920`, then set
 the GitHub Actions repository variable `AWS_ECR_PUBLISH_ROLE_ARN` to the stack's

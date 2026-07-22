@@ -218,9 +218,10 @@ MCP pulls the published read-model before serving. It then refreshes the model
 and raw events on a background thread, so a large trace history cannot hold the
 semantic-search dispatcher or delay search startup. Raw-derived tools remain
 serialized on their own dispatcher. HTTP work is bounded by separate semantic
-and raw queues, a 120-second response deadline, 32 in-flight connections, and a
-per-client 120-request/minute window; queued work whose client timed out is
-dropped before execution.
+and raw queues, a 120-second response deadline, 32 in-flight requests, 64 live
+connections, 10-second TLS/header/body read deadlines, and a per-client
+120-request/minute window; queued work whose client timed out is dropped before
+execution.
 
 The Helm chart under `deploy/helm/synty` defaults to the private image
 `851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty:<appVersion>`. Version
@@ -230,7 +231,8 @@ tags build each architecture on a native GitHub runner, then publish a verified
 `AWS_ECR_PUBLISH_ROLE_ARN` to its role output. Remote MCP is disabled by default;
 enabling it requires a TLS Secret and a NetworkPolicy whose source selectors
 name trusted callers. The Service remains cluster-internal, and its default
-NetworkPolicy accepts same-namespace callers only.
+NetworkPolicy accepts only same-namespace pods labeled
+`synty.superlinked.com/mcp-client: "true"`.
 
 ## How it works
 

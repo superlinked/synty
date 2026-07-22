@@ -39,12 +39,20 @@ jobs:
             echo "MCP rendered without a TLS Secret" >&2
             exit 1
           fi
+          for selector in '[{"podSelector":{}}]' '[{"namespaceSelector":{"matchLabels":{}}}]'; do
+            if helm template synty deploy/helm/synty \
+              --set bucket=s3://example/synty --set mcp.enabled=true \
+              --set mcp.tls.existingSecret=synty-mcp-tls \
+              --set-json "networkPolicy.ingressFrom=$selector" >/tmp/synty-unrestricted.yaml; then
+              echo "MCP rendered with an unrestricted caller selector" >&2
+              exit 1
+            fi
+          done
       - name: Render every optional branch
         run: >-
           helm template synty deploy/helm/synty
           --set bucket=s3://example/synty
           --set bucketRegion=us-west-2
-          --set awsProfile=workload
           --set tracker.campaign=campaign-1
           --set tracker.role=primary
           --set mcp.enabled=true

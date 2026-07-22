@@ -39,9 +39,6 @@ spec:
                 - { name: AWS_REGION, value: {{ .Values.bucketRegion | quote }} }
                 - { name: AWS_DEFAULT_REGION, value: {{ .Values.bucketRegion | quote }} }
                 {{- end }}
-                {{- if .Values.awsProfile }}
-                - { name: AWS_PROFILE, value: {{ .Values.awsProfile | quote }} }
-                {{- end }}
               volumeMounts:
                 - { name: synty-home, mountPath: /var/synty }
                 - { name: tmp, mountPath: /tmp }

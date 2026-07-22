@@ -294,11 +294,7 @@ impl Bucket for Cloud {
             }
         });
         let results = self.rt.block_on(requests.buffer_unordered(OBJECT_CONCURRENCY).collect::<Vec<_>>());
-        let mut created = 0;
-        for (key, result) in results {
-            created += usize::from(result.map_err(|e| anyhow!("put_if_absent {key}: {e}"))?);
-        }
-        Ok(created)
+        summarize_batch_puts(results)
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -309,6 +305,26 @@ impl Bucket for Cloud {
             Err(e) => Err(anyhow!("delete {key}: {e}")),
         }
     }
+}
+
+fn summarize_batch_puts(
+    results: Vec<(String, object_store::Result<bool>)>,
+) -> Result<usize> {
+    let mut created = 0;
+    let mut first_error = None;
+    for (key, result) in results {
+        match result {
+            Ok(was_created) => created += usize::from(was_created),
+            Err(error) if first_error.is_none() => first_error = Some((key, error)),
+            Err(_) => {}
+        }
+    }
+    if let Some((key, error)) = first_error {
+        bail!(
+            "put_many_if_absent partially completed: {created} object(s) created; first failure at {key}: {error}"
+        );
+    }
+    Ok(created)
 }
 
 #[cfg(all(test, feature = "s3"))]
@@ -452,5 +468,22 @@ mod tests {
         let cloud = test_cloud(Arc::new(FailingGet(object_store::memory::InMemory::new())));
         let error = cloud.get_many(&["broken".into()]).unwrap_err().to_string();
         assert!(error.contains("injected get failure"), "backend error must remain actionable: {error}");
+    }
+
+    #[test]
+    fn cloud_batch_put_error_reports_every_successful_create() {
+        let failure = object_store::Error::Generic {
+            store: "scenario",
+            source: Box::new(std::io::Error::other("injected put failure")),
+        };
+        let error = summarize_batch_puts(vec![
+            ("already-there".into(), Ok(false)),
+            ("broken".into(), Err(failure)),
+            ("created-after-error".into(), Ok(true)),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("1 object(s) created"), "{error}");
+        assert!(error.contains("broken") && error.contains("injected put failure"), "{error}");
     }
 }

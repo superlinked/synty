@@ -33,6 +33,8 @@ mcp:
 
 networkPolicy:
   enabled: true
-  # The harness runs beside the reader; other namespaces are denied by default.
+  # Label harness pods explicitly; other pods and namespaces remain denied.
   ingressFrom:
-    - podSelector: {}
+    - podSelector:
+        matchLabels:
+          synty.superlinked.com/mcp-client: "true"

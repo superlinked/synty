@@ -13,7 +13,6 @@ uploadInterval: 60
 uploadRedaction: "off"
 captureRepos: []
 machine: k8s
-awsProfile: ""
 
 serviceAccount:
   create: true
@@ -89,6 +88,8 @@ mcp:
 
 networkPolicy:
   enabled: true
-  # By default only pods in this namespace can reach MCP.
+  # Label each trusted in-namespace client pod with this key before enabling MCP.
   ingressFrom:
-    - podSelector: {}
+    - podSelector:
+        matchLabels:
+          synty.superlinked.com/mcp-client: "true"
