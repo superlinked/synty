@@ -14,6 +14,18 @@ use next_plaid::{IndexConfig, MmapIndex, UpdateConfig};
 use std::path::Path;
 use std::time::Instant;
 
+/// Bounds decoded ColBERT matrices plus next-plaid's temporary flat copy to a
+/// workstation-sized resident set while still giving each disk update enough
+/// work to amortize centroid and metadata maintenance.
+const INDEX_BATCH_DOCS: usize = 2048;
+
+fn index_batches(start: usize, end: usize) -> Vec<std::ops::Range<usize>> {
+    (start..end)
+        .step_by(INDEX_BATCH_DOCS)
+        .map(|batch_start| batch_start..(batch_start + INDEX_BATCH_DOCS).min(end))
+        .collect()
+}
+
 pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     let docs = load_docs(docs_path)?;
     anyhow::ensure!(!docs.is_empty(), "no docs at {docs_path}; run `ingest` first");
@@ -80,39 +92,19 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     };
     let path = dir.as_path();
 
-    // Pull every known embedding from the store; encode only the rest.
+    // Inventory once, then fetch/encode/index bounded slices. ColBERT matrices
+    // are large enough that retaining a 30-day corpus as f32 until the final
+    // index call exceeds workstation memory; next-plaid's streaming entrypoint
+    // keeps only this slice resident while its completed chunks stay on disk.
     let store = EmbStore::open(bucket, model_id)?;
     let n_new = texts.len() - start;
-    let mut embeddings = store.get_known(&hashes[start..])?;
-    let miss: Vec<usize> =
-        (start..texts.len()).filter(|&i| embeddings[i - start].is_none()).collect();
-    let reused = n_new - miss.len();
-
+    let known = store.known_hashes()?;
+    let listed_reused = hashes[start..].iter().filter(|hash| known.contains(hash)).count();
+    let expected_miss = n_new - listed_reused;
     let t0 = Instant::now();
-    if miss.is_empty() {
-        eprintln!("all {reused} embeddings in store; no encode needed");
-    } else {
-        eprintln!("loading model {model_id} (first run downloads from HF, then offline)...");
-        let mut enc = Encoder::load(model_id)?;
-        eprintln!("reusing {reused} from store, encoding {} new/changed", miss.len());
-        let mut done = 0;
-        for chunk in miss.chunks(64) {
-            let chunk_texts: Vec<String> = chunk.iter().map(|&i| texts[i].clone()).collect();
-            let encoded = enc.encode_docs(&chunk_texts)?;
-            let entries: Vec<(u64, Array2<f32>)> =
-                chunk.iter().zip(encoded).map(|(&i, emb)| (hashes[i], emb)).collect();
-            store.put_many(&entries)?; // share one write-once batch with the fleet
-            for (&i, (_, e)) in chunk.iter().zip(entries) {
-                embeddings[i - start] = Some(e);
-            }
-            done += chunk.len();
-            eprint!("\rencoded {done}/{}", miss.len());
-            crate::progress::phase("encoding", done, miss.len());
-        }
-        eprintln!("\nencoded {} new docs in {:?}", miss.len(), t0.elapsed());
+    if expected_miss > 0 {
+        eprintln!("reusing {listed_reused} from store, encoding {expected_miss} new/changed in bounded batches");
     }
-    let embeddings: Vec<Array2<f32>> =
-        embeddings.into_iter().map(|o| o.expect("every doc filled")).collect();
 
     let t1 = Instant::now();
     let idx = if n_new == 0 && start > 0 {
@@ -123,16 +115,65 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
         if start > 0 {
             eprintln!("index: appending {n_new} new docs ({start} already indexed)");
         }
-        crate::progress::phase("indexing", 0, 1);
-        let (idx, _ids) = MmapIndex::update_or_create_with_metadata(
-            &embeddings,
-            &dir_str,
-            &IndexConfig::default(),
-            &UpdateConfig::default(),
-            Some(&metas[start..]),
-        )
-        .context("build next-plaid index")?;
-        idx
+        let index_config = IndexConfig::default();
+        let update_config = UpdateConfig::default();
+        let mut enc: Option<Encoder> = None;
+        let mut encoded_done = 0usize;
+        let mut indexed_done = 0usize;
+        for range in index_batches(start, texts.len()) {
+            let mut batch = store.get_listed(&hashes[range.clone()], &known)?;
+            let miss: Vec<usize> = (0..batch.len()).filter(|&i| batch[i].is_none()).collect();
+            if !miss.is_empty() {
+                if enc.is_none() {
+                    eprintln!("loading model {model_id} (first run downloads from HF, then offline)...");
+                    enc = Some(Encoder::load(model_id)?);
+                }
+                for chunk in miss.chunks(64) {
+                    let chunk_texts: Vec<String> =
+                        chunk.iter().map(|&i| texts[range.start + i].clone()).collect();
+                    let encoded = enc.as_mut().unwrap().encode_docs(&chunk_texts)?;
+                    let entries: Vec<(u64, Array2<f32>)> = chunk
+                        .iter()
+                        .zip(encoded)
+                        .map(|(&i, emb)| (hashes[range.start + i], emb))
+                        .collect();
+                    store.put_many(&entries)?; // share one write-once batch with the fleet
+                    for (&i, (_, emb)) in chunk.iter().zip(entries) {
+                        batch[i] = Some(emb);
+                    }
+                    encoded_done += chunk.len();
+                    eprint!("\rencoded {encoded_done}/{expected_miss}");
+                    crate::progress::phase("encoding", encoded_done, expected_miss.max(encoded_done));
+                }
+            }
+            let embeddings: Vec<Array2<f32>> =
+                batch.into_iter().map(|o| o.expect("every batch doc filled")).collect();
+            let (next, ids) = MmapIndex::update_or_create_with_metadata(
+                &embeddings,
+                &dir_str,
+                &index_config,
+                &update_config,
+                Some(&metas[range.clone()]),
+            )
+            .context("build next-plaid index batch")?;
+            anyhow::ensure!(
+                ids.len() == range.len()
+                    && ids.first().copied() == Some(range.start as i64)
+                    && ids.last().copied() == Some(range.end as i64 - 1),
+                "next-plaid assigned non-contiguous ids for docs {}..{}",
+                range.start,
+                range.end
+            );
+            indexed_done += range.len();
+            crate::progress::phase("indexing", indexed_done, n_new);
+            drop(next);
+        }
+        if encoded_done == 0 {
+            eprintln!("all {listed_reused} embeddings in store; no encode needed");
+        } else {
+            eprintln!("\nencoded {encoded_done} new docs in {:?}", t0.elapsed());
+        }
+        MmapIndex::load(&dir_str).context("load completed streamed build")?
     };
 
     // Complete the build dir: the manifest, the docs snapshot readers render
@@ -213,13 +254,23 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{fnv1a, reconcile};
+    use super::{INDEX_BATCH_DOCS, fnv1a, index_batches, reconcile};
 
     #[test]
     fn fnv1a_is_stable_and_distinguishing() {
         assert_eq!(fnv1a(b"generation isolation"), fnv1a(b"generation isolation"));
         assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"));
         assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
+    }
+
+    #[test]
+    fn large_corpus_is_covered_in_order_by_bounded_index_batches() {
+        let start = 17;
+        let end = start + INDEX_BATCH_DOCS * 2 + 9;
+        let batches = index_batches(start, end);
+        assert_eq!(batches, vec![17..2065, 2065..4113, 4113..4122]);
+        assert!(batches.iter().all(|range| range.len() <= INDEX_BATCH_DOCS));
+        assert_eq!(batches.iter().map(|range| range.len()).sum::<usize>(), end - start);
     }
 
     // The reconcile sees every corpus change stable_order can produce as an

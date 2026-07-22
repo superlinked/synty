@@ -47,18 +47,26 @@ impl EmbStore {
         decode_many(self.bucket.get_many(&keys)?)
     }
 
-    /// Resolve a corpus-sized batch from one listing, then fetch only objects
-    /// that exist. A missing hash is an encode candidate, not 100 ms of remote
-    /// negative lookup repeated for every new document.
-    pub fn get_known(&self, hashes: &[u64]) -> Result<Vec<Option<Array2<f32>>>> {
-        let known: HashSet<String> = self.bucket.list(&format!("embeddings/{}", self.ns))?.into_iter().collect();
+    /// One inventory serves every bounded batch in an index build. A missing
+    /// hash is an encode candidate, not a remote negative lookup per document.
+    pub fn known_hashes(&self) -> Result<HashSet<u64>> {
+        Ok(self
+            .bucket
+            .list(&format!("embeddings/{}", self.ns))?
+            .into_iter()
+            .filter_map(|key| key.rsplit('/').next()?.strip_suffix(".emb").and_then(|s| u64::from_str_radix(s, 16).ok()))
+            .collect())
+    }
+
+    /// Fetch only the members of `hashes` present in a previously listed
+    /// inventory, preserving corpus order and leaving misses empty.
+    pub fn get_listed(&self, hashes: &[u64], known: &HashSet<u64>) -> Result<Vec<Option<Array2<f32>>>> {
         let mut positions = Vec::new();
         let mut keys = Vec::new();
         for (i, &hash) in hashes.iter().enumerate() {
-            let key = self.key(hash);
-            if known.contains(&key) {
+            if known.contains(&hash) {
                 positions.push(i);
-                keys.push(key);
+                keys.push(self.key(hash));
             }
         }
         let fetched = decode_many(self.bucket.get_many(&keys)?)?;
@@ -256,7 +264,7 @@ mod tests {
         let b = Array2::from_shape_vec((1, 2), vec![9.0, 10.0]).unwrap();
         s.put_many(&[(42, a.clone()), (7, b.clone())]).unwrap();
 
-        let found = s.get_known(&[7, 99, 42]).unwrap();
+        let found = s.get_listed(&[7, 99, 42], &s.known_hashes().unwrap()).unwrap();
         assert_eq!(found[0].as_ref(), Some(&b));
         assert!(found[1].is_none(), "an absent corpus hash remains an encode candidate");
         assert_eq!(found[2].as_ref(), Some(&a));
