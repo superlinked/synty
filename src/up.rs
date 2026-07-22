@@ -71,7 +71,7 @@ pub fn build(bucket: &str, machine: &str, resolution: f64, no_track: bool) -> Re
     } else {
         // The tailer is skipped, not the backplane: this machine's events must
         // still reach the bucket for other builders (push is idempotent).
-        match crate::sync::push_events(bucket, &format!("{CORPUS_DIR}/local")) {
+        match crate::sync::push_events(bucket, &format!("{CORPUS_DIR}/local"), &machine) {
             Ok(n) if n > 0 => eprintln!("build: pushed {n} event chunks → {bucket}/events/"),
             Ok(_) => {}
             Err(e) => eprintln!("build: event push skipped ({e})"),

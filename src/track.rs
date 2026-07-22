@@ -183,12 +183,16 @@ impl Tracker {
         }
         self.last_push = Some(std::time::Instant::now());
         match &self.bucket {
-            Some(b) => crate::sync::push_events_with(
-                b,
-                &self.out,
-                ".synty/uploads.json",
-                (self.cutoff_ms > 0).then_some(self.cutoff_ms),
-            ),
+            Some(b) => {
+                let owned = self.streams.iter().map(|stream| stream.name.clone()).collect();
+                crate::sync::push_events_for_streams(
+                    b,
+                    &self.out,
+                    ".synty/uploads.json",
+                    (self.cutoff_ms > 0).then_some(self.cutoff_ms),
+                    &owned,
+                )
+            }
             None => Ok(0),
         }
     }

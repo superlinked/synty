@@ -124,12 +124,24 @@ struct UploadState {
 }
 
 /// Default event upload path used by builds outside the long-lived tracker.
-pub fn push_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
-    push_events_with(
+/// Only stream directories owned by this resolved machine id are eligible;
+/// pulled fleet streams below the same local corpus remain read-only.
+pub fn push_events(bucket_uri: &str, local_dir: &str, machine: &str) -> Result<usize> {
+    let prefix = format!("edge-{machine}-");
+    let owned: BTreeSet<String> = std::fs::read_dir(local_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    push_events_for_streams(
         bucket_uri,
         local_dir,
         ".synty/uploads.json",
         crate::config::capture_since_ms(),
+        &owned,
     )
 }
 
@@ -139,11 +151,39 @@ pub fn push_events(bucket_uri: &str, local_dir: &str) -> Result<usize> {
 /// on every poll, and the growing current-day file is never re-uploaded whole.
 /// The absolute capture bound is applied here as a second privacy gate, so
 /// joining a bucket does not silently publish older local history.
-pub fn push_events_with(
+#[cfg(test)]
+pub(crate) fn push_events_with(
     bucket_uri: &str,
     local_dir: &str,
     state_path: &str,
     capture_since_ms: Option<i64>,
+) -> Result<usize> {
+    push_events_scoped(bucket_uri, local_dir, state_path, capture_since_ms, None)
+}
+
+/// Production upload path with the tracker-owned streams made explicit.
+pub fn push_events_for_streams(
+    bucket_uri: &str,
+    local_dir: &str,
+    state_path: &str,
+    capture_since_ms: Option<i64>,
+    owned_streams: &BTreeSet<String>,
+) -> Result<usize> {
+    push_events_scoped(
+        bucket_uri,
+        local_dir,
+        state_path,
+        capture_since_ms,
+        Some(owned_streams),
+    )
+}
+
+fn push_events_scoped(
+    bucket_uri: &str,
+    local_dir: &str,
+    state_path: &str,
+    capture_since_ms: Option<i64>,
+    owned_streams: Option<&BTreeSet<String>>,
 ) -> Result<usize> {
     let b = bucket::open(bucket_uri)?;
     let mut state: UploadState = std::fs::read_to_string(state_path)
@@ -182,6 +222,9 @@ pub fn push_events_with(
         let rel_path = path.strip_prefix(local_dir)?;
         let rel = rel_path.to_string_lossy().replace('\\', "/");
         let (stream, file) = rel.split_once('/').unwrap_or(("local", rel.as_str()));
+        if owned_streams.is_some_and(|owned| !owned.contains(stream)) {
+            continue;
+        }
         if registered_streams.insert(stream.to_string()) {
             b.put_if_absent(&format!("{EVENT_STREAMS}/{stream}"), b"")?;
             changed = true;
@@ -771,6 +814,61 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owned_stream_upload_never_republishes_a_pulled_legacy_stream() {
+        let root = std::env::temp_dir().join(format!("synty-event-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let local = root.join("local");
+        let mine = local.join("edge-mine-codex");
+        let pulled = local.join("edge-other-codex");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&pulled).unwrap();
+        std::fs::write(
+            mine.join("track.2026-07-21.jsonl"),
+            event("mine", "s1", "user_prompt", "2026-07-21T10:00:00Z", "mine"),
+        )
+        .unwrap();
+        std::fs::write(
+            pulled.join("track.2026-07-21.jsonl"),
+            event(
+                "theirs",
+                "s2",
+                "user_prompt",
+                "2026-07-21T10:00:00Z",
+                "theirs",
+            ),
+        )
+        .unwrap();
+
+        let bucket = root.join("bucket");
+        let owned = BTreeSet::from(["edge-mine-codex".to_string()]);
+        assert_eq!(
+            push_events_for_streams(
+                bucket.to_str().unwrap(),
+                local.to_str().unwrap(),
+                root.join("uploads.json").to_str().unwrap(),
+                None,
+                &owned,
+            )
+            .unwrap(),
+            1
+        );
+
+        let b = crate::bucket::LocalFs::new(&bucket);
+        assert_eq!(
+            b.list(EVENT_STREAMS).unwrap(),
+            vec!["event-streams/edge-mine-codex"],
+            "only this tracker instance's stream is registered"
+        );
+        let uploaded = b.list(EVENTS).unwrap();
+        assert_eq!(uploaded.len(), 1);
+        assert!(
+            uploaded[0].starts_with("events/edge-mine-codex/chunks/"),
+            "pulled fleet data must stay read-only: {uploaded:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
