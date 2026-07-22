@@ -59,9 +59,11 @@ pub fn build(bucket: &str, machine: &str, resolution: f64, no_track: bool) -> Re
             which: "all".into(),
             out: format!("{CORPUS_DIR}/local"),
             max_age_days: 90,
+            capture_since_ms: crate::config::capture_since_ms(),
             machine: machine.clone(),
             watch: false,
             poll_secs: 60,
+            upload_interval_secs: crate::config::upload_interval_secs(),
             install: None,
             cursors: ".synty/cursors.json".into(),
             bucket: Some(bucket.to_string()),
@@ -69,8 +71,8 @@ pub fn build(bucket: &str, machine: &str, resolution: f64, no_track: bool) -> Re
     } else {
         // The tailer is skipped, not the backplane: this machine's events must
         // still reach the bucket for other builders (push is idempotent).
-        match crate::sync::push_events(bucket, &format!("{CORPUS_DIR}/local")) {
-            Ok(n) if n > 0 => eprintln!("build: pushed {n} event files → {bucket}/events/"),
+        match crate::sync::push_events(bucket, &format!("{CORPUS_DIR}/local"), &machine) {
+            Ok(n) if n > 0 => eprintln!("build: pushed {n} event chunks → {bucket}/events/"),
             Ok(_) => {}
             Err(e) => eprintln!("build: event push skipped ({e})"),
         }
@@ -162,9 +164,11 @@ fn tick(bucket: &str, machine: &str, poll_secs: u64) -> Result<()> {
         which: "all".into(),
         out: format!("{CORPUS_DIR}/local"),
         max_age_days: 90,
+        capture_since_ms: crate::config::capture_since_ms(),
         machine: machine.into(),
         watch: false,
         poll_secs,
+        upload_interval_secs: crate::config::upload_interval_secs(),
         install: None,
         cursors: ".synty/cursors.json".into(),
         bucket: Some(bucket.to_string()), // push events so a fleet build sees them

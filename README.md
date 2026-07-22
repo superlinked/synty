@@ -16,8 +16,9 @@ agents you work with.
 - **Your data stays yours.** Everything is open on disk: raw events as JSONL, a
   SQLite index, `--json` on every command. Chart agent friction, fine-tune a
   model, build your own dashboards. Nothing is trapped in a viewer.
-- **Local-first.** One binary, no API keys, nothing leaves your machine. Even the
-  one-line summaries run on a small local model.
+- **Local-first.** One binary and no remote model API: even the one-line
+  summaries run locally. Data stays on the machine unless you explicitly join
+  a shared team bucket.
 
 ## Quick start
 
@@ -99,13 +100,48 @@ Solo, the "bucket" is a local directory. For a team, or just your own laptop and
 desktop, point synty at one shared S3/GCS bucket and you build one memory:
 
 ```sh
-synty init gs://my-team
+# Workstation: a durable credential_process profile (for example Roles Anywhere)
+synty init s3://my-team-synty --aws-profile synty-writer --capture-since now
+
+# AWS VM/container: omit --aws-profile and use its instance/task/workload role
+synty init s3://my-team-synty --capture-since 2026-07-21
+```
+
+On a systemd-based EC2 developer VM, enable lingering once so the per-user
+tracker starts at boot without an SSH login, then run `init` normally:
+
+```sh
+sudo loginctl enable-linger "$USER"
 ```
 
 That bucket is the only shared infrastructure: no build server, no coordination
-service. Every machine's tracker pushes events; whoever opens a viewer builds the
-index and publishes it for the rest; one tokened machine scrapes GitHub for
-everyone. Cloud buckets need `--features s3` / `gcs`.
+service. Each machine writes a stable `edge-<machine>-<source>` stream, so
+writers do not overwrite one another. Readers pull every stream plus the latest
+published read-model. A bounded stream registry and per-stream local key cursors
+avoid relisting historical chunks on each read. The TUI builds unpublished
+event deltas in the background;
+`synty build` does the same explicitly, while `search` warns if raw events are
+newer than the published index. One tokened machine scrapes GitHub for everyone.
+
+The tracker polls locally every 30 seconds and, by default, uploads only new
+complete event lines every 60 seconds as immutable chunks (not one request per
+event and not a whole-file rewrite). Set `--upload-interval <seconds>` on
+`init` to change that cadence. `--capture-since now`, a UTC date, or an RFC3339
+timestamp is resolved and persisted as an absolute lower bound; older agent
+content is neither newly uploaded nor included in a published read-model. This
+is a forward collection boundary, not deletion of objects already in a bucket.
+
+Do not use an expiring `aws sso login` session as the unattended credential.
+On workstations, point `--aws-profile` at a shared-config profile backed by a
+refreshing `credential_process`; on EC2/ECS/EKS, omit it and grant the workload
+role access to the bucket. The login service stores only the profile name, never
+AWS keys. Release assets include S3/GCS support; source builds need
+`--features s3` / `gcs`.
+
+For S3, scope each writer/reader role to the chosen bucket (or URI prefix):
+`s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, and
+`s3:DeleteObject` on its objects. Delete is used only to release the soft build
+lease; event chunks and content-addressed derived objects are immutable.
 
 > **Heads up:** every member with the bucket can read every session in it. synty
 > is built for high-trust groups; there's no per-reader redaction. If that

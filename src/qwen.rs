@@ -2,14 +2,14 @@
 // sentence per session, generated offline and cached by an input hash so the
 // reader never runs the model at view time. Greedy decode (temperature 0) keeps
 // it reproducible. This is the ONLY place a generative model is used — retrieval
-// and clustering stay LLM-free, and nothing leaves the machine.
+// and clustering stay LLM-free, with no remote model call.
 
 use crate::units::{self, CachedSummary, DocInput, SessionInput};
-use anyhow::{anyhow, Context, Result};
-use candle_core::{DType, Device, Tensor, D};
-use ndarray::Array2;
+use anyhow::{Context, Result, anyhow};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::{Config, ModelForCausalLM};
+use ndarray::Array2;
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
@@ -836,7 +836,6 @@ const MIN_MEMBERS_FOR_COH: usize = 5;
 struct NameVerdict {
     name_score: f32,
     coh_p10: f32,
-    members: usize,
     reject: bool,
 }
 
@@ -870,8 +869,16 @@ fn score_name(name: &Array2<f32>, members: &[Array2<f32>]) -> NameVerdict {
     let coh = member_coherences(members);
     let p10 = percentile(&coh, COH_PCTILE);
     // Tiny clusters: the percentile is noise — lean on the absolute floor only.
-    let floor = if members.len() < MIN_MEMBERS_FOR_COH { ABS_FLOOR } else { ABS_FLOOR.max(COH_BETA * p10) };
-    NameVerdict { name_score: ns, coh_p10: p10, members: members.len(), reject: ns < floor }
+    let floor = if members.len() < MIN_MEMBERS_FOR_COH {
+        ABS_FLOOR
+    } else {
+        ABS_FLOOR.max(COH_BETA * p10)
+    };
+    NameVerdict {
+        name_score: ns,
+        coh_p10: p10,
+        reject: ns < floor,
+    }
 }
 
 /// Top-GATE_MEMBERS member embeddings for a topic, loaded from the store

@@ -236,11 +236,37 @@ struct Agg {
 /// Fold one envelope line into the per-session tallies. Split from
 /// `aggregate()` so scenario tests can feed envelope strings directly; the
 /// event-id `seen` set stays caller-owned because dedup spans files.
-fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<u64>, aggs: &mut HashMap<String, Agg>) {
+#[cfg(test)]
+fn fold_line(
+    line: &str,
+    known: &std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<u64>,
+    aggs: &mut HashMap<String, Agg>,
+) {
+    fold_line_since(line, known, seen, aggs, None)
+}
+
+fn fold_line_since(
+    line: &str,
+    known: &std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<u64>,
+    aggs: &mut HashMap<String, Agg>,
+    capture_since_ms: Option<i64>,
+) {
     if line.trim().is_empty() {
         return;
     }
-    let Ok(ev) = serde_json::from_str::<Value>(line) else { return };
+    let Ok(ev) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let ts = ev["ts"].as_str().unwrap_or("");
+    let visible = crate::config::captured_at(ts, capture_since_ms);
+    // A pre-boundary session_start carries repo/actor metadata required by a
+    // retained later turn. Every other proven-old event stays out of summaries
+    // and shared derived artifacts.
+    if !visible && ev["kind"].as_str() != Some("session_start") {
+        return;
+    }
     if !crate::event::first_sighting(seen, ev["event_id"].as_str().unwrap_or("")) {
         return;
     }
@@ -254,8 +280,7 @@ fn fold_line(line: &str, known: &std::collections::HashSet<String>, seen: &mut s
             a.source = src.to_string();
         }
     }
-    let ts = ev["ts"].as_str().unwrap_or("");
-    if !ts.is_empty() {
+    if visible && !ts.is_empty() {
         if a.first.is_empty() || ts < a.first.as_str() {
             a.first = ts.to_string();
         }
@@ -823,17 +848,22 @@ pub fn tool_profile(name: &str) -> ToolProfile {
 /// Aggregate the raw envelopes under corpus/local into per-session tallies.
 fn aggregate() -> HashMap<String, Agg> {
     // The org's repos (from the last back-fill) — fold worktree dirs onto them.
-    let known: std::collections::HashSet<String> = crate::config::load().repos.into_iter().collect();
+    let known: std::collections::HashSet<String> =
+        crate::config::load().repos.into_iter().collect();
     let mut aggs: HashMap<String, Agg> = HashMap::new();
     // Overlapping trackers can append the same envelope twice; ids are
     // deterministic, so count each event once.
     let mut seen = std::collections::HashSet::new();
+    let capture_since_ms = crate::config::capture_since_ms();
     for f in jsonl_files(Path::new(LOCAL_DIR)) {
-        let Ok(data) = std::fs::read_to_string(&f) else { continue };
+        let Ok(data) = std::fs::read_to_string(&f) else {
+            continue;
+        };
         for line in data.lines() {
-            fold_line(line, &known, &mut seen, &mut aggs);
+            fold_line_since(line, &known, &mut seen, &mut aggs, capture_since_ms);
         }
     }
+    aggs.retain(|_, a| !a.first.is_empty());
     aggs
 }
 
@@ -1180,10 +1210,11 @@ pub fn repo_from_cwd(cwd: &str, known: &std::collections::HashSet<String>) -> St
 
 /// Repo name from a cwd's `git remote origin` (basename, no `.git`), cached per
 /// cwd; `None` if the checkout is gone or has no remote. Resolves local repos
-/// that aren't in the tracked org — locally, nothing leaves the machine.
+/// that aren't in the tracked org, without a network lookup.
 fn git_repo(cwd: &str) -> Option<String> {
     use std::sync::{LazyLock, Mutex};
-    static CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    static CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     if cwd.is_empty() {
         return None;
     }
@@ -1425,6 +1456,57 @@ mod tests {
             fold_line(line, &known, &mut seen, &mut aggs);
         }
         aggs
+    }
+
+    fn aggs_since(text: &str, cutoff: i64) -> HashMap<String, Agg> {
+        let known = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut aggs = HashMap::new();
+        for line in text.lines() {
+            fold_line_since(line, &known, &mut seen, &mut aggs, Some(cutoff));
+        }
+        aggs.retain(|_, a| !a.first.is_empty());
+        aggs
+    }
+
+    #[test]
+    fn capture_boundary_keeps_metadata_but_summarizes_only_retained_work() {
+        let line = |id: &str, kind: &str, ts: &str, text: &str| {
+            serde_json::json!({
+                "event_id": id, "session_id": "s", "source": "codex_cli", "kind": kind, "ts": ts,
+                "payload": if kind == "session_start" {
+                    serde_json::json!({"cwd": "/work/repo", "actor": "alice"})
+                } else {
+                    serde_json::json!({"text": text})
+                }
+            })
+            .to_string()
+        };
+        let text = [
+            line("a", "session_start", "2026-07-20T23:50:00Z", ""),
+            line(
+                "b",
+                "user_prompt",
+                "2026-07-20T23:55:00Z",
+                "old secret prompt",
+            ),
+            line(
+                "c",
+                "user_prompt",
+                "2026-07-21T00:05:00Z",
+                "new retained prompt",
+            ),
+        ]
+        .join("\n");
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let aggs = aggs_since(&text, cutoff);
+        let a = &aggs["s"];
+        assert_eq!(a.actor, "alice");
+        assert_eq!(a.ask, "new retained prompt");
+        assert_eq!(a.first, "2026-07-21T00:05:00Z");
+        assert!(!a.texts.iter().any(|t| t.contains("old secret")));
     }
 
     fn day_stats_of(text: &str) -> HashMap<String, DayStat> {

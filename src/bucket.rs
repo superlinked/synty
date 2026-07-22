@@ -17,11 +17,20 @@ pub trait Bucket: Send + Sync {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
     fn exists(&self, key: &str) -> Result<bool>;
-    /// Byte size of an object, or None if absent — a cheap change check for
-    /// append-only event files (no full download).
+    /// Byte size of an object, or None if absent — used for legacy mutable
+    /// event compatibility and other metadata-only checks.
     fn size(&self, key: &str) -> Result<Option<u64>>;
     /// All keys under `prefix` (recursive), relative to the bucket root.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// Keys under `prefix` whose full key sorts after `offset`. Cloud stores
+    /// push the cursor into their paginated LIST; local/test stores filter the
+    /// already-sorted result.
+    fn list_after(&self, prefix: &str, offset: &str) -> Result<Vec<String>> {
+        let mut keys = self.list(prefix)?;
+        keys.retain(|key| key.as_str() > offset);
+        keys.sort();
+        Ok(keys)
+    }
     /// Create the object only if absent; Ok(true) = we created it, Ok(false) =
     /// someone else holds it. The atomic primitive under leases and write-once
     /// stores (local: hard-link-if-absent; cloud: conditional PUT).

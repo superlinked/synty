@@ -381,13 +381,13 @@ pub fn roster(docs: &[Doc], local: &std::path::Path) -> Roster {
 /// `edge-<machine>-<sourceid>` → (machine, sourceid). Streams that predate
 /// the grammar fold to machine "local".
 fn machine_of(stream: &str) -> (String, String) {
+    if let Some((machine, source)) = crate::identity::stream_parts(stream) {
+        return (machine.to_string(), source.to_string());
+    }
     let Some(rest) = stream.strip_prefix("edge-") else {
         return ("local".into(), stream.to_string());
     };
-    match rest.rsplit_once('-') {
-        Some((m, src)) => (m.to_string(), src.to_string()),
-        None => (rest.to_string(), String::new()),
-    }
+    (rest.to_string(), String::new())
 }
 
 fn rfc3339(ms: i64) -> String {
