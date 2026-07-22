@@ -3,5 +3,12 @@ target
 tmp
 corpus
 .synty
+.env
+.env.*
+.aws
+*.pem
+*.key
+*.p12
+*.pfx
 docs/*.gif
 evals/runs*

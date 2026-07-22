@@ -170,13 +170,16 @@ runs on CI or a server without a developer machine.
 - **MCP server:** `synty mcp` serves the CLI's read surface as agent tools over
   stdio by default (hand-rolled JSON-RPC): search, related, topics, recent,
   status, stats, tool, show, plus forensic `synty_trace_*` tools. Role/tool
-  policy and optional read scope bound mediated clients; responses apply a
+  policy and optional read scope bind mediated clients; responses apply a
   redaction profile. A restricted scope is applied before topics and detail
   aggregates are built; global health surfaces are unavailable. `sources`
   names native producers, matching both indexed and trace data. `--http`
   (feature `mcp-http`) exposes the same dispatcher as authenticated Streamable
-  HTTP at `/mcp` for remote agents. It requires a 32-byte bearer token,
-  validates exact browser origins and protocol versions, bounds requests, and
+  HTTP at `/mcp` for remote agents. It requires a 32-byte bearer token; any
+  non-loopback `--bind` also requires `--listen-public`, `--tls-cert`, and
+  `--tls-key`. `--scope`, `--redaction`, and repeatable `--allowed-origin`
+  configure the mediated boundary. The transport validates exact browser
+  origins and protocol versions, bounds requests, and
   keeps health responsive while tool calls run. It pulls the published query
   model before serving and continues potentially large raw-event transfers in
   the background. Raw-history analysis is serialized separately so it cannot
@@ -188,7 +191,10 @@ runs on CI or a server without a developer machine.
   owned envelope streams with deterministic ids, capture boundaries, and
   import-time redaction. Identity derives from native ids or canonical event
   content, independent of input path and line order; concurrent writers lock
-  the owned stream. Dry runs write neither streams nor quarantine files. *Built.*
+  the owned stream. `--format`, `--machine`, `--campaign`, `--role`, `--repo`,
+  `--actor`, `--since`, `--redaction`, `--quarantine`, and `--bucket` describe
+  the foreign source and publication policy; `--dry-run` writes neither streams
+  nor quarantine files. *Built.*
 - **JSON output:** `--json` on every read command, one versioned envelope
   (`{"v": 1, "kind": …, "data": …}`) so scripts check the format once. *Built.*
 
@@ -338,8 +344,9 @@ The container image is a separate release artifact. Tag builds publish a
 through a GitHub OIDC role. Each architecture builds on a native hosted runner;
 the release verifies both platforms after composing the index. The Helm chart
 follows `Chart.appVersion`, runs each container as UID 10001 with a read-only
-root filesystem, and exposes MCP only as a cluster Service. TLS belongs at the
-Ingress or service-mesh boundary.
+root filesystem, and exposes MCP only as a cluster Service. Remote MCP is
+disabled by default; enabling it requires an application TLS Secret and a
+NetworkPolicy with explicit source selectors.
 
 ## Data compatibility
 
@@ -367,8 +374,8 @@ build + publish), `search [--filter col=value] [--json]`, `topic`, `recent`,
 `status`, `trace list/show/search/compare` (turns, spans, async jobs), `tui`,
 `mcp` (stdio + optional HTTP), `import`, `cluster [--resolution]`, `summarize`,
 `eval`, plus the scenario test suite (`cargo test`, pure). The bucket backplane
-(local always, S3/GCS/MCP-HTTP opt-in) gives fleet-wide encode-once and
-collaborative builds.
+(local always, S3/GCS opt-in) gives fleet-wide encode-once and collaborative
+builds. MCP-HTTP is an optional mediated transport for remote clients.
 Validated at M0/M1 on real data (3,938 docs / 770 K embeddings): retrieval 12/12
 relevant top-3, agent task-start dogfood 3/3, session summaries specific and
 accurate (extractive in the core; one-line abstractive from a local Qwen3-0.6B

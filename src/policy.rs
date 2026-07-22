@@ -70,10 +70,7 @@ impl ReadScope {
     }
 
     pub fn allows_event(&self, event: &Event, repo: &str) -> bool {
-        self.allows_repo(repo)
-            && self.allows_source(&event.source)
-            && allowed(&self.campaigns, campaign(event))
-            && allowed(&self.roles, role(event))
+        self.allows_fields(repo, campaign(event), role(event), &event.source)
     }
 
     pub fn restricted(&self) -> bool {
@@ -120,14 +117,14 @@ fn allowed(values: &[String], candidate: &str) -> bool {
     values.is_empty() || values.iter().any(|value| value == candidate)
 }
 
-fn campaign(event: &Event) -> &str {
+pub(crate) fn campaign(event: &Event) -> &str {
     if !event.rollup_dim.is_empty() {
         return &event.rollup_dim;
     }
     event.payload["campaign_id"].as_str().unwrap_or("")
 }
 
-fn role(event: &Event) -> &str {
+pub(crate) fn role(event: &Event) -> &str {
     event.payload["campaign_role"].as_str().unwrap_or("")
 }
 

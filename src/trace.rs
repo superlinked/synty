@@ -217,14 +217,10 @@ impl TraceStore {
             ctx.machine = machine.clone();
         }
         if ctx.campaign.is_empty() {
-            ctx.campaign = if ev.rollup_dim.is_empty() {
-                ev.payload["campaign_id"].as_str().unwrap_or("").to_string()
-            } else {
-                ev.rollup_dim.clone()
-            };
+            ctx.campaign = crate::policy::campaign(&ev).to_string();
         }
         if ctx.role.is_empty() {
-            ctx.role = ev.payload["campaign_role"].as_str().unwrap_or("").to_string();
+            ctx.role = crate::policy::role(&ev).to_string();
         }
         if let Some(cwd) = event_cwd(&ev.payload).filter(|s| !s.is_empty()) {
             if ctx.cwd.is_empty() {
@@ -883,11 +879,12 @@ fn scope_allows(
 ) -> bool {
     let Some(scope) = scope else { return true };
     let context = store.sessions.get(session_id);
-    scope.allows_repo(repo)
-        && scope.allows_source(source)
-        && (scope.campaigns.is_empty()
-            || context.is_some_and(|ctx| scope.campaigns.contains(&ctx.campaign)))
-        && (scope.roles.is_empty() || context.is_some_and(|ctx| scope.roles.contains(&ctx.role)))
+    scope.allows_fields(
+        repo,
+        context.map(|ctx| ctx.campaign.as_str()).unwrap_or(""),
+        context.map(|ctx| ctx.role.as_str()).unwrap_or(""),
+        source,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -985,7 +982,7 @@ pub fn show_text(
     scope: Option<&crate::policy::ReadScope>,
 ) -> Result<String> {
     let store = TraceStore::load()?;
-    let resolved = resolve(&store, id)?;
+    let resolved = resolve(&store, id, scope)?;
     anyhow::ensure!(resolved_allowed(&store, &resolved, scope), "trace id is outside the read scope");
     match resolved {
         Resolved::Job(i) => show_job_text(&store, i, json_out),
@@ -1008,8 +1005,8 @@ pub fn compare_text(
     scope: Option<&crate::policy::ReadScope>,
 ) -> Result<String> {
     let store = TraceStore::load()?;
-    let left_resolved = resolve(&store, left)?;
-    let right_resolved = resolve(&store, right)?;
+    let left_resolved = resolve(&store, left, scope)?;
+    let right_resolved = resolve(&store, right, scope)?;
     anyhow::ensure!(
         resolved_allowed(&store, &left_resolved, scope)
             && resolved_allowed(&store, &right_resolved, scope),
@@ -1206,49 +1203,51 @@ fn resolved_allowed(
         }
         Resolved::Session(session_id) => {
             let context = store.sessions.get(session_id);
-            scope.is_none_or(|scope| {
-                context.is_some_and(|ctx| {
-                    scope.allows_repo(&ctx.repo)
-                        && scope.allows_source(&ctx.source)
-                        && (scope.campaigns.is_empty()
-                            || scope.campaigns.contains(&ctx.campaign))
-                        && (scope.roles.is_empty() || scope.roles.contains(&ctx.role))
+            scope.is_none()
+                || context.is_some_and(|ctx| {
+                    scope_allows(store, session_id, &ctx.repo, &ctx.source, scope)
                 })
-            })
         }
     }
 }
 
-fn resolve(store: &TraceStore, query: &str) -> Result<Resolved> {
+fn resolve(
+    store: &TraceStore,
+    query: &str,
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<Resolved> {
     if query.chars().count() < 4 {
         bail!("trace id prefixes must be at least 4 characters");
     }
     let mut bases: HashMap<String, Resolved> = HashMap::new();
     for (i, j) in store.jobs.iter().enumerate() {
-        if id_matches(&j.id, query) {
-            bases.insert(j.id.clone(), Resolved::Job(i));
+        let resolved = Resolved::Job(i);
+        if id_matches(&j.id, query) && resolved_allowed(store, &resolved, scope) {
+            bases.insert(j.id.clone(), resolved);
         }
     }
     for (i, t) in store.turns.iter().enumerate() {
-        if id_matches(&t.id, query) {
-            bases.insert(t.id.clone(), Resolved::Turn(i));
+        let resolved = Resolved::Turn(i);
+        if id_matches(&t.id, query) && resolved_allowed(store, &resolved, scope) {
+            bases.insert(t.id.clone(), resolved);
         }
     }
     for (i, s) in store.spans.iter().enumerate() {
-        if id_matches(&s.id, query) {
-            bases.entry(s.id.clone()).or_insert(Resolved::Span(i));
+        let resolved = Resolved::Span(i);
+        if id_matches(&s.id, query) && resolved_allowed(store, &resolved, scope) {
+            bases.entry(s.id.clone()).or_insert(resolved);
         }
     }
     for sid in store.session_events.keys() {
-        if id_matches(sid, query) {
-            bases
-                .entry(sid.clone())
-                .or_insert_with(|| Resolved::Session(sid.clone()));
+        let resolved = Resolved::Session(sid.clone());
+        if id_matches(sid, query) && resolved_allowed(store, &resolved, scope) {
+            bases.entry(sid.clone()).or_insert(resolved);
         }
     }
     for (i, e) in store.events.iter().enumerate() {
-        if id_matches(&e.id, query) {
-            bases.entry(e.id.clone()).or_insert(Resolved::Event(i));
+        let resolved = Resolved::Event(i);
+        if id_matches(&e.id, query) && resolved_allowed(store, &resolved, scope) {
+            bases.entry(e.id.clone()).or_insert(resolved);
         }
     }
     match bases.len() {
@@ -2628,7 +2627,43 @@ mod tests {
         let shown_right = display_id(&s, right);
         assert_ne!(shown_left, shown_right);
         assert!(shown_left.len() > 8);
-        assert!(resolve(&s, &shown_left).is_ok());
-        assert!(resolve(&s, &shown_right).is_ok());
+        assert!(resolve(&s, &shown_left, None).is_ok());
+        assert!(resolve(&s, &shown_right, None).is_ok());
+    }
+
+    #[test]
+    fn scoped_trace_prefixes_never_reveal_disallowed_candidates() {
+        let lines = [
+            ev(
+                "01JSCOPEDALLOWED0000000000",
+                "2026-06-01T10:00:00Z",
+                "harness",
+                "allowed-session",
+                "assistant_message",
+                json!({"text":"allowed evidence"}),
+            ),
+            ev(
+                "01JSCOPEDBLOCKED0000000000",
+                "2026-06-01T10:00:01Z",
+                "codex_cli",
+                "blocked-session",
+                "assistant_message",
+                json!({"text":"blocked evidence"}),
+            ),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let store = TraceStore::from_lines(&refs);
+        let scope = crate::policy::ReadScope {
+            sources: vec!["harness".into()],
+            ..Default::default()
+        };
+
+        let resolved = resolve(&store, "01JS", Some(&scope)).expect("one allowed candidate");
+        let Resolved::Event(index) = resolved else { panic!("expected an event") };
+        assert_eq!(store.events[index].id, "01JSCOPEDALLOWED0000000000");
+        assert!(
+            resolve(&store, "01JSCOPEDBLOCKED", Some(&scope)).is_err(),
+            "an exact disallowed prefix must look absent"
+        );
     }
 }

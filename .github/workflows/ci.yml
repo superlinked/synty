@@ -34,6 +34,11 @@ jobs:
         run: |
           helm lint deploy/helm/synty --set bucket=s3://example/synty
           helm template synty deploy/helm/synty --set bucket=s3://example/synty >/tmp/synty.yaml
+          if helm template synty deploy/helm/synty \
+            --set bucket=s3://example/synty --set mcp.enabled=true >/tmp/synty-insecure.yaml; then
+            echo "MCP rendered without a TLS Secret" >&2
+            exit 1
+          fi
       - name: Render every optional branch
         run: >-
           helm template synty deploy/helm/synty
@@ -42,6 +47,8 @@ jobs:
           --set awsProfile=workload
           --set tracker.campaign=campaign-1
           --set tracker.role=primary
+          --set mcp.enabled=true
+          --set mcp.tls.existingSecret=synty-mcp-tls
           --set mcp.allowedOrigins[0]=https://memory.example.com
           --set persistence.enabled=false >/tmp/synty-options.yaml
       - name: Build the shipped image

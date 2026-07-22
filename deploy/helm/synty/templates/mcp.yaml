@@ -1,4 +1,18 @@
 {{- if .Values.mcp.enabled }}
+{{- if not .Values.networkPolicy.enabled }}
+{{- fail "networkPolicy.enabled must be true when MCP is enabled" }}
+{{- end }}
+{{- if not .Values.networkPolicy.ingressFrom }}
+{{- fail "networkPolicy.ingressFrom must select at least one trusted MCP caller" }}
+{{- end }}
+{{- range .Values.networkPolicy.ingressFrom }}
+{{- if empty . }}
+{{- fail "networkPolicy.ingressFrom entries must contain a podSelector or restricted namespaceSelector" }}
+{{- end }}
+{{- if and (hasKey . "namespaceSelector") (empty .namespaceSelector) }}
+{{- fail "an empty namespaceSelector would expose MCP to every namespace" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,7 +50,7 @@ spec:
           command: ["/bin/sh", "-ec"]
           args:
             - |
-              set -- synty mcp --bucket "$SYNTY_BUCKET" --http --listen-public --bind "0.0.0.0:{{ .Values.mcp.port }}" --role "$SYNTY_MCP_ROLE" --scope /etc/synty/scope.json --redaction mcp_safe
+              set -- synty mcp --bucket "$SYNTY_BUCKET" --http --listen-public --bind "0.0.0.0:{{ .Values.mcp.port }}" --tls-cert /etc/synty/tls/tls.crt --tls-key /etc/synty/tls/tls.key --role "$SYNTY_MCP_ROLE" --scope /etc/synty/scope.json --redaction mcp_safe
               {{- range .Values.mcp.allowedOrigins }}
               set -- "$@" --allowed-origin {{ . | quote }}
               {{- end }}
@@ -63,17 +77,18 @@ spec:
             - { name: synty-home, mountPath: /var/synty }
             - { name: tmp, mountPath: /tmp }
             - { name: scope, mountPath: /etc/synty, readOnly: true }
+            - { name: tls, mountPath: /etc/synty/tls, readOnly: true }
           # Startup includes a read-only pull of the published query model; raw
           # trace chunks continue in the background after the service is ready.
           startupProbe:
-            httpGet: { path: /health, port: mcp }
+            httpGet: { path: /health, port: mcp, scheme: HTTPS }
             periodSeconds: 10
             failureThreshold: 120
           livenessProbe:
-            httpGet: { path: /health, port: mcp }
+            httpGet: { path: /health, port: mcp, scheme: HTTPS }
             periodSeconds: 30
           readinessProbe:
-            httpGet: { path: /health, port: mcp }
+            httpGet: { path: /health, port: mcp, scheme: HTTPS }
             periodSeconds: 10
           resources:
             {{- toYaml .Values.mcp.resources | nindent 12 }}
@@ -89,6 +104,14 @@ spec:
         - name: scope
           configMap:
             name: {{ include "synty.fullname" . }}
+        - name: tls
+          secret:
+            secretName: {{ required "mcp.tls.existingSecret is required when MCP is enabled" .Values.mcp.tls.existingSecret }}
+            items:
+              - key: {{ .Values.mcp.tls.certificateKey }}
+                path: tls.crt
+              - key: {{ .Values.mcp.tls.privateKeyKey }}
+                path: tls.key
 ---
 apiVersion: v1
 kind: Service

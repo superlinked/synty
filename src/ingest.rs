@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn session_messages_become_docs_with_repo_from_cwd() {
         let lines = [
-            r#"{"kind":"session_start","source":"harness","session_id":"S1","payload":{"cwd":"/Users/d/c/sie-internal/x","backend":"codex"}}"#,
+            r#"{"kind":"session_start","source":"harness","session_id":"S1","rollup_dim":"campaign-42","payload":{"cwd":"/Users/d/c/sie-internal/x","campaign_role":"investigator","backend":"codex"}}"#,
             r#"{"kind":"user_prompt","session_id":"S1","ts":"2026-05-02T09:00:00Z","payload":{"text":"fix the login redirect bug"}}"#,
             r#"{"kind":"assistant_message","session_id":"S1","ts":"2026-05-02T09:01:00Z","payload":{"text":"I'll inspect auth.ts and the redirect handler"}}"#,
             r#"{"kind":"assistant_message","session_id":"S1","ts":"2026-05-02T09:02:00Z","payload":{"text":"ok"}}"#,
@@ -542,6 +542,8 @@ mod tests {
         assert!(docs.iter().all(|d| d.meta.session_id == "S1"));
         assert!(docs.iter().all(|d| d.meta.repo == "sie-internal"));
         assert!(docs.iter().all(|d| d.meta.source == "agent"));
+        assert!(docs.iter().all(|d| d.meta.campaign_id == "campaign-42"));
+        assert!(docs.iter().all(|d| d.meta.campaign_role == "investigator"));
         assert!(docs.iter().all(|d| d.meta.backend == "codex"));
         assert!(docs.iter().all(|d| d.meta.capture_source == "harness"));
     }

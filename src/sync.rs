@@ -961,6 +961,28 @@ mod tests {
     }
 
     #[test]
+    fn upload_redaction_removes_bearer_tokens_while_off_is_lossless() {
+        let raw = concat!(
+            r#"{"event_id":"E","kind":"tool_result","payload":{"text":"Authorization: Bearer abcdefghijklmnop"}}"#,
+            "\n",
+        )
+        .as_bytes();
+
+        assert_eq!(
+            redact_event_lines(raw, crate::redact::Profile::Off),
+            raw,
+            "raw bucket mode must preserve the source bytes"
+        );
+        let redacted = String::from_utf8(redact_event_lines(
+            raw,
+            crate::redact::Profile::Standard,
+        ))
+        .unwrap();
+        assert!(redacted.contains("[REDACTED]"), "{redacted}");
+        assert!(!redacted.contains("abcdefghijklmnop"), "{redacted}");
+    }
+
+    #[test]
     fn advanced_uploads_refuse_irreversible_policy_changes() {
         let bucket = "s3://team/events";
         let mut state = UploadState::default();

@@ -412,6 +412,12 @@ enum Cmd {
         /// Permit a non-loopback bind. Put the endpoint behind TLS.
         #[arg(long)]
         listen_public: bool,
+        /// PEM certificate for HTTPS. Required with a non-loopback bind.
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<String>,
+        /// PEM private key for HTTPS. Required with a non-loopback bind.
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<String>,
         /// Exact browser Origin allowed to call HTTP MCP (repeatable). Clients
         /// without an Origin header, such as server-side agents, are allowed.
         #[arg(long = "allowed-origin")]
@@ -933,6 +939,8 @@ fn main() -> Result<()> {
             bind,
             token,
             listen_public,
+            tls_cert,
+            tls_key,
             allowed_origins,
             role,
             scope,
@@ -958,6 +966,8 @@ fn main() -> Result<()> {
                     bind,
                     token,
                     listen_public,
+                    tls_cert,
+                    tls_key,
                     role,
                     scope,
                     redaction,
@@ -1151,6 +1161,10 @@ mod tests {
             "127.0.0.1:9000",
             "--token",
             "secret",
+            "--tls-cert",
+            "tls.crt",
+            "--tls-key",
+            "tls.key",
             "--role",
             "investigator",
             "--scope",
@@ -1168,6 +1182,8 @@ mod tests {
                 http: true,
                 bind,
                 token: Some(t),
+                tls_cert: Some(cert),
+                tls_key: Some(key),
                 role,
                 scope: Some(s),
                 redaction: Some(r),
@@ -1175,6 +1191,8 @@ mod tests {
                 ..
             } if b == "s3://team" && bind == "127.0.0.1:9000"
                 && t == "secret"
+                && cert == "tls.crt"
+                && key == "tls.key"
                 && role == "investigator"
                 && s == "scope.json"
                 && r == "mcp_safe"

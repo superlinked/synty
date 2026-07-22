@@ -63,7 +63,9 @@ builder:
     limits: { cpu: "8", memory: 8Gi }
 
 mcp:
-  enabled: true
+  # Remote MCP is opt-in because a non-loopback listener requires both TLS
+  # material and an explicitly restricted NetworkPolicy source.
+  enabled: false
   port: 8765
   role: investigator
   existingSecret: synty-mcp
@@ -71,6 +73,11 @@ mcp:
   tokenKey: token
   # Exact browser origins. Server-side clients normally omit Origin.
   allowedOrigins: []
+  tls:
+    # Kubernetes TLS Secret (PEM data under certificateKey/privateKeyKey).
+    existingSecret: ""
+    certificateKey: tls.crt
+    privateKeyKey: tls.key
   scope:
     repos: []
     campaigns: []

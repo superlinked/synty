@@ -98,6 +98,30 @@ jq -r '.meta.kind' ~/.synty/corpus/docs.jsonl | sort | uniq -c              # st
 Because synty already clusters the work and links across sources (PRs, issues,
 sessions), your analysis starts from structured data, not a heap of logs.
 
+Harnesses can import their own canonical NDJSON and use the same read surface:
+
+```sh
+# Validate first; rejected rows can be quarantined without changing the corpus.
+synty import run.ndjson --format harness --machine eval-1 --campaign c42 \
+  --role validator --repo sie-internal --since now --redaction standard \
+  --quarantine tmp/rejected.ndjson --dry-run
+
+# A writer may then append and publish the owned harness stream.
+synty import run.ndjson --format harness --machine eval-1 --campaign c42 \
+  --role validator --repo sie-internal --bucket s3://my-team-synty
+
+# Local agents normally use stdio. Remote server-side agents use authenticated
+# Streamable HTTP; a non-loopback bind additionally requires HTTPS material.
+synty mcp --role investigator --scope scope.json --redaction mcp_safe
+SYNTY_MCP_TOKEN="$token" synty mcp --http --bind 0.0.0.0:8765 \
+  --listen-public --tls-cert tls.crt --tls-key tls.key \
+  --allowed-origin https://memory.example.com --scope scope.json
+```
+
+`import` also accepts `--actor`; omit `--dry-run` to append. `mcp --http`
+defaults to loopback, where TLS is optional for local development. The scope
+file contains `repos`, `campaigns`, `roles`, and native `sources` allowlists.
+
 ## Teams
 
 Solo, the "bucket" is a local directory. For a team, or just your own laptop and
@@ -119,6 +143,11 @@ synty init s3://my-team-synty --capture-repo api --capture-repo web
 # Raw events remain the rebuildable bucket source of truth by default.
 # Redaction before upload is explicit and irreversible for those chunks.
 synty init s3://my-team-synty --upload-redaction standard
+
+# Stamp campaign metadata, choose the stream identity, and set the default
+# response redaction used by a separately supervised MCP process.
+synty init s3://my-team-synty --campaign c42 --role primary --machine eval-1 \
+  --mcp-redaction mcp_safe --no-autostart
 ```
 
 Codex and Claude Code session roots honor `$CODEX_HOME` and `$CLAUDE_CONFIG_DIR`
@@ -177,8 +206,9 @@ correct endpoint.
 > scope, and response redaction. If neither fit, stay local, or scope the bucket
 > to people who already see each other's work.
 
-For HTTP MCP, use a random token of at least 32 bytes and terminate TLS at an
-Ingress or service mesh. Browser callers also need an exact `--allowed-origin`;
+For HTTP MCP, use a random token of at least 32 bytes. A non-loopback listener
+requires `--tls-cert` and `--tls-key`; the Helm chart mounts them from a
+Kubernetes TLS Secret. Browser callers also need an exact `--allowed-origin`;
 server-side callers normally send no Origin header. A scope's `sources` values
 name native producers such as `harness`, `codex_cli`, or `github`. Restricted
 scopes omit fleet-wide status/stat/tool surfaces and rebuild topic facets only
@@ -197,9 +227,10 @@ The Helm chart under `deploy/helm/synty` defaults to the private image
 tags build each architecture on a native GitHub runner, then publish a verified
 `linux/amd64` + `linux/arm64` manifest through GitHub OIDC. Deploy
 `deploy/aws/ecr-publisher.yaml` once and set the repository variable
-`AWS_ECR_PUBLISH_ROLE_ARN` to its role output. The MCP Service is cluster-internal. Its
-default NetworkPolicy accepts same-namespace callers only; configure TLS and
-`mcp.allowedOrigins` at the ingress boundary.
+`AWS_ECR_PUBLISH_ROLE_ARN` to its role output. Remote MCP is disabled by default;
+enabling it requires a TLS Secret and a NetworkPolicy whose source selectors
+name trusted callers. The Service remains cluster-internal, and its default
+NetworkPolicy accepts same-namespace callers only.
 
 ## How it works
 

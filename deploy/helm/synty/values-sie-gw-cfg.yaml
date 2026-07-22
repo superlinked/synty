@@ -19,7 +19,10 @@ builder:
   enabled: false
 
 mcp:
+  enabled: true
   role: operator
+  tls:
+    existingSecret: synty-mcp-tls
   # Empty allowlists deliberately expose all internal bucket records. The MCP
   # surface remains read-only and applies mcp_safe response redaction.
   scope:
@@ -30,6 +33,6 @@ mcp:
 
 networkPolicy:
   enabled: true
-  # ClusterIP + bearer authentication remain in force; any namespace may call.
+  # The harness runs beside the reader; other namespaces are denied by default.
   ingressFrom:
-    - namespaceSelector: {}
+    - podSelector: {}

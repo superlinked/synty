@@ -86,4 +86,26 @@ status="$(curl -sS -o "$work/rate.txt" -w '%{http_code}' "${common[@]}" \
   "http://127.0.0.1:$port/mcp")"
 [[ "$status" == 429 ]]
 
-printf 'MCP HTTP smoke passed: health, auth, initialize, tools, protocol, origin, rate limit\n'
+kill "$server_pid"
+wait "$server_pid" 2>/dev/null || true
+server_pid=""
+
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -keyout "$work/tls.key" -out "$work/tls.crt" >/dev/null 2>&1
+SYNTY_HOME="$work/home" "$bin" mcp --http --bind "127.0.0.1:$port" --token "$token" \
+  --tls-cert "$work/tls.crt" --tls-key "$work/tls.key" \
+  >"$work/tls-server.out" 2>"$work/tls-server.err" &
+server_pid="$!"
+for _ in {1..80}; do
+  if curl -kfsS "https://127.0.0.1:$port/health" >"$work/tls-health.json" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    sed -n '1,120p' "$work/tls-server.err" >&2
+    exit 1
+  fi
+  sleep 0.25
+done
+grep -q '"status":"ok"' "$work/tls-health.json"
+
+printf 'MCP HTTP smoke passed: health, auth, initialize, tools, protocol, origin, rate limit, TLS\n'

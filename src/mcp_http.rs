@@ -21,7 +21,7 @@ use std::sync::{
 #[cfg(any(feature = "mcp-http", test))]
 use std::time::{Duration, Instant};
 #[cfg(feature = "mcp-http")]
-use tiny_http::{Header, Method, Request, Response, Server as HttpServer, StatusCode};
+use tiny_http::{Header, Method, Request, Response, Server as HttpServer, SslConfig, StatusCode};
 
 #[cfg(feature = "mcp-http")]
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -134,6 +134,8 @@ pub struct Opts {
     pub bind: String,
     pub token: String,
     pub listen_public: bool,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
     pub role: crate::policy::McpRole,
     pub scope: crate::policy::ReadScope,
     pub redaction: crate::redact::Profile,
@@ -144,10 +146,20 @@ pub struct Opts {
 #[cfg(feature = "mcp-http")]
 pub fn run(opts: Opts) -> Result<()> {
     anyhow::ensure!(opts.token.len() >= 32, "HTTP MCP bearer token must contain at least 32 bytes");
-    if !opts.listen_public && !is_loopback_bind(&opts.bind) {
-        bail!("refusing non-loopback bind {}; pass --listen-public behind TLS", opts.bind);
-    }
-    let server = HttpServer::http(&opts.bind).map_err(|e| anyhow::anyhow!("bind {}: {e}", opts.bind))?;
+    let tls = tls_config(opts.tls_cert.as_deref(), opts.tls_key.as_deref())?;
+    validate_listener(&opts.bind, opts.listen_public, tls.is_some())?;
+    let (server, scheme) = match tls {
+        Some(config) => (
+            HttpServer::https(&opts.bind, config)
+                .map_err(|e| anyhow::anyhow!("bind HTTPS {}: {e}", opts.bind))?,
+            "https",
+        ),
+        None => (
+            HttpServer::http(&opts.bind)
+                .map_err(|e| anyhow::anyhow!("bind HTTP {}: {e}", opts.bind))?,
+            "http",
+        ),
+    };
     let require_read_model = opts.bucket.is_some();
     mcp::start_bucket_refresh(opts.bucket.clone());
     let dispatcher = Dispatcher::start("semantic", mcp::Server::new(
@@ -167,7 +179,7 @@ pub fn run(opts: Opts) -> Result<()> {
     let allowed_origins = Arc::new(opts.allowed_origins);
     let in_flight = Arc::new(AtomicUsize::new(0));
     let rate_limiter = Arc::new(Mutex::new(RateLimiter::default()));
-    eprintln!("synty mcp: serving authenticated HTTP at http://{}/mcp", opts.bind);
+    eprintln!("synty mcp: serving authenticated HTTP at {scheme}://{}/mcp", opts.bind);
     for request in server.incoming_requests() {
         if in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
             in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -194,6 +206,31 @@ pub fn run(opts: Opts) -> Result<()> {
             }
             in_flight.fetch_sub(1, Ordering::AcqRel);
         });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mcp-http")]
+fn tls_config(cert_path: Option<&str>, key_path: Option<&str>) -> Result<Option<SslConfig>> {
+    match (cert_path, key_path) {
+        (None, None) => Ok(None),
+        (Some(cert_path), Some(key_path)) => Ok(Some(SslConfig {
+            certificate: std::fs::read(cert_path)
+                .map_err(|error| anyhow::anyhow!("read TLS certificate {cert_path}: {error}"))?,
+            private_key: std::fs::read(key_path)
+                .map_err(|error| anyhow::anyhow!("read TLS private key {key_path}: {error}"))?,
+        })),
+        _ => bail!("--tls-cert and --tls-key must be provided together"),
+    }
+}
+
+#[cfg(any(feature = "mcp-http", test))]
+fn validate_listener(bind: &str, listen_public: bool, tls: bool) -> Result<()> {
+    if !is_loopback_bind(bind) && !listen_public {
+        bail!("refusing non-loopback bind {bind}; pass --listen-public with TLS");
+    }
+    if !is_loopback_bind(bind) && !tls {
+        bail!("refusing plaintext non-loopback bind {bind}; pass --tls-cert and --tls-key");
     }
     Ok(())
 }
@@ -429,6 +466,10 @@ mod tests {
         assert!(is_loopback_bind("127.0.0.1:8765"));
         assert!(is_loopback_bind("[::1]:8765"));
         assert!(!is_loopback_bind("0.0.0.0:8765"));
+        assert!(validate_listener("127.0.0.1:8765", false, false).is_ok());
+        assert!(validate_listener("0.0.0.0:8765", false, true).is_err());
+        assert!(validate_listener("0.0.0.0:8765", true, false).is_err());
+        assert!(validate_listener("0.0.0.0:8765", true, true).is_ok());
     }
 
     #[test]
