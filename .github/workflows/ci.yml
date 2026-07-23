@@ -85,7 +85,7 @@ jobs:
           grep -q 'path: /ready' /tmp/synty-options.yaml
           grep -q 'scheme: HTTPS' /tmp/synty-options.yaml
           grep -q '203.0.113.10/32' /tmp/synty-options.yaml
-          grep -q -- '--athena-workgroup synty-mcp-readonly' /tmp/synty-options.yaml
+          grep -q -- '--athena-workgroup "synty-mcp-readonly"' /tmp/synty-options.yaml
           grep -q '198.51.100.20/32' /tmp/synty-options.yaml
           if grep -q -- '- {}' /tmp/synty-options.yaml; then
             echo "MCP rendered an unrestricted NetworkPolicy rule" >&2
