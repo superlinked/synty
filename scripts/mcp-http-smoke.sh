@@ -91,13 +91,15 @@ wait "$server_pid" 2>/dev/null || true
 server_pid=""
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -addext 'subjectAltName=IP:127.0.0.1' \
   -keyout "$work/tls.key" -out "$work/tls.crt" >/dev/null 2>&1
 SYNTY_HOME="$work/home" "$bin" mcp --http --bind "127.0.0.1:$port" --token "$token" \
   --tls-cert "$work/tls.crt" --tls-key "$work/tls.key" \
   >"$work/tls-server.out" 2>"$work/tls-server.err" &
 server_pid="$!"
 for _ in {1..80}; do
-  if curl -kfsS "https://127.0.0.1:$port/health" >"$work/tls-health.json" 2>/dev/null; then
+  if curl --cacert "$work/tls.crt" -fsS "https://127.0.0.1:$port/health" \
+    >"$work/tls-health.json" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$server_pid" 2>/dev/null; then

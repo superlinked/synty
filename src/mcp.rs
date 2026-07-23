@@ -275,14 +275,13 @@ impl Server {
     }
 }
 
-/// Keep the read model and raw trace snapshot fresh without holding the MCP
-/// dispatcher lock. The initial read-model pull happens in `main`; this thread
-/// immediately starts the potentially long raw-history transfer and then
-/// repeats incremental checks.
+/// Keep the complete published read model fresh without holding the MCP
+/// dispatcher lock. Format-2 builds include compact session and trace
+/// projections, so a mediated reader never downloads the raw event lake.
 pub(crate) fn start_bucket_refresh(bucket: Option<String>) {
     let Some(bucket) = bucket else { return };
     std::thread::spawn(move || loop {
-        crate::sync::pull_for_read(&bucket);
+        crate::sync::pull_read_model_for_read(&bucket);
         std::thread::sleep(std::time::Duration::from_secs(30));
     });
 }
@@ -315,6 +314,7 @@ fn topics_text(a: &Value, scope: &crate::policy::ReadScope) -> Result<String> {
                 || t.units.iter().any(|u| u.title.to_lowercase().contains(&ql))
         });
     }
+    topics.truncate(bounded_positive(a, "limit", 12, 100));
     Ok(view::topics_md(&topics))
 }
 
@@ -353,7 +353,8 @@ fn tool_defs(role: crate::policy::McpRole, scope: &crate::policy::ReadScope, all
             "name": "synty_topics",
             "description": "Emergent topics of recent work (clustered sessions, PRs, issues) with summaries and members. Topic keys and member ids in the output feed synty_show.",
             "inputSchema": obj(json!({
-                "query": {"type": "string", "maxLength": 4096, "description": "Optional substring to filter topics"}
+                "query": {"type": "string", "maxLength": 4096, "description": "Optional substring to filter topics"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max topics (default 12)"}
             }), json!([])),
         },
         {
@@ -413,7 +414,7 @@ fn tool_defs(role: crate::policy::McpRole, scope: &crate::policy::ReadScope, all
         },
         {
             "name": "synty_trace_search",
-            "description": "Literal case-insensitive search over raw execution events with optional repo, machine, source, and kind filters.",
+            "description": "Literal case-insensitive search over bounded execution evidence with optional repo, machine, source, and kind filters.",
             "inputSchema": obj(json!({
                 "query": {"type": "string", "maxLength": 4096}, "repo": {"type": "string"},
                 "machine": {"type": "string"}, "source": {"type": "string"},

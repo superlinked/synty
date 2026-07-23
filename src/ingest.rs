@@ -59,8 +59,12 @@ fn run_with_config(
     }
 
     let manifest_path = format!("{out_path}.manifest");
+    let analysis_path = Path::new(out_path).with_file_name("analysis.json");
+    let trace_path = Path::new(out_path).with_file_name("trace.json");
     let manifest = input_manifest(gh_files.iter().map(|(p, _, _)| p).chain(&local_files), cfg);
     if Path::new(out_path).exists()
+        && analysis_path.is_file()
+        && trace_path.is_file()
         && std::fs::read_to_string(&manifest_path).ok().as_deref() == Some(manifest.as_str())
     {
         eprintln!("ingest up to date ({} inputs unchanged) → {out_path}", gh_files.len() + local_files.len());
@@ -89,6 +93,12 @@ fn run_with_config(
     // the whole corpus as one string.
     let known: std::collections::HashSet<String> = cfg.repos.iter().cloned().collect();
     let local_actor = crate::identity::actor();
+    let cutoff = cfg
+        .capture_since
+        .as_deref()
+        .and_then(|raw| crate::config::capture_since_ms_from(raw).ok());
+    let mut analysis = crate::units::AnalysisBuilder::new(known.clone(), cutoff);
+    let mut trace = crate::trace::SnapshotBuilder::new(known.clone(), cutoff);
     let mut maps = SessionMaps::default();
     for f in &local_files {
         if let Ok(d) = std::fs::read_to_string(f) {
@@ -101,13 +111,11 @@ fn run_with_config(
         if let Ok(d) = std::fs::read_to_string(f) {
             let before = docs.len();
             docs_from_events(&d, &maps, &local_actor, &mut seen, &mut docs);
+            analysis.fold_text(&d);
+            trace.fold_text(&d);
             n_session += docs.len() - before;
         }
     }
-    let cutoff = cfg
-        .capture_since
-        .as_deref()
-        .and_then(|raw| crate::config::capture_since_ms_from(raw).ok());
     if let Some(cutoff) = cutoff {
         docs.retain(|d| {
             d.meta.source != "agent" || crate::config::captured_at(&d.meta.ts, Some(cutoff))
@@ -135,7 +143,6 @@ fn run_with_config(
         std::fs::create_dir_all(parent)?;
     }
     crate::write_atomic(out_path, out.as_bytes())?;
-    std::fs::write(&manifest_path, &manifest)?;
     let mut m = crate::metrics::Run::new("ingest");
     m.set("github", n_github)
         .set("session", n_session)
@@ -147,6 +154,12 @@ fn run_with_config(
     // Fleet coverage rides on every full ingest: streams and docs are both in
     // hand here, and this is the moment the numbers can change.
     let r = crate::fleet::roster(&docs, &local_dir);
+    analysis.write(&analysis_path, r.clone())?;
+    trace.write(&trace_path)?;
+    // The manifest is the fast path's commit marker. Publish it only after
+    // docs and both mediated projections are durable, so an interrupted ingest
+    // cannot bless a mixture of old and new artifacts.
+    std::fs::write(&manifest_path, &manifest)?;
     let mut c = crate::metrics::Run::new("coverage");
     c.set("machines", r.machines.len())
         .set("machines_active", r.active())
@@ -379,7 +392,7 @@ fn derivation_config(cfg: &crate::config::Config) -> String {
     // Doc-derivation format: bump whenever the derivation itself changes (new
     // Meta fields, new detectors) so a binary upgrade regenerates docs.jsonl
     // once even though the input files are unchanged.
-    out.push_str("fmt=4\n");
+    out.push_str("fmt=5\n");
     out
 }
 

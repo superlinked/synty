@@ -156,8 +156,8 @@ runs on CI or a server without a developer machine.
 
 - **CLI → stdout (agents):** `search`, `related`, `topic`, `recent`, `status`,
   `stats`, `tool`, `show`, and `trace` print Markdown an agent reads over the shell: no
-  server or application auth. In team mode a read first syncs the fleet's raw
-  chunks and latest published read-model; offline it keeps using the last
+  server or application auth. In team mode a local read first syncs the fleet's
+  raw chunks and latest published read-model; offline it keeps using the last
   complete local snapshot. `related` takes no query: it derives one from the
   repo's recent commits + changed files and searches cross-repo, so an agent can
   pull prior work on its current task for free. Stable ids ride inline (sessions
@@ -181,12 +181,18 @@ runs on CI or a server without a developer machine.
   configure the mediated boundary. The transport validates exact browser
   origins and protocol versions, bounds requests, and
   keeps health responsive while tool calls run. It pulls the published query
-  model before serving and continues potentially large raw-event transfers in
-  the background. Raw-history analysis is serialized separately so it cannot
-  block semantic search. Each dispatcher has a bounded queue; HTTP clients have
-  a 120-second response deadline and a per-client 120-request/minute window,
-  while stale queued work is cancelled before execution. Remote related-work
-  queries accept context text rather than server filesystem paths. *Built.*
+  model before serving and refreshes only that model in the background; it does
+  not mirror the raw event lake. Format-2 builds include compact session/tool/
+  fleet facts and bounded trace evidence. `/health` remains a liveness check,
+  while `/ready` requires both mediated projections. Analysis calls use a
+  serialized one-slot dispatcher so concurrent first loads cannot multiply
+  memory or block semantic search. Each dispatcher has a bounded queue; HTTP
+  clients have a 120-second response deadline and a per-client
+  120-request/minute window, while stale queued work is cancelled before
+  execution. Remote related-work queries accept context text rather than server
+  filesystem paths. *Built.*
+  A format-1 bucket requires one run from a write-enabled builder before remote
+  MCP becomes ready; the MCP workload never migrates or publishes bucket state.
 - **Harness import:** `synty import` normalizes campaign/Devin NDJSON into
   owned envelope streams with deterministic ids, capture boundaries, and
   import-time redaction. Identity derives from native ids or canonical event
@@ -207,10 +213,10 @@ or a remediation workflow in synty itself:
 - `trace list --type turns|spans|jobs` filters by repo, machine, source, status,
   operation, time, error presence, and duration, then sorts by recency or
   duration. Jobs may instead sort by source-reported wait time.
-- `trace show <id>` expands a source-native turn, paired tool call/result, raw
+- `trace show <id>` expands a source-native turn, paired tool call/result,
   event, associated job, or session into a bounded evidence timeline. Turn
   timelines collapse same-turn job polls into one navigable job row.
-- `trace search <literal>` searches the raw envelopes, including prompts,
+- `trace search <literal>` searches the bounded evidence published from prompts,
   commands, outputs, and metadata; `trace compare <left> <right>` returns only
   factual field differences between two turns, two spans, or two jobs.
 
@@ -224,9 +230,11 @@ a long wait. A continuation without a captured initiating call remains visible
 and is labeled `continuation_only` rather than guessed onto another command.
 Every duration says whether the source reported it or it is merely an event
 gap; the latter may include human approval or idle time and is deliberately not
-presented as tool runtime. The projection is rebuilt on demand from JSONL for
-now, keeping raw envelopes authoritative and avoiding a new index contract
-until corpus-scale use demonstrates one is needed. *Built.*
+presented as tool runtime. Ingest regenerates the projection from JSONL and
+publishes it inside the immutable read-model. Event search evidence is capped at
+512 characters and rendered commands/outputs at 360, which makes query memory
+depend on a compact event vocabulary rather than retained raw bytes. The raw
+envelopes remain authoritative and lossless for local rebuilds. *Built.*
 
 ## Tiers and the trust boundary
 
@@ -295,17 +303,20 @@ blobs/<fnv>                            content-addressed build files (index
                                         across builds, so appends upload deltas
 builds/<build>.<rev>.json              manifest: filename → blob, per (build, rev)
 current.json                           the pointer, PUT last; readers never see
-                                        a torn build; rev versions the clusters
+                                        a torn build; rev versions the clusters;
+                                        format 2 includes analysis.json and
+                                        trace.json in each immutable build
 lease/build                            soft TTL lease electing one index builder
 ```
 
 A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
 `--features s3/gcs`, with conditional PUT for write-once and the lease). The
 fleet model is **no designated builder**: every tracker pushes events; whoever
-opens a viewer pulls all raw streams and the published read-model, then
-contributes a build. All CLI/MCP readers perform the same pull; commands can
-therefore inspect every machine, while semantic results cover the latest
-published build and warn when newer raw chunks are pending.
+opens a local viewer pulls all raw streams and the published read-model, then
+contributes a build. MCP-only readers pull the complete published model without
+bucket write access or a raw-history mirror. Local commands can inspect and
+rebuild from every machine, while semantic results cover the latest published
+build and warn when newer raw chunks are pending.
 Write-once stores are the collaboration primitive: a viewer encodes and
 summarizes only what no other machine has (pending lists shuffle per machine,
 so concurrent viewers split the work). The lease only prevents duplicate index
@@ -346,7 +357,8 @@ the release verifies both platforms after composing the index. The Helm chart
 follows `Chart.appVersion`, runs each container as UID 10001 with a read-only
 root filesystem, and exposes MCP only as a cluster Service. Remote MCP is
 disabled by default; enabling it requires an application TLS Secret and a
-NetworkPolicy with explicit source selectors.
+NetworkPolicy with explicit source selectors and object-store destination
+CIDRs. Its egress is limited to cluster DNS and those ranges on TCP 443.
 
 ## Data compatibility
 
@@ -362,7 +374,9 @@ NetworkPolicy with explicit source selectors.
   regenerates exactly the affected entries, fleet-wide, once.
 - **The read-model pointer carries `format` + the writer's version.** A reader
   meeting a newer format refuses to pull it and says to upgrade; an unreadable
-  derived blob is a cache miss, never an error.
+  derived blob is a cache miss, never an error. Format 2 publishes compact
+  analysis and trace projections alongside documents, so mediated readers need
+  no raw bucket objects.
 
 ## What's built (kernel)
 

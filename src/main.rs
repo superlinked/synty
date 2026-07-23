@@ -38,6 +38,7 @@ mod tui;
 mod units;
 mod up;
 mod view;
+mod words;
 mod index;
 mod ingest;
 mod import;
@@ -112,15 +113,18 @@ pub struct Doc {
 }
 
 pub fn load_docs(path: impl AsRef<std::path::Path>) -> Result<Vec<Doc>> {
+    use std::io::BufRead;
+
     let path = path.as_ref();
-    let data = std::fs::read_to_string(path)
+    let file = std::fs::File::open(path)
         .map_err(|e| anyhow::anyhow!("read {}: {e} (run `ingest` first)", path.display()))?;
     let mut v = Vec::new();
-    for line in data.lines() {
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        v.push(serde_json::from_str::<Doc>(line)?);
+        v.push(serde_json::from_str::<Doc>(&line)?);
     }
     Ok(v)
 }

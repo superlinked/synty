@@ -4,15 +4,15 @@
 
 use crate::event::Event;
 use anyhow::{Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const EXCERPT: usize = 360;
 const TIMELINE_CAP: usize = 200;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct SessionContext {
     source: String,
     machine: String,
@@ -22,7 +22,7 @@ struct SessionContext {
     role: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TraceEvent {
     id: String,
     ts: String,
@@ -31,13 +31,17 @@ struct TraceEvent {
     session_id: String,
     kind: String,
     summary: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    /// Bounded normalized evidence used by literal search in the published
+    /// trace projection. It is intentionally not returned to clients.
+    #[serde(skip)]
+    search_text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     subtype: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     event_kind: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     turn_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
     #[serde(skip)]
     span: Option<usize>,
@@ -45,35 +49,35 @@ struct TraceEvent {
     ordinal: usize,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Span {
     id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     result_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     turn_id: String,
     session_id: String,
     source: String,
     machine: String,
     repo: String,
     started: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     ended: String,
     operation: String,
     status: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     process_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     exit_code: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     duration_source: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     workdir: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     input: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     output: String,
     #[serde(skip)]
     start_event: usize,
@@ -81,7 +85,7 @@ struct Span {
     end_event: Option<usize>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Job {
     id: String,
     process_id: String,
@@ -96,7 +100,7 @@ struct Job {
     started: String,
     ended: String,
     status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     elapsed_ms: Option<u64>,
     reported_wait_ms: u64,
     spans: usize,
@@ -104,13 +108,13 @@ struct Job {
     stdin_writes: usize,
     errors: usize,
     command: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     final_output: String,
     #[serde(skip)]
     span_indexes: Vec<usize>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Turn {
     id: String,
     session_id: String,
@@ -120,7 +124,7 @@ struct Turn {
     started: String,
     ended: String,
     status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
     duration_source: String,
     ask: String,
@@ -155,50 +159,265 @@ struct TraceStore {
     ids: HashSet<String>,
 }
 
+const TRACE_FORMAT: u32 = 1;
+const SEARCH_EVIDENCE: usize = 512;
+
+/// Serializable form keeps renderer-only indexes out of public tool JSON while
+/// retaining them in parallel arrays for exact reconstruction.
+#[derive(Serialize, Deserialize)]
+struct TraceSnapshot {
+    format: u32,
+    events: Vec<TraceEvent>,
+    event_search: Vec<String>,
+    event_spans: Vec<Option<usize>>,
+    event_ordinals: Vec<usize>,
+    spans: Vec<Span>,
+    span_events: Vec<(usize, Option<usize>)>,
+    jobs: Vec<Job>,
+    job_spans: Vec<Vec<usize>>,
+    turns: Vec<Turn>,
+    turn_events: Vec<Vec<usize>>,
+    turn_spans: Vec<Vec<usize>>,
+    sessions: BTreeMap<String, SessionContext>,
+    session_events: BTreeMap<String, Vec<usize>>,
+}
+
+impl TraceSnapshot {
+    /// Separate renderer indexes from client-visible records before encoding.
+    fn from_store(store: TraceStore) -> Self {
+        Self {
+            format: TRACE_FORMAT,
+            event_search: store.events.iter().map(|event| event.search_text.clone()).collect(),
+            event_spans: store.events.iter().map(|event| event.span).collect(),
+            event_ordinals: store.events.iter().map(|event| event.ordinal).collect(),
+            span_events: store
+                .spans
+                .iter()
+                .map(|span| (span.start_event, span.end_event))
+                .collect(),
+            job_spans: store.jobs.iter().map(|job| job.span_indexes.clone()).collect(),
+            turn_events: store.turns.iter().map(|turn| turn.event_indexes.clone()).collect(),
+            turn_spans: store.turns.iter().map(|turn| turn.span_indexes.clone()).collect(),
+            events: store.events,
+            spans: store.spans,
+            jobs: store.jobs,
+            turns: store.turns,
+            sessions: store.sessions.into_iter().collect(),
+            session_events: store.session_events.into_iter().collect(),
+        }
+    }
+
+    /// Validate every parallel index before reconstructing a queryable store.
+    fn into_store(mut self) -> Result<TraceStore> {
+        anyhow::ensure!(self.format == TRACE_FORMAT, "unsupported trace snapshot format {}", self.format);
+        anyhow::ensure!(
+            self.events.len() == self.event_search.len()
+                && self.events.len() == self.event_spans.len()
+                && self.events.len() == self.event_ordinals.len()
+                && self.spans.len() == self.span_events.len()
+                && self.jobs.len() == self.job_spans.len()
+                && self.turns.len() == self.turn_events.len()
+                && self.turns.len() == self.turn_spans.len(),
+            "trace snapshot index lengths do not match"
+        );
+        for (index, event) in self.events.iter_mut().enumerate() {
+            event.search_text = std::mem::take(&mut self.event_search[index]);
+            event.span = self.event_spans[index];
+            event.ordinal = self.event_ordinals[index];
+        }
+        for (span, (start, end)) in self.spans.iter_mut().zip(self.span_events) {
+            span.start_event = start;
+            span.end_event = end;
+        }
+        for (job, spans) in self.jobs.iter_mut().zip(self.job_spans) {
+            job.span_indexes = spans;
+        }
+        for ((turn, events), spans) in self
+            .turns
+            .iter_mut()
+            .zip(self.turn_events)
+            .zip(self.turn_spans)
+        {
+            turn.event_indexes = events;
+            turn.span_indexes = spans;
+        }
+        let mut store = TraceStore {
+            events: self.events,
+            spans: self.spans,
+            jobs: self.jobs,
+            turns: self.turns,
+            sessions: self.sessions.into_iter().collect(),
+            session_events: self.session_events.into_iter().collect(),
+            ids: HashSet::new(),
+        };
+        store.rebuild_ids();
+        Ok(store)
+    }
+}
+
+/// Build the mediated trace projection during ingest, applying the same
+/// collection boundary as documents and analysis facts.
+pub(crate) struct SnapshotBuilder {
+    store: TraceStore,
+    seen: HashSet<String>,
+    pending: HashMap<(String, String), usize>,
+    known: HashSet<String>,
+    capture_since_ms: Option<i64>,
+    ordinal: usize,
+}
+
+impl SnapshotBuilder {
+    /// Start one deterministic projection pass for the configured repositories.
+    pub(crate) fn new(known: HashSet<String>, capture_since_ms: Option<i64>) -> Self {
+        Self {
+            store: TraceStore::default(),
+            seen: HashSet::new(),
+            pending: HashMap::new(),
+            known,
+            capture_since_ms,
+            ordinal: 0,
+        }
+    }
+
+    /// Fold one event chunk, deduplicating envelope ids across chunks.
+    pub(crate) fn fold_text(&mut self, text: &str) {
+        for line in text.lines() {
+            let Ok(event) = serde_json::from_str::<Event>(line) else { continue };
+            if !event.event_id.is_empty() && !self.seen.insert(event.event_id.clone()) {
+                continue;
+            }
+            if !crate::config::captured_at(&event.ts, self.capture_since_ms) {
+                if event.kind == "session_start" {
+                    self.store.fold_context(&event, &self.known);
+                }
+                continue;
+            }
+            self.store
+                .fold(event, self.ordinal, &self.known, &mut self.pending);
+            self.ordinal += 1;
+        }
+    }
+
+    /// Complete joins after removing metadata-only, pre-boundary sessions.
+    fn finish(mut self) -> TraceStore {
+        let active: HashSet<String> = self.store.session_events.keys().cloned().collect();
+        self.store.sessions.retain(|session, _| active.contains(session));
+        self.store.finish(&self.known);
+        self.store
+    }
+
+    /// Atomically publish the validated projection and emit its health metrics.
+    pub(crate) fn write(self, path: &Path) -> Result<()> {
+        use std::io::Write;
+
+        let snapshot = TraceSnapshot::from_store(self.finish());
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = crate::write_unique_temp(path, &[])?;
+        let result = (|| -> Result<()> {
+            let file = std::fs::OpenOptions::new().write(true).truncate(true).open(&tmp)?;
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &snapshot)?;
+            writer.flush()?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result?;
+        let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        crate::metrics::Run::new("trace_index")
+            .set("events", snapshot.events.len())
+            .set("turns", snapshot.turns.len())
+            .set("spans", snapshot.spans.len())
+            .set("jobs", snapshot.jobs.len())
+            .set("bytes", bytes)
+            .emit();
+        Ok(())
+    }
+}
+
+type TraceCacheKey = (PathBuf, u64, u128);
+type TraceCache = Option<(TraceCacheKey, std::sync::Arc<TraceStore>)>;
+static TRACE_CACHE: std::sync::OnceLock<std::sync::Mutex<TraceCache>> =
+    std::sync::OnceLock::new();
+
 impl TraceStore {
-    fn load() -> Result<Self> {
+    fn load() -> Result<std::sync::Arc<Self>> {
+        let path = crate::readmodel::trace_path();
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let modified = meta
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let key = (path.clone(), meta.len(), modified);
+            let cache = TRACE_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+            if let Ok(mut cache) = cache.lock() {
+                if let Some((cached_key, store)) = cache.as_ref() {
+                    if cached_key == &key {
+                        return Ok(std::sync::Arc::clone(store));
+                    }
+                }
+                let file = std::fs::File::open(&path)?;
+                let snapshot: TraceSnapshot =
+                    serde_json::from_reader(std::io::BufReader::new(file))?;
+                let store = std::sync::Arc::new(snapshot.into_store()?);
+                *cache = Some((key, std::sync::Arc::clone(&store)));
+                return Ok(store);
+            }
+        }
         let paths = crate::units::jsonl_files(Path::new(crate::units::LOCAL_DIR));
-        Self::from_paths(&paths)
+        Ok(std::sync::Arc::new(Self::from_paths(&paths)?))
     }
 
     fn from_paths(paths: &[PathBuf]) -> Result<Self> {
-        let mut store = Self::default();
-        let mut seen = HashSet::new();
-        let mut pending: HashMap<(String, String), usize> = HashMap::new();
+        use std::io::BufRead;
+
         let known: HashSet<String> = crate::config::load().repos.into_iter().collect();
-        let mut ordinal = 0usize;
+        let mut builder = SnapshotBuilder::new(known, crate::config::capture_since_ms());
         for path in paths {
-            let data = std::fs::read_to_string(path)?;
-            for line in data.lines() {
-                let Ok(ev) = serde_json::from_str::<Event>(line) else {
-                    continue;
-                };
-                if !ev.event_id.is_empty() && !seen.insert(ev.event_id.clone()) {
-                    continue;
-                }
-                store.fold(ev, ordinal, &known, &mut pending);
-                ordinal += 1;
+            let file = std::fs::File::open(path)?;
+            for line in std::io::BufReader::new(file).lines() {
+                builder.fold_text(&line?);
             }
         }
-        store.finish(&known);
-        Ok(store)
+        Ok(builder.finish())
     }
 
     #[cfg(test)]
     fn from_lines(lines: &[&str]) -> Self {
-        let mut store = Self::default();
-        let mut seen = HashSet::new();
-        let mut pending = HashMap::new();
-        let known = HashSet::new();
-        for (ordinal, line) in lines.iter().enumerate() {
-            let ev: Event = serde_json::from_str(line).expect("test event");
-            if !ev.event_id.is_empty() && !seen.insert(ev.event_id.clone()) {
-                continue;
-            }
-            store.fold(ev, ordinal, &known, &mut pending);
+        let mut builder = SnapshotBuilder::new(HashSet::new(), None);
+        builder.fold_text(&lines.join("\n"));
+        builder.finish()
+    }
+
+    /// Preserve session-level scope and repository context even when the
+    /// session_start predates the collection boundary. The old start itself is
+    /// not published, and contexts with no retained events are removed.
+    fn fold_context(&mut self, ev: &Event, known: &HashSet<String>) {
+        let machine = machine_from_stream(&ev.stream);
+        let ctx = self.sessions.entry(ev.session_id.clone()).or_default();
+        if ctx.source.is_empty() {
+            ctx.source = ev.source.clone();
         }
-        store.finish(&known);
-        store
+        if ctx.machine.is_empty() {
+            ctx.machine = machine;
+        }
+        if ctx.campaign.is_empty() {
+            ctx.campaign = crate::policy::campaign(ev).to_string();
+        }
+        if ctx.role.is_empty() {
+            ctx.role = crate::policy::role(ev).to_string();
+        }
+        if let Some(cwd) = event_cwd(&ev.payload).filter(|cwd| !cwd.is_empty()) {
+            if ctx.cwd.is_empty() {
+                ctx.repo = crate::units::resolve_repo(&cwd, known);
+                ctx.cwd = cwd;
+            }
+        }
     }
 
     fn fold(
@@ -209,25 +428,7 @@ impl TraceStore {
         pending: &mut HashMap<(String, String), usize>,
     ) {
         let machine = machine_from_stream(&ev.stream);
-        let ctx = self.sessions.entry(ev.session_id.clone()).or_default();
-        if ctx.source.is_empty() {
-            ctx.source = ev.source.clone();
-        }
-        if ctx.machine.is_empty() {
-            ctx.machine = machine.clone();
-        }
-        if ctx.campaign.is_empty() {
-            ctx.campaign = crate::policy::campaign(&ev).to_string();
-        }
-        if ctx.role.is_empty() {
-            ctx.role = crate::policy::role(&ev).to_string();
-        }
-        if let Some(cwd) = event_cwd(&ev.payload).filter(|s| !s.is_empty()) {
-            if ctx.cwd.is_empty() {
-                ctx.repo = crate::units::resolve_repo(&cwd, known);
-                ctx.cwd = cwd;
-            }
-        }
+        self.fold_context(&ev, known);
 
         let payload = &ev.payload;
         let subtype = payload["subtype"].as_str().unwrap_or("").to_string();
@@ -249,6 +450,7 @@ impl TraceStore {
             session_id: ev.session_id.clone(),
             kind: ev.kind.clone(),
             summary: event_summary(&ev),
+            search_text: event_search_text(&ev),
             subtype,
             event_kind,
             turn_id,
@@ -382,10 +584,15 @@ impl TraceStore {
             }
         }
         self.jobs = build_jobs(&self.spans);
-        self.ids.extend(self.events.iter().map(|e| e.id.clone()));
-        self.ids.extend(self.spans.iter().map(|s| s.id.clone()));
-        self.ids.extend(self.jobs.iter().map(|j| j.id.clone()));
-        self.ids.extend(self.turns.iter().map(|t| t.id.clone()));
+        self.rebuild_ids();
+    }
+
+    fn rebuild_ids(&mut self) {
+        self.ids.clear();
+        self.ids.extend(self.events.iter().map(|event| event.id.clone()));
+        self.ids.extend(self.spans.iter().map(|span| span.id.clone()));
+        self.ids.extend(self.jobs.iter().map(|job| job.id.clone()));
+        self.ids.extend(self.turns.iter().map(|turn| turn.id.clone()));
         self.ids.extend(self.session_events.keys().cloned());
     }
 }
@@ -1060,9 +1267,8 @@ pub fn search_text(
     if query.trim().is_empty() {
         bail!("trace search: query cannot be empty");
     }
-    let paths = crate::units::jsonl_files(Path::new(crate::units::LOCAL_DIR));
-    let known: HashSet<String> = crate::config::load().repos.into_iter().collect();
-    let hits = search_hits(&paths, query, repo, machine, source, kind, limit, &known, scope)?;
+    let store = TraceStore::load()?;
+    let hits = search_hits(&store, query, repo, machine, source, kind, limit, scope);
     if json_out {
         Ok(crate::view::envelope("trace_search", json!(hits)))
     } else {
@@ -1085,73 +1291,46 @@ pub fn search_text(
 
 #[allow(clippy::too_many_arguments)]
 fn search_hits(
-    paths: &[PathBuf],
+    store: &TraceStore,
     query: &str,
     repo: Option<&str>,
     machine: Option<&str>,
     source: Option<&str>,
     kind: Option<&str>,
     limit: usize,
-    known: &HashSet<String>,
     scope: Option<&crate::policy::ReadScope>,
-) -> Result<Vec<SearchHit>> {
+) -> Vec<SearchHit> {
     let q = query.to_lowercase();
-    let mut seen = HashSet::new();
-    let mut contexts: HashMap<String, SessionContext> = HashMap::new();
-    let mut hits = Vec::new();
-    for path in paths {
-        let data = std::fs::read_to_string(path)?;
-        for line in data.lines() {
-            let matched = line.to_lowercase().contains(&q);
-            let Ok(ev) = serde_json::from_str::<Event>(line) else {
-                continue;
-            };
-            if !ev.event_id.is_empty() && !seen.insert(ev.event_id.clone()) {
-                continue;
-            }
-            let m = machine_from_stream(&ev.stream);
-            let ctx = contexts.entry(ev.session_id.clone()).or_default();
-            if ctx.source.is_empty() {
-                ctx.source = ev.source.clone();
-                ctx.machine = m.clone();
-            }
-            if let Some(cwd) = event_cwd(&ev.payload).filter(|s| !s.is_empty()) {
-                if ctx.cwd.is_empty() {
-                    ctx.repo = crate::units::resolve_repo(&cwd, known);
-                    ctx.cwd = cwd;
-                }
-            }
-            if !matched
-                || !contains_opt(&m, machine)
-                || !contains_opt(&ev.source, source)
-                || !contains_opt(&ev.kind, kind)
-                || scope.is_some_and(|scope| !scope.allows_event(&ev, &ctx.repo))
+    let mut hits: Vec<SearchHit> = store
+        .events
+        .iter()
+        .filter(|event| event.search_text.to_lowercase().contains(&q))
+        .filter(|event| contains_opt(&event.machine, machine))
+        .filter(|event| contains_opt(&event.source, source))
+        .filter(|event| contains_opt(&event.kind, kind))
+        .filter_map(|event| {
+            let context = store.sessions.get(&event.session_id);
+            let event_repo = context.map(|ctx| ctx.repo.as_str()).unwrap_or("");
+            if !contains_opt(event_repo, repo)
+                || !scope_allows(store, &event.session_id, event_repo, &event.source, scope)
             {
-                continue;
+                return None;
             }
-            let summary = event_summary(&ev);
-            hits.push(SearchHit {
-                id: ev.event_id,
-                ts: ev.ts,
-                source: ev.source,
-                machine: m,
-                session_id: ev.session_id,
-                repo: String::new(),
-                kind: ev.kind,
-                summary,
-            });
-        }
-    }
-    for h in &mut hits {
-        h.repo = contexts
-            .get(&h.session_id)
-            .map(|c| c.repo.clone())
-            .unwrap_or_default();
-    }
-    hits.retain(|h| contains_opt(&h.repo, repo));
+            Some(SearchHit {
+                id: event.id.clone(),
+                ts: event.ts.clone(),
+                source: event.source.clone(),
+                machine: event.machine.clone(),
+                session_id: event.session_id.clone(),
+                repo: event_repo.to_string(),
+                kind: event.kind.clone(),
+                summary: event.summary.clone(),
+            })
+        })
+        .collect();
     hits.sort_by(|a, b| b.ts.cmp(&a.ts));
     hits.truncate(limit);
-    Ok(hits)
+    hits
 }
 
 #[derive(Serialize)]
@@ -1745,6 +1924,22 @@ fn event_summary(ev: &Event) -> String {
     }
 }
 
+/// Normalize a fixed-size literal-search record from one raw envelope.
+fn event_search_text(ev: &Event) -> String {
+    let payload = serde_json::to_string(&ev.payload).unwrap_or_default();
+    excerpt(
+        &format!(
+            "{} {} {} {} {}",
+            ev.kind,
+            ev.source,
+            ev.session_id,
+            event_summary(ev),
+            payload,
+        ),
+        SEARCH_EVIDENCE,
+    )
+}
+
 fn tool_input(p: &Value) -> (String, String, String) {
     let parsed;
     let input = if p["input"].is_object() {
@@ -1759,8 +1954,8 @@ fn tool_input(p: &Value) -> (String, String, String) {
         .as_str()
         .or_else(|| input["command"].as_str())
         .or_else(|| input["script"].as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(|command| excerpt(command, EXCERPT))
+        .unwrap_or_default();
     let workdir = input["workdir"]
         .as_str()
         .or_else(|| input["cwd"].as_str())
@@ -2554,14 +2749,6 @@ mod tests {
 
     #[test]
     fn filtered_search_keeps_repo_context_from_nonmatching_session_start() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("synty-trace-search-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        let path = dir.join("events.jsonl");
         let lines = [
             ev(
                 "start",
@@ -2580,23 +2767,118 @@ mod tests {
                 json!({"tool_use_id":"x","content":"missing libneedle.so"}),
             ),
         ];
-        std::fs::write(&path, lines.join("\n")).expect("test corpus");
         let known = HashSet::from(["repo".to_string()]);
+        let mut builder = SnapshotBuilder::new(known, None);
+        builder.fold_text(&lines.join("\n"));
+        let store = builder.finish();
         let hits = search_hits(
-            &[path],
+            &store,
             "libneedle.so",
             Some("repo"),
             None,
             None,
             Some("tool_result"),
             10,
-            &known,
             None,
-        )
-        .expect("filtered search");
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].repo, "repo");
-        std::fs::remove_dir_all(dir).expect("clean test dir");
+    }
+
+    #[test]
+    fn published_trace_excludes_pre_boundary_evidence_but_keeps_context() {
+        let lines = [
+            ev(
+                "start",
+                "2026-06-01T23:00:00Z",
+                "harness",
+                "S",
+                "session_start",
+                json!({"cwd":"/workspace/repo"}),
+            ),
+            ev(
+                "old",
+                "2026-06-01T23:30:00Z",
+                "harness",
+                "S",
+                "user_prompt",
+                json!({"text":"old-secret-evidence"}),
+            ),
+            ev(
+                "new",
+                "2026-06-02T00:30:00Z",
+                "harness",
+                "S",
+                "user_prompt",
+                json!({"text":"retained-evidence"}),
+            ),
+        ];
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut builder = SnapshotBuilder::new(HashSet::from(["repo".to_string()]), Some(cutoff));
+        builder.fold_text(&lines.join("\n"));
+        let store = builder.finish();
+        assert_eq!(store.events.len(), 1);
+        assert!(
+            search_hits(&store, "old-secret", None, None, None, None, 10, None).is_empty()
+        );
+        let hits = search_hits(&store, "retained-evidence", None, None, None, None, 10, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].repo, "repo", "pre-boundary start still supplies scope context");
+    }
+
+    #[test]
+    fn published_trace_roundtrips_bounded_literal_evidence() {
+        let long = format!("visible-needle {} hidden-tail-needle", "x".repeat(4_000));
+        let lines = [
+            ev(
+                "start",
+                "2026-06-01T10:00:00Z",
+                "harness",
+                "S",
+                "session_start",
+                json!({"cwd":"/workspace/repo"}),
+            ),
+            ev(
+                "prompt",
+                "2026-06-01T10:00:01Z",
+                "harness",
+                "S",
+                "user_prompt",
+                json!({"text":long}),
+            ),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let snapshot = TraceSnapshot::from_store(TraceStore::from_lines(&refs));
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let again = serde_json::to_vec(&TraceSnapshot::from_store(TraceStore::from_lines(&refs)))
+            .unwrap();
+        assert_eq!(bytes, again, "identical events publish identical trace bytes");
+        assert!(
+            bytes.len() < 4_000,
+            "one oversized raw payload cannot inflate the mediated projection"
+        );
+        let restored: TraceSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let store = restored.into_store().unwrap();
+        assert_eq!(
+            search_hits(&store, "visible-needle", None, None, None, None, 10, None).len(),
+            1
+        );
+        assert!(
+            search_hits(
+                &store,
+                "hidden-tail-needle",
+                None,
+                None,
+                None,
+                None,
+                10,
+                None
+            )
+            .is_empty(),
+            "literal search is explicitly bounded to published evidence"
+        );
     }
 
     #[test]

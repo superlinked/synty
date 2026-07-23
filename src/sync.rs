@@ -688,13 +688,13 @@ enum ReaderPull {
     Events,
 }
 
-// A large raw history must never delay the small pointer + published query
-// model that makes the MCP service useful. Events continue in the background.
+// A large raw history must never delay the pointer + published query model.
+// Interactive local readers use this order; mediated MCP readers need only the
+// complete format-2 read model.
 const READER_PULL_ORDER: [ReaderPull; 2] = [ReaderPull::ReadModel, ReaderPull::Events];
 
-/// Pull only the published query model. MCP performs this bounded startup step
-/// before serving, while raw trace history syncs independently in the
-/// background.
+/// Pull only the complete published query model. Format-2 builds include the
+/// compact analysis and trace projections needed by mediated MCP readers.
 pub fn pull_read_model_for_read(bucket_uri: &str) {
     match pull_if_stale(bucket_uri) {
         Ok(true) => eprintln!("pulled published read-model from {bucket_uri}"),
@@ -713,9 +713,8 @@ pub fn pull_events_for_read(bucket_uri: &str) {
     }
 }
 
-/// Bring a reader onto the fleet's published query model first, then its raw
-/// event snapshot. Interactive MCP uses the same ordering on a background
-/// thread after the initial read-model pull.
+/// Bring a local reader onto the fleet's published query model first, then its
+/// raw event snapshot for building and unpublished-delta detection.
 pub fn pull_for_read(bucket_uri: &str) {
     for step in READER_PULL_ORDER {
         match step {
@@ -877,6 +876,9 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
         return Ok(false);
     }
     let local = readmodel::current();
+    if local_format_is_newer(local.as_ref(), &remote) {
+        return Ok(false);
+    }
     if local.as_ref() == Some(&remote) {
         return Ok(false);
     }
@@ -893,7 +895,7 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
     next_plaid::MmapIndex::load(&dir.to_string_lossy())
         .map_err(|e| anyhow!("pulled build does not load: {e}"))?;
     let keep: Vec<String> = local.iter().map(|c| c.build.clone()).collect();
-    readmodel::repoint(&remote.build, remote.rev)?;
+    readmodel::repoint_current(&remote)?;
     readmodel::gc(&keep);
     crate::metrics::Run::new("sync")
         .set("phase", "pull_down")
@@ -904,6 +906,10 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
     Ok(true)
 }
 
+fn local_format_is_newer(local: Option<&readmodel::Current>, remote: &readmodel::Current) -> bool {
+    local.is_some_and(|current| current.format > remote.format)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +918,24 @@ mod tests {
     #[test]
     fn published_read_model_precedes_unbounded_raw_history() {
         assert_eq!(READER_PULL_ORDER, [ReaderPull::ReadModel, ReaderPull::Events]);
+    }
+
+    #[test]
+    fn older_remote_format_never_replaces_a_newer_local_projection() {
+        let local = readmodel::Current {
+            build: "local-v2".into(),
+            rev: 0,
+            format: readmodel::FORMAT,
+            writer: "new".into(),
+        };
+        let remote = readmodel::Current {
+            build: "remote-v1".into(),
+            rev: 9,
+            format: 1,
+            writer: "old".into(),
+        };
+        assert!(local_format_is_newer(Some(&local), &remote));
+        assert!(!local_format_is_newer(None, &remote));
     }
 
     struct RecordingBucket {

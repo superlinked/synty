@@ -128,6 +128,8 @@ pub fn status() -> Result<Status> {
     // effort). Independent of the bucket — it's about synty itself, not the data.
     let bucket = crate::config::load().bucket;
     let upgrade = crate::release::available();
+    let fleet = crate::units::analysis_roster()
+        .unwrap_or_else(|| crate::fleet::roster(&docs, std::path::Path::new(crate::units::LOCAL_DIR)));
     Ok(Status {
         docs: docs.len(),
         github,
@@ -144,7 +146,7 @@ pub fn status() -> Result<Status> {
         bucket,
         upgrade,
         stale: stale_note().is_some(),
-        fleet: crate::fleet::roster(&docs, std::path::Path::new(crate::units::LOCAL_DIR)),
+        fleet,
     })
 }
 

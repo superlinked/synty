@@ -48,7 +48,7 @@ Every read command prints Markdown to stdout, or `--json` for a versioned envelo
 | `synty recent` | latest PRs, issues, and prompts |
 | `synty topic [name]` | emergent topics, or one topic's members |
 | `synty show <id>` | open a session, PR/issue (`repo#123`), or topic |
-| `synty trace list/show/search/compare` | inspect turns, paired tool calls, async jobs, and raw evidence |
+| `synty trace list/show/search/compare` | inspect turns, paired tool calls, async jobs, and bounded event evidence |
 | `synty status` | what's indexed, freshness, activation, the fleet roster |
 | `synty stats` | tokens / tools / sessions vs LOC / PRs / issues per week |
 | `synty tui` | interactive browser: tabs, drill-down, filter by repo or account |
@@ -88,7 +88,7 @@ plain files under `~/.synty`, so you can build on it directly:
 synty stats --json | jq '.data.weeks[] | {week: .start, tok_in, tok_out}'   # weekly token trend
 synty trace list --type spans --status error --sort duration               # slow/error tool evidence
 synty trace list --type jobs --sort wait                                   # associated exec/poll lifecycles
-synty trace search 'libxcb.so.1'                                           # literal raw-event lookup
+synty trace search 'libxcb.so.1'                                           # literal bounded-evidence lookup
 synty trace show <full-or-unique-id> --json                                # surrounding execution context
 # Agents can call the same forensic surface over MCP (synty_trace_*), including
 # authenticated HTTP when the binary is built with --features mcp-http.
@@ -169,10 +169,11 @@ sudo loginctl enable-linger "$USER"
 
 That bucket is the only shared infrastructure: no build server, no coordination
 service. Each machine writes a stable `edge-<machine>-<source>` stream, so
-writers do not overwrite one another. Readers pull every stream plus the latest
-published read-model. A bounded stream registry and per-stream local key cursors
-avoid relisting historical chunks on each read. The TUI builds unpublished
-event deltas in the background;
+writers do not overwrite one another. Local readers and builders pull every
+stream plus the latest published read-model. MCP-only readers pull just that
+read-model, which includes compact session, tool, fleet, and trace projections.
+A bounded stream registry and per-stream local key cursors avoid relisting
+historical chunks on each local read. The TUI builds unpublished event deltas in the background;
 `synty build` does the same explicitly, while `search` warns if raw events are
 newer than the published index. One tokened machine scrapes GitHub for everyone.
 
@@ -214,14 +215,19 @@ name native producers such as `harness`, `codex_cli`, or `github`. Restricted
 scopes omit fleet-wide status/stat/tool surfaces and rebuild topic facets only
 from allowed members. HTTP `synty_related` accepts client-supplied `context`
 and never reads a caller-provided path on the server.
-MCP pulls the published read-model before serving. It then refreshes the model
-and raw events on a background thread, so a large trace history cannot hold the
-semantic-search dispatcher or delay search startup. Raw-derived tools remain
-serialized on their own dispatcher. HTTP work is bounded by separate semantic
-and raw queues, a 120-second response deadline, 32 in-flight requests, 64 live
-connections, 10-second TLS/header/body read deadlines, and a per-client
-120-request/minute window; queued work whose client timed out is dropped before
-execution.
+MCP pulls the complete published read-model before serving and refreshes it on
+a background thread; it never mirrors the raw event lake. Format-2 builds carry
+compact session/tool/fleet facts plus a trace projection whose searchable
+evidence, commands, and outputs are capped per event. `/health` reports
+transport liveness and `/ready` waits for both projections. Analysis tools are
+serialized on a one-slot dispatcher so concurrent first loads cannot multiply
+memory. HTTP work is bounded by separate semantic and analysis queues, a
+120-second response deadline, 32 in-flight requests, 64 live connections,
+10-second TLS/header/body read deadlines, and a per-client 120-request/minute
+window; queued work whose client timed out is dropped before execution.
+A bucket still on read-model format 1 needs one `synty build` from a
+write-enabled builder before remote MCP becomes ready. The MCP service account
+does not perform that migration or write anything back.
 
 The Helm chart under `deploy/helm/synty` defaults to the private image
 `851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty:<appVersion>`. Version
@@ -230,9 +236,10 @@ tags build each architecture on a native GitHub runner, then publish a verified
 `deploy/aws/ecr-publisher.yaml` once and set the repository variable
 `AWS_ECR_PUBLISH_ROLE_ARN` to its role output. Remote MCP is disabled by default;
 enabling it requires a TLS Secret and a NetworkPolicy whose source selectors
-name trusted callers. The Service remains cluster-internal, and its default
-NetworkPolicy accepts only same-namespace pods labeled
-`synty.superlinked.com/mcp-client: "true"`.
+name trusted callers. The policy also requires explicit object-store CIDRs;
+cluster DNS and only those destinations on TCP 443 are allowed for egress. The
+Service remains cluster-internal, and its default ingress accepts only
+same-namespace pods labeled `synty.superlinked.com/mcp-client: "true"`.
 
 ## How it works
 

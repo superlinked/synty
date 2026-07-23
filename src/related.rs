@@ -46,7 +46,10 @@ pub fn build_query(log_subjects: &str, changed_files: &str) -> Option<String> {
 fn add_words(s: &str, seen: &mut std::collections::HashSet<String>, words: &mut Vec<String>) {
     for raw in s.split(|c: char| !c.is_alphanumeric() && c != '-') {
         let w = raw.trim_matches('-').to_lowercase();
-        if w.len() < 3 || w.chars().all(|c| c.is_ascii_digit()) || crate::qwen::STOPWORDS.contains(&w.as_str()) {
+        if w.len() < 3
+            || w.chars().all(|c| c.is_ascii_digit())
+            || crate::words::DEVELOPER_STOPWORDS.contains(&w.as_str())
+        {
             continue;
         }
         if seen.insert(w.clone()) {

@@ -116,6 +116,7 @@ pub fn run(model_id: &str) -> Result<()> {
 /// evals/names.json, a worst-first report to evals/names.md, and a
 /// `[metrics nameeval]` block with the BETA sensitivity sweep. Read-only:
 /// scores cached names, never regenerates them.
+#[cfg(feature = "llm")]
 pub fn run_names(bucket: &str) -> Result<()> {
     use crate::qwen::{eval_names, is_slug, rejects_at, NameRow};
     let mut rows = eval_names(bucket)?;
@@ -214,6 +215,13 @@ pub fn run_names(bucket: &str) -> Result<()> {
     m.emit();
     eprintln!("wrote evals/names.json + evals/names.md ({} topics)", rows.len());
     Ok(())
+}
+
+#[cfg(not(feature = "llm"))]
+/// Keep the command surface stable in extractive-only binaries while making
+/// the missing local naming model explicit.
+pub fn run_names(_bucket: &str) -> Result<()> {
+    anyhow::bail!("name evaluation requires a build with the `llm` feature")
 }
 
 /// (query, gold gh: key) pairs from sessions that produced a PR — a free

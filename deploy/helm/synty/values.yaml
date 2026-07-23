@@ -93,3 +93,7 @@ networkPolicy:
     - podSelector:
         matchLabels:
           synty.superlinked.com/mcp-client: "true"
+  # Required when MCP is enabled. Kubernetes NetworkPolicy cannot select an
+  # external service by DNS name, so list the current CIDRs for the configured
+  # object-store endpoint. Never use 0.0.0.0/0 or ::/0 here.
+  objectStoreCidrs: []

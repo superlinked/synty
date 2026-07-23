@@ -5,6 +5,14 @@
 {{- if not .Values.networkPolicy.ingressFrom }}
 {{- fail "networkPolicy.ingressFrom must select at least one trusted MCP caller" }}
 {{- end }}
+{{- if not .Values.networkPolicy.objectStoreCidrs }}
+{{- fail "networkPolicy.objectStoreCidrs must list the configured object-store endpoint ranges" }}
+{{- end }}
+{{- range .Values.networkPolicy.objectStoreCidrs }}
+{{- if or (eq . "0.0.0.0/0") (eq . "::/0") }}
+{{- fail "networkPolicy.objectStoreCidrs must not allow the entire internet" }}
+{{- end }}
+{{- end }}
 {{- range .Values.networkPolicy.ingressFrom }}
 {{- $hasPodSelector := hasKey . "podSelector" }}
 {{- $hasNamespaceSelector := hasKey . "namespaceSelector" }}
@@ -86,8 +94,10 @@ spec:
             - { name: tmp, mountPath: /tmp }
             - { name: scope, mountPath: /etc/synty, readOnly: true }
             - { name: tls, mountPath: /etc/synty/tls, readOnly: true }
-          # Startup includes a read-only pull of the published query model; raw
-          # trace chunks continue in the background after the service is ready.
+          # Liveness proves the transport loop is responsive. Readiness also
+          # requires the compact analysis + trace projections from a format-2
+          # published build, so agents never discover a reader that must scan
+          # the raw lake on its first request.
           startupProbe:
             httpGet: { path: /health, port: mcp, scheme: HTTPS }
             periodSeconds: 10
@@ -96,7 +106,7 @@ spec:
             httpGet: { path: /health, port: mcp, scheme: HTTPS }
             periodSeconds: 30
           readinessProbe:
-            httpGet: { path: /health, port: mcp, scheme: HTTPS }
+            httpGet: { path: /ready, port: mcp, scheme: HTTPS }
             periodSeconds: 10
           resources:
             {{- toYaml .Values.mcp.resources | nindent 12 }}
@@ -151,6 +161,23 @@ spec:
       ports:
         - { protocol: TCP, port: {{ .Values.mcp.port }} }
   egress:
-    - {}
+    # Resolve the object-store hostname through cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Reach only the configured object-store address ranges over TLS.
+    - to:
+        {{- range .Values.networkPolicy.objectStoreCidrs }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 443 }
 {{- end }}
 {{- end }}

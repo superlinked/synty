@@ -50,6 +50,8 @@ const MAX_CONNECTIONS: usize = 64;
 #[cfg(feature = "mcp-http")]
 const DISPATCH_QUEUE: usize = 8;
 #[cfg(feature = "mcp-http")]
+const ANALYSIS_DISPATCH_QUEUE: usize = 1;
+#[cfg(feature = "mcp-http")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(feature = "mcp-http")]
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,7 +79,7 @@ struct Dispatcher {
 #[derive(Clone)]
 struct AppState {
     dispatcher: Dispatcher,
-    raw_dispatcher: Dispatcher,
+    analysis_dispatcher: Dispatcher,
     token: Arc<String>,
     allowed_origins: Arc<Vec<String>>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
@@ -103,8 +105,8 @@ enum DispatchError {
 
 #[cfg(feature = "mcp-http")]
 impl Dispatcher {
-    fn start(name: &str, mut server: mcp::Server) -> Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel::<DispatchJob>(DISPATCH_QUEUE);
+    fn start(name: &str, queue: usize, mut server: mcp::Server) -> Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<DispatchJob>(queue);
         std::thread::Builder::new()
             .name(format!("synty-mcp-{name}"))
             .spawn(move || {
@@ -195,7 +197,7 @@ pub fn run(opts: Opts) -> Result<()> {
     let scheme = if tls.is_some() { "https" } else { "http" };
     let require_read_model = opts.bucket.is_some();
     mcp::start_bucket_refresh(opts.bucket.clone());
-    let dispatcher = Dispatcher::start("semantic", mcp::Server::new(
+    let dispatcher = Dispatcher::start("semantic", DISPATCH_QUEUE, mcp::Server::new(
         opts.model_id.clone(),
         opts.role,
         opts.scope.clone(),
@@ -203,14 +205,15 @@ pub fn run(opts: Opts) -> Result<()> {
         false,
         opts.bucket.clone(),
     ))?;
-    // Raw-derived tools may scan a large local history. Keep them serialized,
-    // but on a separate dispatcher so they cannot block semantic search.
-    let raw_dispatcher = Dispatcher::start("raw", mcp::Server::new(
+    // Analysis tools share a cached published projection. Keep them serialized
+    // on a one-slot queue so bursts cannot duplicate its first-load memory or
+    // block semantic search.
+    let analysis_dispatcher = Dispatcher::start("analysis", ANALYSIS_DISPATCH_QUEUE, mcp::Server::new(
         opts.model_id, opts.role, opts.scope, opts.redaction, false, opts.bucket,
     ))?;
     let state = AppState {
         dispatcher,
-        raw_dispatcher,
+        analysis_dispatcher,
         token: Arc::new(opts.token),
         allowed_origins: Arc::new(opts.allowed_origins),
         rate_limiter: Arc::new(Mutex::new(RateLimiter::default())),
@@ -359,15 +362,22 @@ async fn handle(
     if !origin_allowed(&request, &state.allowed_origins) {
         return response(StatusCode::FORBIDDEN, "origin forbidden".into(), false);
     }
-    if request.method() == Method::GET && path == "/health" {
-        let ready = !state.require_read_model || crate::readmodel::current().is_some();
+    if request.method() == Method::GET && matches!(path, "/health" | "/ready") {
+        let read_model = crate::readmodel::current().is_some();
+        let mediated = crate::readmodel::mediated_ready();
+        let ready = !state.require_read_model || (read_model && mediated);
+        let liveness = path == "/health";
         let body = json!({
-            "status": if ready { "ok" } else { "starting" },
+            "status": if liveness || ready { "ok" } else { "starting" },
+            "ready": ready,
+            "read_model": read_model,
+            "mediated_projections": mediated,
             "name": "synty",
             "version": env!("CARGO_PKG_VERSION"),
         })
         .to_string();
-        return response(StatusCode::from_u16(health_code(ready)).unwrap(), body, true);
+        let success = liveness || ready;
+        return response(StatusCode::from_u16(health_code(success)).unwrap(), body, true);
     }
     if path != "/mcp" {
         return response(StatusCode::NOT_FOUND, "not found".into(), false);
@@ -444,8 +454,8 @@ async fn handle(
             false,
         );
     }
-    let dispatcher = if uses_raw_history(&value) {
-        state.raw_dispatcher
+    let dispatcher = if uses_analysis_projection(&value) {
+        state.analysis_dispatcher
     } else {
         state.dispatcher
     };
@@ -494,7 +504,7 @@ fn health_code(ready: bool) -> u16 {
 }
 
 #[cfg(any(feature = "mcp-http", test))]
-fn uses_raw_history(request: &serde_json::Value) -> bool {
+fn uses_analysis_projection(request: &serde_json::Value) -> bool {
     request["method"].as_str() == Some("tools/call")
         && matches!(
             request["params"]["name"].as_str(),
@@ -638,17 +648,17 @@ mod tests {
     }
 
     #[test]
-    fn long_raw_analysis_cannot_take_the_search_dispatcher() {
+    fn analysis_calls_cannot_take_the_search_dispatcher() {
         let call = |name| serde_json::json!({
             "method": "tools/call",
             "params": {"name": name, "arguments": {}}
         });
-        assert!(uses_raw_history(&call("synty_status")));
-        assert!(uses_raw_history(&call("synty_trace_search")));
-        assert!(uses_raw_history(&call("synty_recent")));
-        assert!(!uses_raw_history(&call("synty_search")));
-        assert!(!uses_raw_history(&call("synty_related")));
-        assert!(!uses_raw_history(&serde_json::json!({"method": "tools/list"})));
+        assert!(uses_analysis_projection(&call("synty_status")));
+        assert!(uses_analysis_projection(&call("synty_trace_search")));
+        assert!(uses_analysis_projection(&call("synty_recent")));
+        assert!(!uses_analysis_projection(&call("synty_search")));
+        assert!(!uses_analysis_projection(&call("synty_related")));
+        assert!(!uses_analysis_projection(&serde_json::json!({"method": "tools/list"})));
     }
 
     #[test]
@@ -703,6 +713,7 @@ mod tests {
     fn bounded_dispatcher_roundtrips_protocol_calls() {
         let dispatcher = Dispatcher::start(
             "test",
+            1,
             mcp::Server::new(
                 "m".into(),
                 crate::policy::McpRole::Operator,

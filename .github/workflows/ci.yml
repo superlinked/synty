@@ -18,6 +18,7 @@ jobs:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+      - run: cargo test --locked --no-default-features
       - run: cargo test --locked --features s3,gcs,mcp-http
       - name: Exercise the HTTP MCP listener
         run: |
@@ -43,8 +44,18 @@ jobs:
             if helm template synty deploy/helm/synty \
               --set bucket=s3://example/synty --set mcp.enabled=true \
               --set mcp.tls.existingSecret=synty-mcp-tls \
+              --set-json 'networkPolicy.objectStoreCidrs=["203.0.113.10/32"]' \
               --set-json "networkPolicy.ingressFrom=$selector" >/tmp/synty-unrestricted.yaml; then
               echo "MCP rendered with an unrestricted caller selector" >&2
+              exit 1
+            fi
+          done
+          for cidr in '[]' '["0.0.0.0/0"]' '["::/0"]'; do
+            if helm template synty deploy/helm/synty \
+              --set bucket=s3://example/synty --set mcp.enabled=true \
+              --set mcp.tls.existingSecret=synty-mcp-tls \
+              --set-json "networkPolicy.objectStoreCidrs=$cidr" >/tmp/synty-unrestricted.yaml; then
+              echo "MCP rendered without constrained object-store egress" >&2
               exit 1
             fi
           done
@@ -58,7 +69,17 @@ jobs:
           --set mcp.enabled=true
           --set mcp.tls.existingSecret=synty-mcp-tls
           --set mcp.allowedOrigins[0]=https://memory.example.com
+          --set-json 'networkPolicy.objectStoreCidrs=["203.0.113.10/32"]'
           --set persistence.enabled=false >/tmp/synty-options.yaml
+      - name: Assert MCP probe and egress contracts
+        run: |
+          grep -q 'path: /ready' /tmp/synty-options.yaml
+          grep -q 'scheme: HTTPS' /tmp/synty-options.yaml
+          grep -q 'cidr: 203.0.113.10/32' /tmp/synty-options.yaml
+          if grep -q -- '- {}' /tmp/synty-options.yaml; then
+            echo "MCP rendered an unrestricted NetworkPolicy rule" >&2
+            exit 1
+          fi
       - name: Build the shipped image
         run: |
           docker build -t synty-ci .
