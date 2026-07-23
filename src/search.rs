@@ -3,7 +3,7 @@
 // resolved to a doc-id subset via next-plaid's filtering module, then passed
 // to MaxSim search. Renders Markdown to stdout — the agent-facing surface.
 
-use crate::{encode::Encoder, excerpt, first_line, load_docs, readmodel, short, Doc};
+use crate::{Doc, encode::Encoder, excerpt, first_line, load_docs, readmodel};
 use anyhow::{anyhow, Result};
 use next_plaid::{MmapIndex, QueryResult, SearchParameters};
 
@@ -164,8 +164,48 @@ fn card(d: &Doc, rank: usize, score: f32) -> String {
             "{rank}. [{score:.1}] _{} · {} · {}_\n   {}\n",
             d.meta.kind,
             if d.meta.repo.is_empty() { "—" } else { &d.meta.repo },
-            short(&d.meta.session_id),
+            if d.meta.session_id.is_empty() { "—" } else { &d.meta.session_id },
             excerpt(&d.text, 160)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::card;
+    use crate::{Doc, Meta};
+
+    fn session_doc(id: &str) -> Doc {
+        Doc {
+            id: 0,
+            text: "Measured the GPU bottleneck".into(),
+            meta: Meta {
+                source: "agent".into(),
+                kind: "assistant_message".into(),
+                repo: String::new(),
+                author: String::new(),
+                session_id: id.into(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: "codex_cli".into(),
+                ts: "2026-07-23T00:00:00Z".into(),
+                number: None,
+                url: None,
+                state: None,
+                labels: vec![],
+                agent_attr: None,
+            },
+        }
+    }
+
+    // Search ids are direct synty_show arguments even when two ULIDs share
+    // their timestamp prefix, as observed in the live harness corpus.
+    #[test]
+    fn session_cards_print_full_native_ids() {
+        let first = card(&session_doc("019f7d1e-0000-4000-8000-000000000001"), 1, 7.3);
+        let second = card(&session_doc("019f7d1e-0000-4000-8000-000000000002"), 2, 7.1);
+        assert!(first.contains("019f7d1e-0000-4000-8000-000000000001"), "{first}");
+        assert!(second.contains("019f7d1e-0000-4000-8000-000000000002"), "{second}");
     }
 }

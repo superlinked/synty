@@ -333,7 +333,7 @@ fn tool_defs(role: crate::policy::McpRole, scope: &crate::policy::ReadScope, all
     let mut all = json!([
         {
             "name": "synty_search",
-            "description": "Semantic search over this machine's coding-agent sessions and GitHub activity (PRs, issues, prompts). Use before starting work to find prior attempts, decisions, and related PRs. Ids in the output ([a1b2c3d4], repo#123) feed synty_show.",
+            "description": "Semantic search over this machine's coding-agent sessions and GitHub activity (PRs, issues, prompts). Use before starting work to find prior attempts, decisions, and related PRs. Full session ids and repo#123 references in the output feed synty_show.",
             "inputSchema": obj(json!({
                 "query": {"type": "string", "maxLength": 4096, "description": "What to look for, in natural language"},
                 "k": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results (default 5)"},

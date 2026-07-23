@@ -56,15 +56,16 @@ Every read command prints Markdown to stdout, or `--json` for a versioned envelo
 | `synty import` | ingest harness/Devin NDJSON into a local owned stream |
 | `synty build` / `synty up` | rebuild the index once / keep it fresh on a loop |
 
-A result is a ranked Markdown card with ids you can drill (`[a1b2c3d4]` sessions,
-`repo#123` PRs/issues, `[72a778f8]` topics) that feed `synty show`:
+A result is a ranked Markdown card with full native ids you can drill
+(`[019f7d1e-0000-4000-8000-000000000001]` sessions, `repo#123` PRs/issues,
+`[72a778f8aabbccdd]` topics) that feed `synty show` without prefix collisions:
 
 ```text
 ## rate limiting middleware
 
 1. [24.3] **pull_request api#1487** — Add a token-bucket limiter to the gateway
    merged · https://github.com/acme/api/pull/1487
-2. [21.8] _user_prompt · api · a3f1c2d9_
+2. [21.8] _user_prompt · api · 019f7d1e-0000-4000-8000-000000000001_
    how do we share the per-tenant limiter's state across pods? settled on Redis…
 3. [19.0] **issue api#1502** — 429s under burst load on the search endpoint
    open · https://github.com/acme/api/issues/1502

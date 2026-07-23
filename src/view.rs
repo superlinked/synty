@@ -480,7 +480,10 @@ fn resolve_among(
                 let topic = topics
                     .into_iter()
                     .find(|t| t.units.iter().any(|u| u.doc_id == Some(doc.id)))
-                    .map(|t| (crate::short(&t.cache_key), t.title().to_string()));
+                    .map(|t| {
+                        let title = t.title().to_string();
+                        (t.cache_key, title)
+                    });
                 Ok(ShowTarget::Gh { doc, topic })
             }
             None => anyhow::bail!("no PR/issue {repo}#{n} in the corpus — `synty github` pulls the active window"),
@@ -507,13 +510,13 @@ fn resolve_among(
             let mut cands: Vec<String> = s_hits
                 .iter()
                 .take(8)
-                .map(|&i| format!("{} session — {}", crate::short(&sessions[i].id), crate::excerpt(&sessions[i].ask, 48)))
+                .map(|&i| format!("{} session — {}", sessions[i].id, crate::excerpt(&sessions[i].ask, 48)))
                 .collect();
             cands.extend(
                 t_hits
                     .iter()
                     .take(8usize.saturating_sub(cands.len()))
-                    .map(|&i| format!("{} topic — {}", crate::short(&topics[i].cache_key), topics[i].title())),
+                    .map(|&i| format!("{} topic — {}", topics[i].cache_key, topics[i].title())),
             );
             anyhow::bail!("`{id}` is ambiguous — {} matches:\n  {}", s_hits.len() + t_hits.len(), cands.join("\n  "))
         }
@@ -740,12 +743,12 @@ pub fn work_md(units: &[Unit]) -> String {
     o
 }
 
-/// The inline id a session row carries (` [a1b2c3d4]`) so a follow-up
-/// `synty show <id>` needs nothing but this output. GitHub rows already lead
-/// their title with `repo#N`, which `show` accepts directly.
+/// The inline native id a session row carries so a follow-up `synty show <id>`
+/// needs nothing but this output, even when timestamp-derived ULID prefixes
+/// collide. GitHub rows already lead their title with `repo#N`.
 fn unit_id_tag(u: &Unit) -> String {
     match (&u.kind, &u.session_id) {
-        (Kind::Session, Some(s)) if !s.is_empty() => format!(" [{}]", crate::short(s)),
+        (Kind::Session, Some(s)) if !s.is_empty() => format!(" [{s}]"),
         _ => String::new(),
     }
 }
@@ -759,7 +762,7 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
         let wk = |i: usize| n.checked_sub(i).and_then(|x| t.activity.get(x)).copied().unwrap_or(0);
         o.push_str(&format!(
             "## [{}] {}\n{} units · last active {} · activity this/last/prior wk: {}/{}/{} · {sess} sessions / {prs} PRs / {issues} issues\n",
-            crate::short(&t.cache_key),
+            t.cache_key,
             t.title(),
             t.units.len(),
             t.last_active,
@@ -1440,7 +1443,8 @@ mod tests {
         ];
         let e = show_err(resolve_among("aaaa", sessions, vec![], &[]));
         assert!(e.contains("ambiguous") && e.contains("2 matches"), "{e}");
-        assert!(e.contains("aaaa1111") && e.contains("aaaa2222"), "{e}");
+        assert!(e.contains("aaaa1111-0000-4000-8000-000000000001"), "{e}");
+        assert!(e.contains("aaaa2222-0000-4000-8000-000000000002"), "{e}");
         assert!(e.contains("first ask"), "candidates carry their ask: {e}");
     }
 
@@ -1527,7 +1531,10 @@ mod tests {
         for i in 0..8 {
             assert!(md.contains(&format!("session number {i}")), "member {i} missing: {md}");
         }
-        assert!(md.contains("[00000007]"), "member rows carry ids: {md}");
+        assert!(
+            md.contains("[00000007-0000-4000-8000-000000000000]"),
+            "member rows carry ids: {md}"
+        );
     }
 
     // PR detail names its state, link, author, topic, and excerpts the body.
@@ -1564,7 +1571,7 @@ mod tests {
             source: "claude_code".into(),
         };
         let md = work_md(&[unit]);
-        assert!(md.contains("session [a1b2c3d4]"), "{md}");
+        assert!(md.contains("session [a1b2c3d4-9999-4242-8888-777766665555]"), "{md}");
     }
 
     // Topic headers lead with the stable content-addressed key — the
@@ -1603,9 +1610,12 @@ mod tests {
             span: None,
         };
         let md = topics_md(&[t]);
-        assert!(md.contains("## [72a778f8] auth work"), "{md}");
+        assert!(md.contains("## [72a778f8aabbccdd] auth work"), "{md}");
         assert!(!md.contains("## 3 —"), "the positional id is gone from MD: {md}");
-        assert!(md.contains("session [a1b2c3d4]:"), "member rows carry ids too: {md}");
+        assert!(
+            md.contains("session [a1b2c3d4-9999-4242-8888-777766665555]:"),
+            "member rows carry ids too: {md}"
+        );
     }
 
     // Every --json output arrives in the same versioned envelope, so a script
