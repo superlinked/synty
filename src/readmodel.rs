@@ -120,13 +120,15 @@ pub fn trace_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("corpus/trace.json"))
 }
 
-/// Strict readiness for mediated readers: format-2 builds carry the compact
-/// raw-derived projections that keep requests bounded independently of raw
-/// retention. Older search-only builds remain usable by local CLI fallbacks.
+/// Strict readiness for mediated readers. Athena-backed trace readers require
+/// only the compact analysis projection; local trace readers additionally
+/// require the published trace snapshot.
 #[cfg(feature = "mcp-http")]
-pub fn mediated_ready() -> bool {
+pub fn mediated_ready(require_trace: bool) -> bool {
     current().is_some_and(|current| {
-        current.format >= FORMAT && current.analysis().is_file() && current.trace().is_file()
+        current.format >= FORMAT
+            && current.analysis().is_file()
+            && (!require_trace || current.trace().is_file())
     })
 }
 

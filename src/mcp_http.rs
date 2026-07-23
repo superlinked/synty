@@ -73,6 +73,17 @@ struct DispatchJob {
 #[derive(Clone)]
 struct Dispatcher {
     sender: SyncSender<DispatchJob>,
+    alive: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "mcp-http")]
+struct DispatcherLife(Arc<AtomicBool>);
+
+#[cfg(feature = "mcp-http")]
+impl Drop for DispatcherLife {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(feature = "mcp-http")]
@@ -85,6 +96,7 @@ struct AppState {
     rate_limiter: Arc<Mutex<RateLimiter>>,
     in_flight: Arc<Semaphore>,
     require_read_model: bool,
+    require_trace_projection: bool,
 }
 
 #[cfg(feature = "mcp-http")]
@@ -107,9 +119,12 @@ enum DispatchError {
 impl Dispatcher {
     fn start(name: &str, queue: usize, mut server: mcp::Server) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<DispatchJob>(queue);
+        let alive = Arc::new(AtomicBool::new(true));
+        let thread_alive = Arc::clone(&alive);
         std::thread::Builder::new()
             .name(format!("synty-mcp-{name}"))
             .spawn(move || {
+                let _life = DispatcherLife(thread_alive);
                 while let Ok(job) = receiver.recv() {
                     if job.cancelled.load(Ordering::Acquire) {
                         continue;
@@ -119,7 +134,7 @@ impl Dispatcher {
                 }
             })
             .map_err(|error| anyhow::anyhow!("start {name} MCP dispatcher: {error}"))?;
-        Ok(Self { sender })
+        Ok(Self { sender, alive })
     }
 
     fn call(&self, request: Value) -> std::result::Result<Option<Value>, DispatchError> {
@@ -139,6 +154,10 @@ impl Dispatcher {
             }
             Err(RecvTimeoutError::Disconnected) => Err(DispatchError::Stopped),
         }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 }
 
@@ -187,6 +206,7 @@ pub struct Opts {
     pub redaction: crate::redact::Profile,
     pub allowed_origins: Vec<String>,
     pub bucket: Option<String>,
+    pub athena: Option<crate::mcp::AthenaTraceOptions>,
 }
 
 #[cfg(feature = "mcp-http")]
@@ -196,7 +216,8 @@ pub fn run(opts: Opts) -> Result<()> {
     validate_listener(&opts.bind, opts.listen_public, tls.is_some())?;
     let scheme = if tls.is_some() { "https" } else { "http" };
     let require_read_model = opts.bucket.is_some();
-    mcp::start_bucket_refresh(opts.bucket.clone());
+    let require_trace_projection = opts.athena.is_none();
+    mcp::start_bucket_refresh(opts.bucket.clone(), require_trace_projection);
     let dispatcher = Dispatcher::start("semantic", DISPATCH_QUEUE, mcp::Server::new(
         opts.model_id.clone(),
         opts.role,
@@ -204,12 +225,13 @@ pub fn run(opts: Opts) -> Result<()> {
         opts.redaction,
         false,
         opts.bucket.clone(),
+        opts.athena.clone(),
     ))?;
     // Analysis tools share a cached published projection. Keep them serialized
     // on a one-slot queue so bursts cannot duplicate its first-load memory or
     // block semantic search.
     let analysis_dispatcher = Dispatcher::start("analysis", ANALYSIS_DISPATCH_QUEUE, mcp::Server::new(
-        opts.model_id, opts.role, opts.scope, opts.redaction, false, opts.bucket,
+        opts.model_id, opts.role, opts.scope, opts.redaction, false, opts.bucket, opts.athena,
     ))?;
     let state = AppState {
         dispatcher,
@@ -219,6 +241,7 @@ pub fn run(opts: Opts) -> Result<()> {
         rate_limiter: Arc::new(Mutex::new(RateLimiter::default())),
         in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         require_read_model,
+        require_trace_projection,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -364,14 +387,23 @@ async fn handle(
     }
     if request.method() == Method::GET && matches!(path, "/health" | "/ready") {
         let read_model = crate::readmodel::current().is_some();
-        let mediated = crate::readmodel::mediated_ready();
-        let ready = !state.require_read_model || (read_model && mediated);
+        let mediated = crate::readmodel::mediated_ready(state.require_trace_projection);
+        let dispatchers_ready =
+            state.dispatcher.is_alive() && state.analysis_dispatcher.is_alive();
+        let ready = ready_state(
+            state.require_read_model,
+            read_model,
+            mediated,
+            dispatchers_ready,
+        );
         let liveness = path == "/health";
         let body = json!({
             "status": if liveness || ready { "ok" } else { "starting" },
             "ready": ready,
             "read_model": read_model,
             "mediated_projections": mediated,
+            "dispatchers": dispatchers_ready,
+            "trace_backend": if state.require_trace_projection { "projection" } else { "athena" },
             "name": "synty",
             "version": env!("CARGO_PKG_VERSION"),
         })
@@ -501,6 +533,16 @@ where
 #[cfg(any(feature = "mcp-http", test))]
 fn health_code(ready: bool) -> u16 {
     if ready { 200 } else { 503 }
+}
+
+#[cfg(any(feature = "mcp-http", test))]
+fn ready_state(
+    require_read_model: bool,
+    read_model: bool,
+    mediated: bool,
+    dispatchers: bool,
+) -> bool {
+    dispatchers && (!require_read_model || (read_model && mediated))
 }
 
 #[cfg(any(feature = "mcp-http", test))]
@@ -645,6 +687,9 @@ mod tests {
         assert!(!protocol_version_supported(Some("2099-01-01")));
         assert_eq!(health_code(true), 200);
         assert_eq!(health_code(false), 503);
+        assert!(ready_state(true, true, true, true));
+        assert!(!ready_state(true, true, true, false));
+        assert!(!ready_state(true, true, false, true));
     }
 
     #[test]
@@ -720,6 +765,7 @@ mod tests {
                 crate::policy::ReadScope::default(),
                 crate::redact::Profile::Off,
                 false,
+                None,
                 None,
             ),
         )

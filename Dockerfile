@@ -8,13 +8,13 @@ COPY Cargo.toml Cargo.lock ./
 # the expensive native dependencies on both architecture runners.
 RUN mkdir src \
     && printf 'fn main() {}\n' > src/main.rs \
-    && cargo build --release --locked --features s3,gcs,mcp-http \
+    && cargo build --release --locked --features s3,gcs,mcp-http,athena \
     && rm -rf src
 COPY src ./src
 # Docker normalizes copied mtimes; force Cargo to invalidate the dummy package
 # while retaining every dependency artifact from the preceding layer.
 RUN touch src/main.rs \
-    && cargo build --release --locked --features s3,gcs,mcp-http
+    && cargo build --release --locked --features s3,gcs,mcp-http,athena
 
 FROM debian:bookworm-slim
 

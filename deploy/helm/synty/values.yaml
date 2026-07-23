@@ -77,6 +77,13 @@ mcp:
     existingSecret: ""
     certificateKey: tls.crt
     privateKeyKey: tls.key
+  athena:
+    # Remote trace tools can query immutable raw events directly instead of
+    # requiring a generated trace.json on the MCP volume.
+    enabled: false
+    workgroup: ""
+    database: synty
+    table: raw_events
   scope:
     repos: []
     campaigns: []
@@ -98,3 +105,6 @@ networkPolicy:
   # object-store endpoint. At most 64 ranges are accepted; IPv4 ranges must be
   # /12 or narrower and IPv6 ranges /32 or narrower.
   objectStoreCidrs: []
+  # Additional regional AWS API endpoint addresses used by Athena and the
+  # workload identity credential chain. Required when mcp.athena.enabled.
+  awsApiCidrs: []

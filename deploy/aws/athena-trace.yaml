@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Read-only Glue catalog and bounded Athena workgroup for Synty raw event traces
+
+Parameters:
+  BucketName:
+    Type: String
+  DatabaseName:
+    Type: String
+    Default: synty
+    AllowedPattern: "[a-z0-9_]+"
+  TableName:
+    Type: String
+    Default: raw_events
+    AllowedPattern: "[a-z0-9_]+"
+  WorkGroupName:
+    Type: String
+    Default: synty-mcp-readonly
+    AllowedPattern: "[a-zA-Z0-9._-]+"
+  FirstEventDay:
+    Type: String
+    Default: "2026-01-01"
+    AllowedPattern: "[0-9]{4}-[0-9]{2}-[0-9]{2}"
+  BytesScannedCutoffPerQuery:
+    Type: Number
+    Default: 21474836480
+    MinValue: 10000000
+    Description: Hard per-query scan ceiling; default is 20 GiB.
+
+Resources:
+  TraceDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: Synty read-only raw event catalog
+
+  RawEventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref TraceDatabase
+      TableInput:
+        Name: !Ref TableName
+        Description: Immutable Synty JSONL event envelopes; one raw line per row
+        Owner: synty
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: "TRUE"
+          classification: regex
+          projection.enabled: "true"
+          projection.stream.type: injected
+          projection.day.type: date
+          projection.day.format: yyyy-MM-dd
+          projection.day.interval: "1"
+          projection.day.interval.unit: DAYS
+          projection.day.range: !Sub "${FirstEventDay},NOW"
+          storage.location.template: !Sub
+            - "s3://${Bucket}/events/${!stream}/chunks/track.${!day}/"
+            - Bucket: !Ref BucketName
+        PartitionKeys:
+          - Name: stream
+            Type: string
+          - Name: day
+            Type: string
+        StorageDescriptor:
+          Columns:
+            - Name: line
+              Type: string
+              Comment: Complete immutable event envelope
+          Compressed: false
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          Location: !Sub "s3://${BucketName}/events/"
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Name: synty-json-line
+            SerializationLibrary: org.apache.hadoop.hive.serde2.RegexSerDe
+            Parameters:
+              input.regex: "^(.*)$"
+
+  TraceWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref WorkGroupName
+      Description: Read-only bounded queries over Synty raw event envelopes
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        RequesterPaysEnabled: false
+        BytesScannedCutoffPerQuery: !Ref BytesScannedCutoffPerQuery
+        ManagedQueryResultsConfiguration:
+          Enabled: true
+        EngineVersion:
+          SelectedEngineVersion: AUTO
+      Tags:
+        - Key: application
+          Value: synty
+        - Key: access
+          Value: read-only
+
+Outputs:
+  DatabaseName:
+    Value: !Ref TraceDatabase
+  TableName:
+    Value: !Ref RawEventsTable
+  WorkGroupName:
+    Value: !Ref TraceWorkGroup

@@ -24,6 +24,11 @@ builder:
 mcp:
   enabled: true
   role: operator
+  athena:
+    enabled: true
+    workgroup: synty-mcp-readonly
+    database: synty
+    table: raw_events
   tls:
     existingSecret: synty-mcp-tls
   # Empty allowlists deliberately expose all internal bucket records. The MCP
@@ -60,3 +65,15 @@ networkPolicy:
     - 3.2.68.0/24
     - 35.80.36.208/28
     - 35.80.36.224/28
+  # Current public Athena us-west-2 answers plus regional STS for IRSA. Keep
+  # these /32s fail-closed and refresh them when AWS rotates endpoint DNS.
+  awsApiCidrs:
+    - 52.24.182.208/32
+    - 32.186.145.128/32
+    - 35.82.214.87/32
+    - 52.43.188.237/32
+    - 32.184.245.105/32
+    - 184.34.144.212/32
+    - 44.227.85.44/32
+    - 44.239.29.42/32
+    - 44.248.101.77/32

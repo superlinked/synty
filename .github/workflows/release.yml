@@ -19,7 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked # pure: no model, corpus, or network
-      - run: cargo test --locked --features s3,gcs,mcp-http # compile + test shipped remote paths
+      - run: cargo test --locked --features s3,gcs,mcp-http,athena # compile + test shipped remote paths
       - name: Verify tag, binary, and chart versions agree
         run: |
           cargo_version="$(awk -F ' *= *' '$1 == "version" {gsub(/"/, "", $2); print $2; exit}' Cargo.toml)"
@@ -38,11 +38,11 @@ jobs:
           # Apple Silicon: GPU encode via metal, with runtime CPU fallback.
           - os: macos-14
             asset: synty-darwin-arm64
-            features: metal,s3,gcs,mcp-http
+            features: metal,s3,gcs,mcp-http,athena
           # Linux x64: plain CPU, portable.
           - os: ubuntu-latest
             asset: synty-linux-x64
-            features: s3,gcs,mcp-http
+            features: s3,gcs,mcp-http,athena
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

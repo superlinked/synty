@@ -26,6 +26,17 @@ struct BuildManifest {
     files: BTreeMap<String, String>,
 }
 
+fn selected_read_model_files(
+    files: &BTreeMap<String, String>,
+    include_trace: bool,
+) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .filter(|(name, _)| include_trace || name.as_str() != "trace.json")
+        .map(|(name, blob)| (name.clone(), blob.clone()))
+        .collect()
+}
+
 fn manifest_key(build: &str, rev: u64) -> String {
     format!("builds/{build}.{rev}.json")
 }
@@ -693,10 +704,16 @@ enum ReaderPull {
 // complete format-2 read model.
 const READER_PULL_ORDER: [ReaderPull; 2] = [ReaderPull::ReadModel, ReaderPull::Events];
 
-/// Pull only the complete published query model. Format-2 builds include the
-/// compact analysis and trace projections needed by mediated MCP readers.
+/// Pull the complete published query model for local readers.
 pub fn pull_read_model_for_read(bucket_uri: &str) {
-    match pull_if_stale(bucket_uri) {
+    pull_read_model_for_mcp(bucket_uri, true);
+}
+
+/// Pull the published model for a mediated reader. Athena-backed trace readers
+/// deliberately omit the legacy trace blob; semantic search and compact
+/// analysis remain local and immutable.
+pub fn pull_read_model_for_mcp(bucket_uri: &str, include_trace: bool) {
+    match pull_if_stale_selected(bucket_uri, include_trace) {
         Ok(true) => eprintln!("pulled published read-model from {bucket_uri}"),
         Ok(false) => {}
         Err(e) => eprintln!("read-model pull skipped ({e})"),
@@ -862,6 +879,10 @@ pub fn publish(bucket_uri: &str) -> Result<usize> {
 /// verified loadable, and only then does the local pointer move. Returns
 /// whether it pulled.
 pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
+    pull_if_stale_selected(bucket_uri, true)
+}
+
+fn pull_if_stale_selected(bucket_uri: &str, include_trace: bool) -> Result<bool> {
     let b = bucket::open(bucket_uri)?;
     let Some(remote) =
         b.get(POINTER_KEY)?.and_then(|raw| serde_json::from_slice::<readmodel::Current>(&raw).ok())
@@ -879,18 +900,20 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
     if local_format_is_newer(local.as_ref(), &remote) {
         return Ok(false);
     }
-    if local.as_ref() == Some(&remote) {
-        return Ok(false);
-    }
-
     let raw = b
         .get(&manifest_key(&remote.build, remote.rev))?
         .ok_or_else(|| anyhow!("bucket pointer names a missing manifest (publish in flight?)"))?;
     let manifest: BuildManifest = serde_json::from_slice(&raw)?;
+    let files = selected_read_model_files(&manifest.files, include_trace);
     let dir = readmodel::build_dir(&remote.build);
+    if local.as_ref() == Some(&remote)
+        && files.keys().all(|name| dir.join(name).is_file())
+    {
+        return Ok(false);
+    }
     // Transfer the build — hardlink-reuse on-disk blobs, fetch only the changed
     // ones (and record the local manifest for the next pull).
-    let (reused, fetched, bytes_down) = fetch_build(&*b, &dir, &manifest.files)?;
+    let (reused, fetched, bytes_down) = fetch_build(&*b, &dir, &files)?;
     // Verify before repointing — a bad pull must never become current.
     next_plaid::MmapIndex::load(&dir.to_string_lossy())
         .map_err(|e| anyhow!("pulled build does not load: {e}"))?;
@@ -918,6 +941,20 @@ mod tests {
     #[test]
     fn published_read_model_precedes_unbounded_raw_history() {
         assert_eq!(READER_PULL_ORDER, [ReaderPull::ReadModel, ReaderPull::Events]);
+    }
+
+    #[test]
+    fn athena_mcp_pull_omits_only_the_legacy_trace_blob() {
+        let files = BTreeMap::from([
+            ("analysis.json".into(), "analysis".into()),
+            ("docs.jsonl".into(), "docs".into()),
+            ("index.db".into(), "index".into()),
+            ("trace.json".into(), "trace".into()),
+        ]);
+        let athena = selected_read_model_files(&files, false);
+        assert!(!athena.contains_key("trace.json"));
+        assert_eq!(athena.len(), files.len() - 1);
+        assert_eq!(selected_read_model_files(&files, true), files);
     }
 
     #[test]
