@@ -90,7 +90,7 @@ pub fn build(bucket: &str, machine: &str, resolution: f64, no_track: bool) -> Re
     let held = crate::lease::acquire(b.as_ref(), "build", &machine, now_ms(), crate::lease::TTL_MS)
         .unwrap_or(true); // a bucket without conditional-put support → behave solo
     if held {
-        index::run(DOCS_PATH, &crate::model_id(), bucket)?;
+        index::run(DOCS_PATH, &crate::model_id(), bucket, false)?;
         summarize(bucket, "delta unit summaries"); // units the new docs snapshot revealed
         crate::topics::run(resolution, &crate::model_id(), bucket)?;
         if crate::lease::refresh(b.as_ref(), "build", &machine, now_ms(), crate::lease::TTL_MS).unwrap_or(true) {
@@ -178,6 +178,6 @@ fn tick(bucket: &str, machine: &str, poll_secs: u64) -> Result<()> {
         bucket: Some(bucket.to_string()), // push events so a fleet build sees them
     })?;
     ingest::run(CORPUS_DIR, DOCS_PATH, Some(bucket))?;
-    index::run(DOCS_PATH, &crate::model_id(), bucket)?;
+    index::run(DOCS_PATH, &crate::model_id(), bucket, false)?;
     Ok(())
 }

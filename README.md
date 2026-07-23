@@ -202,6 +202,17 @@ with the tracker and builder disabled. If EKS and S3 are in different regions,
 set Helm's `bucketRegion` to the bucket's region so requests are signed for the
 correct endpoint.
 
+A one-shot local projection migration can still reuse that bucket's existing
+fleet embeddings without broadening the reader role:
+
+```sh
+synty index --bucket s3://my-team-synty --read-only-bucket
+```
+
+Missing vectors are encoded for the local immutable build but are not written
+to the bucket, and the completed read-model pointer remains local. A separately
+authorized builder is still required to publish format 2 for fresh readers.
+
 > **Heads up:** every member with raw bucket credentials can read every stored
 > object. Mediated MCP clients are narrower: role/tool policy, optional read
 > scope, and response redaction. If neither fit, stay local, or scope the bucket

@@ -391,7 +391,8 @@ A working binary: `up` (solo loop), `build` (one-shot fleet-aware pipeline),
 `track` (native tailers → envelope streams, `--bucket` to push), `github`
 (GraphQL backfill), `ingest` (envelopes + GitHub → `corpus/docs.jsonl`,
 `--bucket` to pull), `index` (encode + content-addressed store + versioned
-build + publish), `search [--filter col=value] [--json]`, `topic`, `recent`,
+build + publish; `--read-only-bucket` reuses existing vectors but keeps misses
+and the completed pointer local), `search [--filter col=value] [--json]`, `topic`, `recent`,
 `status`, `trace list/show/search/compare` (turns, spans, async jobs), `tui`,
 `mcp` (stdio + optional HTTP), `import`, `cluster [--resolution]`, `summarize`,
 `eval`, plus the scenario test suite (`cargo test`, pure). The bucket backplane

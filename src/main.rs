@@ -210,6 +210,10 @@ enum Cmd {
         /// s3://, gs:// with the matching feature). Default: config, then .synty.
         #[arg(long)]
         bucket: Option<String>,
+        /// Reuse existing bucket embeddings but never write misses or publish
+        /// the completed read-model back to that bucket.
+        #[arg(long)]
+        read_only_bucket: bool,
     },
     /// Semantic search; --filter is a SQL WHERE over metadata
     Search {
@@ -716,7 +720,15 @@ fn main() -> Result<()> {
         Cmd::Ingest { bucket } => {
             ingest::run(CORPUS_DIR, DOCS_PATH, config::resolve_bucket_opt(bucket).as_deref())?
         }
-        Cmd::Index { bucket } => index::run(DOCS_PATH, &model_id(), &config::resolve_bucket(bucket))?,
+        Cmd::Index {
+            bucket,
+            read_only_bucket,
+        } => index::run(
+            DOCS_PATH,
+            &model_id(),
+            &config::resolve_bucket(bucket),
+            read_only_bucket,
+        )?,
         Cmd::Search { query, filter, k, bucket, json } => {
             search::run(&query, filter.as_deref(), k, &model_id(), &config::resolve_bucket(bucket), json)?
         }
@@ -1151,6 +1163,25 @@ mod tests {
                 ..
             } if p == "synty-writer" && s == "2026-07-21" && capture_repos == ["synty"]
                 && u == "off" && m == "mcp_safe" && c == "camp-1" && r == "primary"
+        ));
+    }
+
+    #[test]
+    fn index_parses_explicit_read_only_bucket_mode() {
+        let cli = Cli::try_parse_from([
+            "synty",
+            "index",
+            "--bucket",
+            "s3://team",
+            "--read-only-bucket",
+        ])
+        .expect("read-only index settings parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Index {
+                bucket: Some(bucket),
+                read_only_bucket: true,
+            } if bucket == "s3://team"
         ));
     }
 

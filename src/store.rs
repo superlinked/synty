@@ -20,6 +20,10 @@ pub struct EmbStore {
     /// every model gets its own prefix — a mixed-model fleet can never
     /// silently share wrong vectors.
     ns: String,
+    /// A mediated reader may reuse fleet embeddings without being authorized
+    /// to add misses. The caller still receives newly encoded matrices for its
+    /// local build; they simply are not persisted to this bucket.
+    writable: bool,
 }
 
 impl EmbStore {
@@ -27,7 +31,21 @@ impl EmbStore {
     /// runs default to a local dir so re-indexing reuses embeddings even
     /// without a bucket.
     pub fn open(uri: &str, model: &str) -> Result<Self> {
-        Ok(Self { bucket: bucket::open(uri)?, ns: model_ns(model) })
+        Ok(Self {
+            bucket: bucket::open(uri)?,
+            ns: model_ns(model),
+            writable: true,
+        })
+    }
+
+    /// Open a read-through store. Existing vectors remain reusable, while
+    /// `put`/`put_many` deliberately become no-ops.
+    pub fn open_read_only(uri: &str, model: &str) -> Result<Self> {
+        Ok(Self {
+            bucket: bucket::open(uri)?,
+            ns: model_ns(model),
+            writable: false,
+        })
     }
 
     pub fn get(&self, hash: u64) -> Result<Option<Array2<f32>>> {
@@ -80,6 +98,9 @@ impl EmbStore {
     /// Store an embedding if absent (write-once; another device may have raced
     /// to write the same content, which is fine — the bytes are identical).
     pub fn put(&self, hash: u64, emb: &Array2<f32>) -> Result<()> {
+        if !self.writable {
+            return Ok(());
+        }
         self.bucket.put_if_absent(&self.key(hash), &encode(emb))?;
         Ok(())
     }
@@ -87,6 +108,9 @@ impl EmbStore {
     /// Share one encoder batch with bounded cloud concurrency. The entries are
     /// still conditional write-once objects, so fleet races remain harmless.
     pub fn put_many(&self, entries: &[(u64, Array2<f32>)]) -> Result<()> {
+        if !self.writable {
+            return Ok(());
+        }
         let objects: Vec<(String, Vec<u8>)> =
             entries.iter().map(|(hash, emb)| (self.key(*hash), encode(emb))).collect();
         self.bucket.put_many_if_absent(&objects)?;
@@ -276,14 +300,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn read_only_store_reuses_vectors_without_persisting_misses() {
+        let dir =
+            std::env::temp_dir().join(format!("synty-store-read-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let writable = EmbStore::open(dir.to_str().unwrap(), crate::DEFAULT_MODEL).unwrap();
+        let existing = Array2::from_shape_vec((1, 2), vec![7.0, 8.0]).unwrap();
+        let missing = Array2::from_shape_vec((1, 2), vec![9.0, 10.0]).unwrap();
+        writable.put(42, &existing).unwrap();
+
+        let reader = EmbStore::open_read_only(dir.to_str().unwrap(), crate::DEFAULT_MODEL).unwrap();
+        assert_eq!(reader.get(42).unwrap().as_ref(), Some(&existing));
+        reader.put(7, &missing).unwrap();
+        reader.put_many(&[(8, missing)]).unwrap();
+
+        assert!(writable.get(7).unwrap().is_none());
+        assert!(writable.get(8).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Sharded, content-addressed, model-namespaced keys: every encoder gets
     // its own prefix, so vectors from different models can never mix.
     #[test]
     fn key_is_sharded_and_model_namespaced() {
-        let def = EmbStore { bucket: bucket::open("/tmp").unwrap(), ns: model_ns(crate::DEFAULT_MODEL) };
+        let def = EmbStore {
+            bucket: bucket::open("/tmp").unwrap(),
+            ns: model_ns(crate::DEFAULT_MODEL),
+            writable: true,
+        };
         assert!(def.key(0xABCD).starts_with("embeddings/m"));
         assert!(def.key(0xABCD).ends_with("/cd/000000000000abcd.emb"));
-        let other = EmbStore { bucket: bucket::open("/tmp").unwrap(), ns: model_ns("some/other-encoder") };
+        let other = EmbStore {
+            bucket: bucket::open("/tmp").unwrap(),
+            ns: model_ns("some/other-encoder"),
+            writable: true,
+        };
         assert_ne!(def.key(0xABCD), other.key(0xABCD), "models never share a namespace");
     }
 

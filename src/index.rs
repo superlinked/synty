@@ -28,7 +28,12 @@ fn index_batches(start: usize, end: usize) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
-pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
+pub fn run(
+    docs_path: &str,
+    model_id: &str,
+    bucket: &str,
+    read_only_bucket: bool,
+) -> Result<()> {
     // Ingest holds the same lock across all three atomic file replacements.
     // Keep it through the pointer move so the build identity, embeddings,
     // metadata, and copied projections all come from that single generation.
@@ -64,9 +69,11 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
             && MmapIndex::load(&cur.dir().to_string_lossy()).is_ok()
         {
             eprintln!("index up to date ({} docs, corpus unchanged)", docs.len());
-            let published = crate::sync::publish(bucket)?;
-            if published > 0 {
-                eprintln!("published {published} read-model objects → {bucket}");
+            if !read_only_bucket {
+                let published = crate::sync::publish(bucket)?;
+                if published > 0 {
+                    eprintln!("published {published} read-model objects → {bucket}");
+                }
             }
             return Ok(());
         }
@@ -113,7 +120,11 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     // are large enough that retaining a 30-day corpus as f32 until the final
     // index call exceeds workstation memory; next-plaid's streaming entrypoint
     // keeps only this slice resident while its completed chunks stay on disk.
-    let store = EmbStore::open(bucket, model_id)?;
+    let store = if read_only_bucket {
+        EmbStore::open_read_only(bucket, model_id)?
+    } else {
+        EmbStore::open(bucket, model_id)?
+    };
     let n_new = texts.len() - start;
     let known = store.known_hashes()?;
     let listed_reused = hashes[start..].iter().filter(|hash| known.contains(hash)).count();
@@ -218,9 +229,13 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     );
 
     // Publish the read-model so other devices can query without rebuilding.
-    let published = crate::sync::publish(bucket)?;
-    if published > 0 {
-        eprintln!("published {published} read-model objects → {bucket}");
+    if read_only_bucket {
+        eprintln!("index: bucket is read-only; kept the complete read-model local");
+    } else {
+        let published = crate::sync::publish(bucket)?;
+        if published > 0 {
+            eprintln!("published {published} read-model objects → {bucket}");
+        }
     }
     Ok(())
 }
