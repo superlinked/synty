@@ -50,7 +50,12 @@ jobs:
               exit 1
             fi
           done
-          for cidr in '[]' '["0.0.0.0/0"]' '["::/0"]'; do
+          for cidr in \
+            '[]' \
+            '["0.0.0.0/0"]' \
+            '["::/0"]' \
+            '["0.0.0.0/1","128.0.0.0/1"]' \
+            '["::/1","8000::/1"]'; do
             if helm template synty deploy/helm/synty \
               --set bucket=s3://example/synty --set mcp.enabled=true \
               --set mcp.tls.existingSecret=synty-mcp-tls \
@@ -75,7 +80,7 @@ jobs:
         run: |
           grep -q 'path: /ready' /tmp/synty-options.yaml
           grep -q 'scheme: HTTPS' /tmp/synty-options.yaml
-          grep -q 'cidr: 203.0.113.10/32' /tmp/synty-options.yaml
+          grep -q '203.0.113.10/32' /tmp/synty-options.yaml
           if grep -q -- '- {}' /tmp/synty-options.yaml; then
             echo "MCP rendered an unrestricted NetworkPolicy rule" >&2
             exit 1

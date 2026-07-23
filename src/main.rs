@@ -18,6 +18,7 @@ mod event;
 mod config;
 mod fleet;
 mod github;
+mod generation;
 mod identity;
 mod lease;
 mod mcp;

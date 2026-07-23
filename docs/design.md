@@ -309,6 +309,11 @@ current.json                           the pointer, PUT last; readers never see
 lease/build                            soft TTL lease electing one index builder
 ```
 
+A local generation lock serializes `ingest`'s docs/analysis/trace replacements
+with `index`'s complete build and pointer publication. Trackers may continue
+appending raw events, but no build can combine documents, metadata, embeddings,
+or mediated projections from different ingest generations.
+
 A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
 `--features s3/gcs`, with conditional PUT for write-once and the lease). The
 fleet model is **no designated builder**: every tracker pushes events; whoever
@@ -358,7 +363,9 @@ follows `Chart.appVersion`, runs each container as UID 10001 with a read-only
 root filesystem, and exposes MCP only as a cluster Service. Remote MCP is
 disabled by default; enabling it requires an application TLS Secret and a
 NetworkPolicy with explicit source selectors and object-store destination
-CIDRs. Its egress is limited to cluster DNS and those ranges on TCP 443.
+CIDRs. Its egress is limited to cluster DNS and those ranges on TCP 443; the
+chart accepts at most 64 ranges and rejects IPv4 prefixes broader than `/12`
+and IPv6 prefixes broader than `/32`.
 
 ## Data compatibility
 

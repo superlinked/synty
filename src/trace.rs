@@ -220,6 +220,65 @@ impl TraceSnapshot {
                 && self.turns.len() == self.turn_spans.len(),
             "trace snapshot index lengths do not match"
         );
+        for (event, span) in self.event_spans.iter().enumerate() {
+            if let Some(span) = span {
+                anyhow::ensure!(
+                    *span < self.spans.len(),
+                    "trace snapshot event {event} references span {span}, but only {} spans exist",
+                    self.spans.len()
+                );
+            }
+        }
+        for (span, (start, end)) in self.span_events.iter().enumerate() {
+            anyhow::ensure!(
+                *start < self.events.len(),
+                "trace snapshot span {span} starts at event {start}, but only {} events exist",
+                self.events.len()
+            );
+            if let Some(end) = end {
+                anyhow::ensure!(
+                    *end < self.events.len(),
+                    "trace snapshot span {span} ends at event {end}, but only {} events exist",
+                    self.events.len()
+                );
+            }
+        }
+        for (job, spans) in self.job_spans.iter().enumerate() {
+            for span in spans {
+                anyhow::ensure!(
+                    *span < self.spans.len(),
+                    "trace snapshot job {job} references span {span}, but only {} spans exist",
+                    self.spans.len()
+                );
+            }
+        }
+        for (turn, events) in self.turn_events.iter().enumerate() {
+            for event in events {
+                anyhow::ensure!(
+                    *event < self.events.len(),
+                    "trace snapshot turn {turn} references event {event}, but only {} events exist",
+                    self.events.len()
+                );
+            }
+        }
+        for (turn, spans) in self.turn_spans.iter().enumerate() {
+            for span in spans {
+                anyhow::ensure!(
+                    *span < self.spans.len(),
+                    "trace snapshot turn {turn} references span {span}, but only {} spans exist",
+                    self.spans.len()
+                );
+            }
+        }
+        for (session, events) in &self.session_events {
+            for event in events {
+                anyhow::ensure!(
+                    *event < self.events.len(),
+                    "trace snapshot session {session:?} references event {event}, but only {} events exist",
+                    self.events.len()
+                );
+            }
+        }
         for (index, event) in self.events.iter_mut().enumerate() {
             event.search_text = std::mem::take(&mut self.event_search[index]);
             event.span = self.event_spans[index];
@@ -2878,6 +2937,146 @@ mod tests {
             )
             .is_empty(),
             "literal search is explicitly bounded to published evidence"
+        );
+    }
+
+    // Published snapshots are an untrusted bucket boundary: a malformed
+    // parallel index must fail descriptively before any renderer dereferences
+    // it, across events, spans, jobs, turns, and sessions.
+    #[test]
+    fn published_trace_rejects_every_out_of_bounds_reference() {
+        fn snapshot() -> TraceSnapshot {
+            let lines = [
+                ev(
+                    "t1",
+                    "2026-06-01T10:00:00Z",
+                    "codex_cli",
+                    "S",
+                    "agent_meta",
+                    json!({"event_kind":"task_started","payload":{"turn_id":"T"}}),
+                ),
+                ev(
+                    "t2",
+                    "2026-06-01T10:00:01Z",
+                    "codex_cli",
+                    "S",
+                    "user_prompt",
+                    json!({"text":"run the native build"}),
+                ),
+                ev(
+                    "t3",
+                    "2026-06-01T10:00:02Z",
+                    "codex_cli",
+                    "S",
+                    "tool_call",
+                    json!({"name":"exec_command","call_id":"a","arguments":"{\"cmd\":\"make\"}"}),
+                ),
+                ev(
+                    "t4",
+                    "2026-06-01T10:00:03Z",
+                    "codex_cli",
+                    "S",
+                    "tool_result",
+                    json!({"call_id":"a","output":"Process running with session ID 9"}),
+                ),
+                ev(
+                    "t5",
+                    "2026-06-01T10:00:04Z",
+                    "codex_cli",
+                    "S",
+                    "tool_call",
+                    json!({"name":"write_stdin","call_id":"b","arguments":"{\"session_id\":9}"}),
+                ),
+                ev(
+                    "t6",
+                    "2026-06-01T10:00:05Z",
+                    "codex_cli",
+                    "S",
+                    "tool_result",
+                    json!({"call_id":"b","output":"Process exited with code 0"}),
+                ),
+                ev(
+                    "t7",
+                    "2026-06-01T10:00:06Z",
+                    "codex_cli",
+                    "S",
+                    "agent_meta",
+                    json!({"event_kind":"task_complete","payload":{"turn_id":"T"}}),
+                ),
+            ];
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            TraceSnapshot::from_store(TraceStore::from_lines(&refs))
+        }
+
+        let mut invalid = snapshot();
+        invalid.event_spans[0] = Some(invalid.spans.len());
+        assert!(
+            invalid
+                .into_store()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("event 0 references span")
+        );
+
+        let mut invalid = snapshot();
+        invalid.span_events[0].0 = invalid.events.len();
+        assert!(
+            invalid
+                .into_store()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("span 0 starts at event")
+        );
+
+        let mut invalid = snapshot();
+        invalid.job_spans[0].push(invalid.spans.len());
+        assert!(
+            invalid
+                .into_store()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("job 0 references span")
+        );
+
+        let mut invalid = snapshot();
+        invalid.turn_events[0].push(invalid.events.len());
+        assert!(
+            invalid
+                .into_store()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("turn 0 references event")
+        );
+
+        let mut invalid = snapshot();
+        invalid.turn_spans[0].push(invalid.spans.len());
+        assert!(
+            invalid
+                .into_store()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("turn 0 references span")
+        );
+
+        let mut invalid = snapshot();
+        let event_count = invalid.events.len();
+        invalid
+            .session_events
+            .entry("S".into())
+            .or_default()
+            .push(event_count);
+        assert!(
+            invalid
+                .into_store()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("session \"S\"")
         );
     }
 

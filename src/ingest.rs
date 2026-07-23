@@ -34,6 +34,11 @@ fn run_with_config(
         }
     }
 
+    // Index holds the same lock while consuming and publishing a build. This
+    // makes docs + both projections one generation even though their working
+    // files are individually replaced.
+    let _generation = crate::generation::exclusive(out_path)?;
+
     // Gather the input file sets first: their (path, mtime, size) manifest is
     // the fast-path key — unchanged inputs mean docs.jsonl is already current,
     // so a polling `up` loop doesn't re-parse the whole corpus every tick.

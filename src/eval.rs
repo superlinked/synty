@@ -224,6 +224,19 @@ pub fn run_names(_bucket: &str) -> Result<()> {
     anyhow::bail!("name evaluation requires a build with the `llm` feature")
 }
 
+#[cfg(all(test, not(feature = "llm")))]
+mod extractive_only_tests {
+    #[test]
+    fn name_eval_explains_how_to_enable_the_local_model() {
+        let error = super::run_names("/tmp/representative-bucket")
+            .expect_err("extractive-only builds cannot run name evaluation");
+        assert!(
+            error.to_string().contains("`llm` feature"),
+            "the command should name the exact feature required: {error}"
+        );
+    }
+}
+
 /// (query, gold gh: key) pairs from sessions that produced a PR — a free
 /// relevance judgment: a query describing the work should retrieve its PR.
 ///

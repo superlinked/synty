@@ -29,6 +29,10 @@ fn index_batches(start: usize, end: usize) -> Vec<std::ops::Range<usize>> {
 }
 
 pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
+    // Ingest holds the same lock across all three atomic file replacements.
+    // Keep it through the pointer move so the build identity, embeddings,
+    // metadata, and copied projections all come from that single generation.
+    let _generation = crate::generation::exclusive(docs_path)?;
     let docs = load_docs(docs_path)?;
     anyhow::ensure!(!docs.is_empty(), "no docs at {docs_path}; run `ingest` first");
     let analysis_path = Path::new(docs_path).with_file_name("analysis.json");

@@ -8,9 +8,22 @@
 {{- if not .Values.networkPolicy.objectStoreCidrs }}
 {{- fail "networkPolicy.objectStoreCidrs must list the configured object-store endpoint ranges" }}
 {{- end }}
+{{- if gt (len .Values.networkPolicy.objectStoreCidrs) 64 }}
+{{- fail "networkPolicy.objectStoreCidrs must contain at most 64 endpoint ranges" }}
+{{- end }}
 {{- range .Values.networkPolicy.objectStoreCidrs }}
-{{- if or (eq . "0.0.0.0/0") (eq . "::/0") }}
-{{- fail "networkPolicy.objectStoreCidrs must not allow the entire internet" }}
+{{- if not (regexMatch `^.+/[0-9]+$` .) }}
+{{- fail "networkPolicy.objectStoreCidrs entries must be CIDR ranges" }}
+{{- end }}
+{{- $prefix := atoi (last (splitList "/" .)) }}
+{{- if contains ":" . }}
+{{- if or (lt $prefix 32) (gt $prefix 128) }}
+{{- fail "networkPolicy.objectStoreCidrs IPv6 ranges must be /32 or narrower" }}
+{{- end }}
+{{- else }}
+{{- if or (lt $prefix 12) (gt $prefix 32) }}
+{{- fail "networkPolicy.objectStoreCidrs IPv4 ranges must be /12 or narrower" }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- range .Values.networkPolicy.ingressFrom }}

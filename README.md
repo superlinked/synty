@@ -237,9 +237,12 @@ tags build each architecture on a native GitHub runner, then publish a verified
 `AWS_ECR_PUBLISH_ROLE_ARN` to its role output. Remote MCP is disabled by default;
 enabling it requires a TLS Secret and a NetworkPolicy whose source selectors
 name trusted callers. The policy also requires explicit object-store CIDRs;
-cluster DNS and only those destinations on TCP 443 are allowed for egress. The
-Service remains cluster-internal, and its default ingress accepts only
-same-namespace pods labeled `synty.superlinked.com/mcp-client: "true"`.
+cluster DNS and only those destinations on TCP 443 are allowed for egress.
+CIDR configuration is capped at 64 ranges and rejects IPv4 prefixes broader
+than `/12` or IPv6 prefixes broader than `/32`, including split-default-route
+combinations. The Service remains cluster-internal, and its default ingress
+accepts only same-namespace pods labeled
+`synty.superlinked.com/mcp-client: "true"`.
 
 ## How it works
 
