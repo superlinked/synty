@@ -211,6 +211,7 @@ pub struct Opts {
 
 #[cfg(feature = "mcp-http")]
 pub fn run(opts: Opts) -> Result<()> {
+    validate_athena_startup(opts.bucket.as_deref(), opts.athena.as_ref())?;
     anyhow::ensure!(opts.token.len() >= 32, "HTTP MCP bearer token must contain at least 32 bytes");
     let tls = tls_config(opts.tls_cert.as_deref(), opts.tls_key.as_deref())?;
     validate_listener(&opts.bind, opts.listen_public, tls.is_some())?;
@@ -248,6 +249,31 @@ pub fn run(opts: Opts) -> Result<()> {
         .build()
         .map_err(|error| anyhow::anyhow!("start MCP HTTP runtime: {error}"))?;
     runtime.block_on(serve(opts.bind, scheme, tls, state))
+}
+
+#[cfg(any(feature = "mcp-http", test))]
+fn validate_athena_startup(
+    bucket: Option<&str>,
+    athena: Option<&crate::mcp::AthenaTraceOptions>,
+) -> Result<()> {
+    let Some(athena) = athena else { return Ok(()) };
+    #[cfg(feature = "athena")]
+    {
+        let bucket = bucket
+            .ok_or_else(|| anyhow::anyhow!("--athena-workgroup requires --bucket s3://..."))?;
+        crate::trace_athena::Config::new(
+            bucket.to_string(),
+            athena.workgroup.clone(),
+            athena.database.clone(),
+            athena.table.clone(),
+        )
+        .map(|_| ())
+    }
+    #[cfg(not(feature = "athena"))]
+    {
+        let _ = (bucket, athena);
+        bail!("Athena trace is not in this binary; rebuild with --features athena")
+    }
 }
 
 #[cfg(feature = "mcp-http")]
@@ -664,6 +690,27 @@ mod tests {
         assert!(validate_listener("0.0.0.0:8765", false, true).is_err());
         assert!(validate_listener("0.0.0.0:8765", true, false).is_err());
         assert!(validate_listener("0.0.0.0:8765", true, true).is_ok());
+    }
+
+    #[test]
+    fn athena_configuration_fails_before_server_start_without_a_backend() {
+        let options = crate::mcp::AthenaTraceOptions {
+            workgroup: "synty-mcp-readonly".into(),
+            database: "synty".into(),
+            table: "raw_events".into(),
+        };
+        #[cfg(not(feature = "athena"))]
+        assert!(
+            validate_athena_startup(Some("s3://team"), Some(&options))
+                .unwrap_err()
+                .to_string()
+                .contains("--features athena")
+        );
+        #[cfg(feature = "athena")]
+        {
+            assert!(validate_athena_startup(Some("s3://team"), Some(&options)).is_ok());
+            assert!(validate_athena_startup(None, Some(&options)).is_err());
+        }
     }
 
     #[test]

@@ -383,7 +383,7 @@ impl Backend {
             ..Default::default()
         };
         let first = self.select(&streams, window, &predicate)?;
-        let sessions = event_sessions(&first.lines)?;
+        let sessions = event_sessions(&first.lines);
         anyhow::ensure!(
             sessions.len() <= MAX_SESSIONS,
             "Athena trace selection spans more than {MAX_SESSIONS} sessions; narrow the time, machine, source, or operation filter"
@@ -640,16 +640,16 @@ fn select_sql(
     }
 }
 
-fn event_sessions(lines: &[String]) -> Result<BTreeSet<String>> {
+fn event_sessions(lines: &[String]) -> BTreeSet<String> {
     let mut sessions = BTreeSet::new();
     for line in lines {
-        let event: crate::event::Event =
-            serde_json::from_str(line).context("parse Athena event row")?;
-        if !event.session_id.is_empty() {
+        if let Ok(event) = serde_json::from_str::<crate::event::Event>(line)
+            && !event.session_id.is_empty()
+        {
             sessions.insert(event.session_id);
         }
     }
-    Ok(sessions)
+    sessions
 }
 
 fn sql_string(value: &str) -> String {
@@ -907,5 +907,14 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.to_string().contains("168 hours"));
+    }
+
+    #[test]
+    fn malformed_rows_do_not_abort_session_discovery() {
+        let sessions = event_sessions(&[
+            "{not-json".into(),
+            event("valid", "2026-07-22T10:00:00Z", "user_prompt", json!({})),
+        ]);
+        assert_eq!(sessions, BTreeSet::from(["session-1".into()]));
     }
 }
