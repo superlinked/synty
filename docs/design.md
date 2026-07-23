@@ -156,8 +156,8 @@ runs on CI or a server without a developer machine.
 
 - **CLI → stdout (agents):** `search`, `related`, `topic`, `recent`, `status`,
   `stats`, `tool`, `show`, and `trace` print Markdown an agent reads over the shell: no
-  server or application auth. In team mode a read first syncs the fleet's raw
-  chunks and latest published read-model; offline it keeps using the last
+  server or application auth. In team mode a local read first syncs the fleet's
+  raw chunks and latest published read-model; offline it keeps using the last
   complete local snapshot. `related` takes no query: it derives one from the
   repo's recent commits + changed files and searches cross-repo, so an agent can
   pull prior work on its current task for free. Stable ids ride inline (sessions
@@ -168,10 +168,39 @@ runs on CI or a server without a developer machine.
   browse/drill (topic → members → full document), reusing the CLI's view-models.
   *Built.*
 - **MCP server:** `synty mcp` serves the CLI's read surface as agent tools over
-  stdio (hand-rolled JSON-RPC, no new deps): search, related, topics, recent,
-  status, stats, tool, show, so a coding agent consults past work mid-session
-  and drills by the ids the tools print (`synty_related` takes the agent's repo
-  path and needs no query). *Built.*
+  stdio by default (hand-rolled JSON-RPC): search, related, topics, recent,
+  status, stats, tool, show, plus forensic `synty_trace_*` tools. Role/tool
+  policy and optional read scope bind mediated clients; responses apply a
+  redaction profile. A restricted scope is applied before topics and detail
+  aggregates are built; global health surfaces are unavailable. `sources`
+  names native producers, matching both indexed and trace data. `--http`
+  (feature `mcp-http`) exposes the same dispatcher as authenticated Streamable
+  HTTP at `/mcp` for remote agents. It requires a 32-byte bearer token; any
+  non-loopback `--bind` also requires `--listen-public`, `--tls-cert`, and
+  `--tls-key`. `--scope`, `--redaction`, and repeatable `--allowed-origin`
+  configure the mediated boundary. The transport validates exact browser
+  origins and protocol versions, bounds requests, and
+  keeps health responsive while tool calls run. It pulls the published query
+  model before serving and refreshes only that model in the background; it does
+  not mirror the raw event lake. Format-2 builds include compact session/tool/
+  fleet facts and bounded trace evidence. `/health` remains a liveness check,
+  while `/ready` requires both mediated projections. Analysis calls use a
+  serialized one-slot dispatcher so concurrent first loads cannot multiply
+  memory or block semantic search. Each dispatcher has a bounded queue; HTTP
+  clients have a 120-second response deadline and a per-client
+  120-request/minute window, while stale queued work is cancelled before
+  execution. Remote related-work queries accept context text rather than server
+  filesystem paths. *Built.*
+  A format-1 bucket requires one run from a write-enabled builder before remote
+  MCP becomes ready; the MCP workload never migrates or publishes bucket state.
+- **Harness import:** `synty import` normalizes campaign/Devin NDJSON into
+  owned envelope streams with deterministic ids, capture boundaries, and
+  import-time redaction. Identity derives from native ids or canonical event
+  content, independent of input path and line order; concurrent writers lock
+  the owned stream. `--format`, `--machine`, `--campaign`, `--role`, `--repo`,
+  `--actor`, `--since`, `--redaction`, `--quarantine`, and `--bucket` describe
+  the foreign source and publication policy; `--dry-run` writes neither streams
+  nor quarantine files. *Built.*
 - **JSON output:** `--json` on every read command, one versioned envelope
   (`{"v": 1, "kind": …, "data": …}`) so scripts check the format once. *Built.*
 
@@ -184,10 +213,10 @@ or a remediation workflow in synty itself:
 - `trace list --type turns|spans|jobs` filters by repo, machine, source, status,
   operation, time, error presence, and duration, then sorts by recency or
   duration. Jobs may instead sort by source-reported wait time.
-- `trace show <id>` expands a source-native turn, paired tool call/result, raw
+- `trace show <id>` expands a source-native turn, paired tool call/result,
   event, associated job, or session into a bounded evidence timeline. Turn
   timelines collapse same-turn job polls into one navigable job row.
-- `trace search <literal>` searches the raw envelopes, including prompts,
+- `trace search <literal>` searches the bounded evidence published from prompts,
   commands, outputs, and metadata; `trace compare <left> <right>` returns only
   factual field differences between two turns, two spans, or two jobs.
 
@@ -201,9 +230,11 @@ a long wait. A continuation without a captured initiating call remains visible
 and is labeled `continuation_only` rather than guessed onto another command.
 Every duration says whether the source reported it or it is merely an event
 gap; the latter may include human approval or idle time and is deliberately not
-presented as tool runtime. The projection is rebuilt on demand from JSONL for
-now, keeping raw envelopes authoritative and avoiding a new index contract
-until corpus-scale use demonstrates one is needed. *Built.*
+presented as tool runtime. Ingest regenerates the projection from JSONL and
+publishes it inside the immutable read-model. Event search evidence is capped at
+512 characters and rendered commands/outputs at 360, which makes query memory
+depend on a compact event vocabulary rather than retained raw bytes. The raw
+envelopes remain authoritative and lossless for local rebuilds. *Built.*
 
 ## Tiers and the trust boundary
 
@@ -211,9 +242,18 @@ until corpus-scale use demonstrates one is needed. *Built.*
   locally, and answers from the CLI/TUI. No mediation needed, since you are the
   only reader. No server, no creds.
 - **Team / company:** a shared bucket that every member reads and writes
-  directly. synty assumes a high-trust team: anyone with the bucket can read
-  every tracked session, because read rules cannot be enforced on a client with
-  raw bucket access. There is no mediation layer and no per-reader redaction.
+  directly. synty assumes a high-trust team for raw bucket credentials: anyone
+  with the bucket can read every stored object, because read rules cannot be
+  enforced on a client with that access. A separate mediated path exists for
+  agents: `synty mcp` (stdio or authenticated HTTP) applies role/tool policy,
+  optional read scope, and response redaction; upload sync can also redact
+  before writing team event chunks. Upload redaction is off by default so raw
+  events remain a rebuildable source of truth. Opting in records the profile in
+  the upload ledger and refuses a later profile change after offsets advance.
+  `init --capture-repo` is enforced at upload and import boundaries; a session
+  without an allowed start record is not uploaded. Repository policy is also
+  fixed once offsets advance because immutable chunks cannot be retracted and
+  newly allowed history cannot be recovered from an advanced cursor.
 
 Usage and topic rollups are by work (topic, repo, period); the one per-person
 view is the fleet-coverage roster, which names who runs agents untracked so a
@@ -230,11 +270,16 @@ the rest, no migration). A machine is **activated**, a real fleet member,
 exactly when a bucket is set; the bucket is the only thing that moves the badge.
 Autostart (the login-time tracker) is turned on by `init`/install and is on by
 default thereafter, reported in its own indicator, not a second activation gate.
-An orphan plist/unit is not reported as active, and initialization fails visibly
-if the service manager does not load the watcher. `--capture-since` persists an
-absolute event boundary and `--upload-interval` sets the network batching
-cadence. A systemd user service starts at boot on a headless developer VM when
-the administrator enables lingering for that user (`loginctl enable-linger`).
+Containers and process supervisors pass `--no-autostart` and run
+`synty track --watch` themselves. An orphan plist/unit is not reported as
+active, and initialization fails visibly if the service manager does not load
+the watcher. `--capture-since` persists an absolute event boundary and
+`--upload-interval` sets the network batching cadence. Optional `--campaign` /
+`--role` persist campaign stamps used by later track/import runs.
+`--capture-repo`, `--upload-redaction`, and `--mcp-redaction` persist the
+corresponding privacy policy. A systemd
+user service starts at boot on a headless developer VM when the administrator
+enables lingering for that user (`loginctl enable-linger`).
 The state shows on `status` and the TUI footer (`◐ local`, accent → `✓
 <bucket>`, sage), so the ramp is legible. The install one-liner carries the
 bucket and drops into the viewer, so a paste goes from nothing to tracking.
@@ -258,17 +303,25 @@ blobs/<fnv>                            content-addressed build files (index
                                         across builds, so appends upload deltas
 builds/<build>.<rev>.json              manifest: filename → blob, per (build, rev)
 current.json                           the pointer, PUT last; readers never see
-                                        a torn build; rev versions the clusters
+                                        a torn build; rev versions the clusters;
+                                        format 2 includes analysis.json and
+                                        trace.json in each immutable build
 lease/build                            soft TTL lease electing one index builder
 ```
+
+A local generation lock serializes `ingest`'s docs/analysis/trace replacements
+with `index`'s complete build and pointer publication. Trackers may continue
+appending raw events, but no build can combine documents, metadata, embeddings,
+or mediated projections from different ingest generations.
 
 A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
 `--features s3/gcs`, with conditional PUT for write-once and the lease). The
 fleet model is **no designated builder**: every tracker pushes events; whoever
-opens a viewer pulls all raw streams and the published read-model, then
-contributes a build. All CLI/MCP readers perform the same pull; commands can
-therefore inspect every machine, while semantic results cover the latest
-published build and warn when newer raw chunks are pending.
+opens a local viewer pulls all raw streams and the published read-model, then
+contributes a build. MCP-only readers pull the complete published model without
+bucket write access or a raw-history mirror. Local commands can inspect and
+rebuild from every machine, while semantic results cover the latest published
+build and warn when newer raw chunks are pending.
 Write-once stores are the collaboration primitive: a viewer encodes and
 summarizes only what no other machine has (pending lists shuffle per machine,
 so concurrent viewers split the work). The lease only prevents duplicate index
@@ -301,6 +354,19 @@ choosing. A passive, cached nag (`status`, footer, `up`) flags when a machine is
 behind; the install one-liner bootstraps from the same public release asset (or
 `gh` for a private repo).
 
+The container image is a separate release artifact. Tag builds publish a
+`linux/amd64` + `linux/arm64` manifest to
+`851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty:<version>` as an immutable tag
+through a GitHub OIDC role. Each architecture builds on a native hosted runner;
+the release verifies both platforms after composing the index. The Helm chart
+follows `Chart.appVersion`, runs each container as UID 10001 with a read-only
+root filesystem, and exposes MCP only as a cluster Service. Remote MCP is
+disabled by default; enabling it requires an application TLS Secret and a
+NetworkPolicy with explicit source selectors and object-store destination
+CIDRs. Its egress is limited to cluster DNS and those ranges on TCP 443; the
+chart accepts at most 64 ranges and rejects IPv4 prefixes broader than `/12`
+and IPv6 prefixes broader than `/32`.
+
 ## Data compatibility
 
 - **Envelopes are add-only, forever.** Fields are never renamed or repurposed;
@@ -315,7 +381,9 @@ behind; the install one-liner bootstraps from the same public release asset (or
   regenerates exactly the affected entries, fleet-wide, once.
 - **The read-model pointer carries `format` + the writer's version.** A reader
   meeting a newer format refuses to pull it and says to upgrade; an unreadable
-  derived blob is a cache miss, never an error.
+  derived blob is a cache miss, never an error. Format 2 publishes compact
+  analysis and trace projections alongside documents, so mediated readers need
+  no raw bucket objects.
 
 ## What's built (kernel)
 
@@ -323,11 +391,13 @@ A working binary: `up` (solo loop), `build` (one-shot fleet-aware pipeline),
 `track` (native tailers → envelope streams, `--bucket` to push), `github`
 (GraphQL backfill), `ingest` (envelopes + GitHub → `corpus/docs.jsonl`,
 `--bucket` to pull), `index` (encode + content-addressed store + versioned
-build + publish), `search [--filter col=value] [--json]`, `topic`, `recent`,
-`status`, `trace list/show/search/compare` (turns, spans, async jobs), `tui`, `mcp`,
-`cluster [--resolution]`, `summarize`, `eval`, plus the
-scenario test suite (`cargo test`, pure). The bucket backplane (local always,
-S3/GCS opt-in) gives fleet-wide encode-once and collaborative builds.
+build + publish; `--read-only-bucket` reuses existing vectors but keeps misses
+and the completed pointer local), `search [--filter col=value] [--json]`, `topic`, `recent`,
+`status`, `trace list/show/search/compare` (turns, spans, async jobs), `tui`,
+`mcp` (stdio + optional HTTP), `import`, `cluster [--resolution]`, `summarize`,
+`eval`, plus the scenario test suite (`cargo test`, pure). The bucket backplane
+(local always, S3/GCS opt-in) gives fleet-wide encode-once and collaborative
+builds. MCP-HTTP is an optional mediated transport for remote clients.
 Validated at M0/M1 on real data (3,938 docs / 770 K embeddings): retrieval 12/12
 relevant top-3, agent task-start dogfood 3/3, session summaries specific and
 accurate (extractive in the core; one-line abstractive from a local Qwen3-0.6B

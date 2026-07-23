@@ -1,0 +1,100 @@
+image:
+  repository: 851725219920.dkr.ecr.eu-central-1.amazonaws.com/synty
+  # Empty follows Chart.appVersion. Release tags publish this version to ECR.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+bucket: ""
+# Set when the bucket is outside the workload's AWS region. The S3 signer must
+# use the bucket region; EKS otherwise injects its own region into the pod.
+bucketRegion: ""
+captureSince: now
+uploadInterval: 60
+uploadRedaction: "off"
+captureRepos: []
+machine: k8s
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  fsGroup: 10001
+  seccompProfile: { type: RuntimeDefault }
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: { drop: [ALL] }
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  accessModes: [ReadWriteMany]
+  size: 20Gi
+
+tracker:
+  enabled: true
+  source: all
+  poll: 30
+  # Existing claim containing the agent's HOME (.codex/.claude). Required to
+  # capture native logs; omit when events arrive through `synty import`.
+  agentHomeClaim: ""
+  agentHomeMountPath: /home/agent
+  # Optional overrides when session roots are not under the mounted HOME.
+  codexHome: ""
+  claudeConfigDir: ""
+  campaign: ""
+  role: ""
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+builder:
+  enabled: true
+  schedule: "*/15 * * * *"
+  resources:
+    requests: { cpu: "2", memory: 2Gi }
+    limits: { cpu: "8", memory: 8Gi }
+
+mcp:
+  # Remote MCP is opt-in because a non-loopback listener requires both TLS
+  # material and an explicitly restricted NetworkPolicy source.
+  enabled: false
+  port: 8765
+  role: investigator
+  existingSecret: synty-mcp
+  # The selected key must contain a random bearer token of at least 32 bytes.
+  tokenKey: token
+  # Exact browser origins. Server-side clients normally omit Origin.
+  allowedOrigins: []
+  tls:
+    # Kubernetes TLS Secret (PEM data under certificateKey/privateKeyKey).
+    existingSecret: ""
+    certificateKey: tls.crt
+    privateKeyKey: tls.key
+  scope:
+    repos: []
+    campaigns: []
+    roles: []
+    sources: []
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "2", memory: 2Gi }
+
+networkPolicy:
+  enabled: true
+  # Label each trusted in-namespace client pod with this key before enabling MCP.
+  ingressFrom:
+    - podSelector:
+        matchLabels:
+          synty.superlinked.com/mcp-client: "true"
+  # Required when MCP is enabled. Kubernetes NetworkPolicy cannot select an
+  # external service by DNS name, so list the current CIDRs for the configured
+  # object-store endpoint. At most 64 ranges are accepted; IPv4 ranges must be
+  # /12 or narrower and IPv6 ranges /32 or narrower.
+  objectStoreCidrs: []

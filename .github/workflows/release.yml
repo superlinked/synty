@@ -9,20 +9,28 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write # create the release and upload assets (uses GITHUB_TOKEN)
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked # pure: no model, corpus, or network
-      - run: cargo test --locked --features s3,gcs # compile + test shipped cloud paths
+      - run: cargo test --locked --features s3,gcs,mcp-http # compile + test shipped remote paths
+      - name: Verify tag, binary, and chart versions agree
+        run: |
+          cargo_version="$(awk -F ' *= *' '$1 == "version" {gsub(/"/, "", $2); print $2; exit}' Cargo.toml)"
+          chart_version="$(awk -F ' *: *' '$1 == "appVersion" {gsub(/"/, "", $2); print $2; exit}' deploy/helm/synty/Chart.yaml)"
+          test "$GITHUB_REF_NAME" = "v$cargo_version"
+          test "$chart_version" = "$cargo_version"
 
   build:
     needs: test
+    permissions:
+      contents: write # create the release and upload assets (uses GITHUB_TOKEN)
     strategy:
       fail-fast: false # one platform failing shouldn't drop the other's artifact
       matrix:
@@ -30,15 +38,15 @@ jobs:
           # Apple Silicon: GPU encode via metal, with runtime CPU fallback.
           - os: macos-14
             asset: synty-darwin-arm64
-            features: metal,s3,gcs
+            features: metal,s3,gcs,mcp-http
           # Linux x64: plain CPU, portable.
           - os: ubuntu-latest
             asset: synty-linux-x64
-            features: s3,gcs
+            features: s3,gcs,mcp-http
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --locked --features ${{ matrix.features }}
@@ -56,3 +64,94 @@ jobs:
           files: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+
+  image:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            suffix: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write # exchange GitHub OIDC for the private ECR publisher role
+    env:
+      AWS_REGION: eu-central-1
+      ECR_REPOSITORY: synty
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Verify the dedicated repository
+        run: aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - id: version
+        name: Resolve image version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - id: existing
+        name: Check immutable architecture tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$VERSION-$SUFFIX" >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and publish native architecture image
+        if: steps.existing.outputs.present != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: ${{ matrix.platform }}
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.version }}-${{ matrix.suffix }}
+          cache-from: type=gha,scope=synty-image-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=synty-image-${{ matrix.suffix }}
+
+  image-index:
+    needs: [test, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: eu-central-1
+      ECR_REPOSITORY: synty
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - id: version
+        name: Resolve image version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Publish and verify the multi-architecture index
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          image="$REGISTRY/$ECR_REPOSITORY"
+          if ! aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$VERSION" >/dev/null 2>&1; then
+            docker buildx imagetools create --tag "$image:$VERSION" \
+              "$image:$VERSION-amd64" "$image:$VERSION-arm64"
+          fi
+          inspect="$(docker buildx imagetools inspect "$image:$VERSION")"
+          grep -q 'Platform:.*linux/amd64' <<<"$inspect"
+          grep -q 'Platform:.*linux/arm64' <<<"$inspect"

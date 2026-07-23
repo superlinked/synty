@@ -34,6 +34,11 @@ fn run_with_config(
         }
     }
 
+    // Index holds the same lock while consuming and publishing a build. This
+    // makes docs + both projections one generation even though their working
+    // files are individually replaced.
+    let _generation = crate::generation::exclusive(out_path)?;
+
     // Gather the input file sets first: their (path, mtime, size) manifest is
     // the fast-path key — unchanged inputs mean docs.jsonl is already current,
     // so a polling `up` loop doesn't re-parse the whole corpus every tick.
@@ -59,8 +64,12 @@ fn run_with_config(
     }
 
     let manifest_path = format!("{out_path}.manifest");
+    let analysis_path = Path::new(out_path).with_file_name("analysis.json");
+    let trace_path = Path::new(out_path).with_file_name("trace.json");
     let manifest = input_manifest(gh_files.iter().map(|(p, _, _)| p).chain(&local_files), cfg);
     if Path::new(out_path).exists()
+        && analysis_path.is_file()
+        && trace_path.is_file()
         && std::fs::read_to_string(&manifest_path).ok().as_deref() == Some(manifest.as_str())
     {
         eprintln!("ingest up to date ({} inputs unchanged) → {out_path}", gh_files.len() + local_files.len());
@@ -89,6 +98,12 @@ fn run_with_config(
     // the whole corpus as one string.
     let known: std::collections::HashSet<String> = cfg.repos.iter().cloned().collect();
     let local_actor = crate::identity::actor();
+    let cutoff = cfg
+        .capture_since
+        .as_deref()
+        .and_then(|raw| crate::config::capture_since_ms_from(raw).ok());
+    let mut analysis = crate::units::AnalysisBuilder::new(known.clone(), cutoff);
+    let mut trace = crate::trace::SnapshotBuilder::new(known.clone(), cutoff);
     let mut maps = SessionMaps::default();
     for f in &local_files {
         if let Ok(d) = std::fs::read_to_string(f) {
@@ -101,13 +116,11 @@ fn run_with_config(
         if let Ok(d) = std::fs::read_to_string(f) {
             let before = docs.len();
             docs_from_events(&d, &maps, &local_actor, &mut seen, &mut docs);
+            analysis.fold_text(&d);
+            trace.fold_text(&d);
             n_session += docs.len() - before;
         }
     }
-    let cutoff = cfg
-        .capture_since
-        .as_deref()
-        .and_then(|raw| crate::config::capture_since_ms_from(raw).ok());
     if let Some(cutoff) = cutoff {
         docs.retain(|d| {
             d.meta.source != "agent" || crate::config::captured_at(&d.meta.ts, Some(cutoff))
@@ -135,7 +148,6 @@ fn run_with_config(
         std::fs::create_dir_all(parent)?;
     }
     crate::write_atomic(out_path, out.as_bytes())?;
-    std::fs::write(&manifest_path, &manifest)?;
     let mut m = crate::metrics::Run::new("ingest");
     m.set("github", n_github)
         .set("session", n_session)
@@ -147,6 +159,12 @@ fn run_with_config(
     // Fleet coverage rides on every full ingest: streams and docs are both in
     // hand here, and this is the moment the numbers can change.
     let r = crate::fleet::roster(&docs, &local_dir);
+    analysis.write(&analysis_path, r.clone())?;
+    trace.write(&trace_path)?;
+    // The manifest is the fast path's commit marker. Publish it only after
+    // docs and both mediated projections are durable, so an interrupted ingest
+    // cannot bless a mixture of old and new artifacts.
+    std::fs::write(&manifest_path, &manifest)?;
     let mut c = crate::metrics::Run::new("coverage");
     c.set("machines", r.machines.len())
         .set("machines_active", r.active())
@@ -194,6 +212,10 @@ pub fn github_docs(json: &str, kind: &str, repo: &str) -> Result<Vec<Doc>> {
                 repo: repo.into(),
                 author: author.into(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: String::new(),
                 ts: it["createdAt"].as_str().unwrap_or("").into(),
                 number: it["number"].as_i64(),
                 url: it["url"].as_str().map(String::from),
@@ -214,6 +236,10 @@ pub fn github_docs(json: &str, kind: &str, repo: &str) -> Result<Vec<Doc>> {
 pub struct SessionMaps {
     repo: HashMap<String, String>,
     actor: HashMap<String, String>,
+    campaign: HashMap<String, String>,
+    role: HashMap<String, String>,
+    backend: HashMap<String, String>,
+    capture_source: HashMap<String, String>,
     pub skipped: usize,
 }
 
@@ -237,6 +263,29 @@ pub fn scan_starts(text: &str, known: &std::collections::HashSet<String>, maps: 
                     {
                         if !a.is_empty() {
                             maps.actor.insert(sid.to_string(), a.to_string());
+                        }
+                    }
+                    if let Some(sid) = v["session_id"].as_str() {
+                        let campaign = v["rollup_dim"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .or_else(|| v["payload"]["campaign_id"].as_str());
+                        if let Some(campaign) = campaign {
+                            maps.campaign.insert(sid.to_string(), campaign.to_string());
+                        }
+                        if let Some(role) = v["payload"]["campaign_role"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                        {
+                            maps.role.insert(sid.to_string(), role.to_string());
+                        }
+                        if let Some(backend) =
+                            v["payload"]["backend"].as_str().filter(|value| !value.is_empty())
+                        {
+                            maps.backend.insert(sid.to_string(), backend.to_string());
+                        }
+                        if let Some(source) = v["source"].as_str().filter(|value| !value.is_empty()) {
+                            maps.capture_source.insert(sid.to_string(), source.to_string());
                         }
                     }
                 }
@@ -275,6 +324,10 @@ pub fn docs_from_events(
         let sid = v["session_id"].as_str().unwrap_or("").to_string();
         let repo = maps.repo.get(&sid).cloned().unwrap_or_default();
         let author = maps.actor.get(&sid).cloned().unwrap_or_else(|| local_actor.to_string());
+        let campaign_id = maps.campaign.get(&sid).cloned().unwrap_or_default();
+        let campaign_role = maps.role.get(&sid).cloned().unwrap_or_default();
+        let backend = maps.backend.get(&sid).cloned().unwrap_or_default();
+        let capture_source = maps.capture_source.get(&sid).cloned().unwrap_or_default();
         out.push(Doc {
             id: 0,
             text: trunc(text, MAX_TEXT),
@@ -284,6 +337,10 @@ pub fn docs_from_events(
                 repo,
                 author,
                 session_id: sid,
+                campaign_id,
+                campaign_role,
+                backend,
+                capture_source,
                 ts: v["ts"].as_str().unwrap_or("").into(),
                 number: None,
                 url: None,
@@ -340,7 +397,7 @@ fn derivation_config(cfg: &crate::config::Config) -> String {
     // Doc-derivation format: bump whenever the derivation itself changes (new
     // Meta fields, new detectors) so a binary upgrade regenerates docs.jsonl
     // once even though the input files are unchanged.
-    out.push_str("fmt=3\n");
+    out.push_str("fmt=5\n");
     out
 }
 
@@ -490,7 +547,7 @@ mod tests {
     #[test]
     fn session_messages_become_docs_with_repo_from_cwd() {
         let lines = [
-            r#"{"kind":"session_start","session_id":"S1","payload":{"cwd":"/Users/d/c/sie-internal/x"}}"#,
+            r#"{"kind":"session_start","source":"harness","session_id":"S1","rollup_dim":"campaign-42","payload":{"cwd":"/Users/d/c/sie-internal/x","campaign_role":"investigator","backend":"codex"}}"#,
             r#"{"kind":"user_prompt","session_id":"S1","ts":"2026-05-02T09:00:00Z","payload":{"text":"fix the login redirect bug"}}"#,
             r#"{"kind":"assistant_message","session_id":"S1","ts":"2026-05-02T09:01:00Z","payload":{"text":"I'll inspect auth.ts and the redirect handler"}}"#,
             r#"{"kind":"assistant_message","session_id":"S1","ts":"2026-05-02T09:02:00Z","payload":{"text":"ok"}}"#,
@@ -503,6 +560,10 @@ mod tests {
         assert!(docs.iter().all(|d| d.meta.session_id == "S1"));
         assert!(docs.iter().all(|d| d.meta.repo == "sie-internal"));
         assert!(docs.iter().all(|d| d.meta.source == "agent"));
+        assert!(docs.iter().all(|d| d.meta.campaign_id == "campaign-42"));
+        assert!(docs.iter().all(|d| d.meta.campaign_role == "investigator"));
+        assert!(docs.iter().all(|d| d.meta.backend == "codex"));
+        assert!(docs.iter().all(|d| d.meta.capture_source == "harness"));
     }
 
     // Starting collection at an absolute boundary removes older local session
@@ -673,6 +734,10 @@ mod tests {
                 repo: "r".into(),
                 author: String::new(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: String::new(),
                 ts: ts.into(),
                 number: None,
                 url: None,
@@ -742,6 +807,10 @@ mod tests {
                 repo: "r".into(),
                 author: String::new(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: String::new(),
                 ts: ts.into(),
                 number: None,
                 url: None,

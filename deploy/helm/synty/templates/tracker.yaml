@@ -1,0 +1,94 @@
+{{- if .Values.tracker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "synty.fullname" . }}-tracker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "synty.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: tracker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "synty.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: tracker
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      serviceAccountName: {{ include "synty.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: tracker
+          image: {{ include "synty.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -- synty init "$SYNTY_BUCKET" --capture-since "$SYNTY_CAPTURE_SINCE" --upload-interval "$SYNTY_UPLOAD_INTERVAL" --upload-redaction "$SYNTY_UPLOAD_REDACTION" --machine "$SYNTY_MACHINE" --no-build --no-autostart
+              {{- range .Values.captureRepos }}
+              set -- "$@" --capture-repo {{ . | quote }}
+              {{- end }}
+              "$@"
+              set -- synty track --watch --source "$SYNTY_SOURCE" --machine "$SYNTY_MACHINE" --bucket "$SYNTY_BUCKET" --poll "$SYNTY_POLL" --upload-interval "$SYNTY_UPLOAD_INTERVAL"
+              if [ -n "$SYNTY_CAMPAIGN" ]; then set -- "$@" --campaign "$SYNTY_CAMPAIGN"; fi
+              if [ -n "$SYNTY_ROLE" ]; then set -- "$@" --role "$SYNTY_ROLE"; fi
+              exec "$@"
+          env:
+            - { name: SYNTY_HOME, value: /var/synty }
+            - { name: HOME, value: {{ ternary .Values.tracker.agentHomeMountPath "/var/synty" (not (empty .Values.tracker.agentHomeClaim)) | quote }} }
+            - { name: SYNTY_BUCKET, value: {{ required "bucket is required" .Values.bucket | quote }} }
+            - { name: SYNTY_CAPTURE_SINCE, value: {{ .Values.captureSince | quote }} }
+            - { name: SYNTY_UPLOAD_INTERVAL, value: {{ .Values.uploadInterval | quote }} }
+            - { name: SYNTY_UPLOAD_REDACTION, value: {{ .Values.uploadRedaction | quote }} }
+            - { name: SYNTY_MACHINE, value: {{ .Values.machine | quote }} }
+            - { name: SYNTY_SOURCE, value: {{ .Values.tracker.source | quote }} }
+            - { name: SYNTY_POLL, value: {{ .Values.tracker.poll | quote }} }
+            {{- if .Values.bucketRegion }}
+            - { name: AWS_REGION, value: {{ .Values.bucketRegion | quote }} }
+            - { name: AWS_DEFAULT_REGION, value: {{ .Values.bucketRegion | quote }} }
+            {{- end }}
+            - { name: SYNTY_CAMPAIGN, value: {{ .Values.tracker.campaign | quote }} }
+            - { name: SYNTY_ROLE, value: {{ .Values.tracker.role | quote }} }
+            {{- if .Values.tracker.codexHome }}
+            - { name: CODEX_HOME, value: {{ .Values.tracker.codexHome | quote }} }
+            {{- end }}
+            {{- if .Values.tracker.claudeConfigDir }}
+            - { name: CLAUDE_CONFIG_DIR, value: {{ .Values.tracker.claudeConfigDir | quote }} }
+            {{- end }}
+          volumeMounts:
+            - { name: synty-home, mountPath: /var/synty }
+            - { name: tmp, mountPath: /tmp }
+            {{- if .Values.tracker.agentHomeClaim }}
+            - { name: agent-home, mountPath: {{ .Values.tracker.agentHomeMountPath }}, readOnly: true }
+            {{- end }}
+          livenessProbe:
+            exec: { command: ["/bin/sh", "-c", "kill -0 1"] }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            exec: { command: ["/bin/sh", "-c", "test -f /var/synty/.synty/cursors.json"] }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.tracker.resources | nindent 12 }}
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - name: synty-home
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "synty.claimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.tracker.agentHomeClaim }}
+        - name: agent-home
+          persistentVolumeClaim:
+            claimName: {{ .Values.tracker.agentHomeClaim }}
+        {{- end }}
+{{- end }}

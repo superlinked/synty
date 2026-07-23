@@ -19,7 +19,7 @@ const POINTER: &str = "index/current.json";
 /// The read-model layout version. Bumped only for breaking layout changes;
 /// a reader that meets a NEWER format refuses to pull it (and says to upgrade)
 /// instead of misparsing it.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 /// The build a reader should open, resolved through the pointer.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -55,6 +55,14 @@ impl Current {
     pub fn clusters(&self) -> PathBuf {
         self.dir().join(format!("unit_clusters.{}.json", self.rev))
     }
+    /// Compact session, fleet, daily-usage, and tool facts for mediated reads.
+    pub fn analysis(&self) -> PathBuf {
+        self.dir().join("analysis.json")
+    }
+    /// Bounded execution evidence and its turn/span/job relationships.
+    pub fn trace(&self) -> PathBuf {
+        self.dir().join("trace.json")
+    }
 }
 
 pub fn build_dir(build: &str) -> PathBuf {
@@ -69,14 +77,20 @@ pub fn current() -> Option<Current> {
 /// Atomically repoint readers at `build`/`rev`. The build directory must be
 /// complete before this is called — the pointer move IS the publish.
 pub fn repoint(build: &str, rev: u64) -> Result<()> {
-    std::fs::create_dir_all(ROOT)?;
     let cur = Current {
         build: build.into(),
         rev,
         format: FORMAT,
         writer: env!("CARGO_PKG_VERSION").into(),
     };
-    crate::write_atomic(POINTER, serde_json::to_string(&cur)?.as_bytes())
+    repoint_current(&cur)
+}
+
+/// Preserve the exact pointer advertised by a remote writer. In particular,
+/// pulling a legacy build must not relabel it as the current layout format.
+pub fn repoint_current(cur: &Current) -> Result<()> {
+    std::fs::create_dir_all(ROOT)?;
+    crate::write_atomic(POINTER, serde_json::to_string(cur)?.as_bytes())
 }
 
 /// Reader conveniences: resolve through the pointer, with the working-corpus
@@ -88,6 +102,32 @@ pub fn docs_path() -> PathBuf {
 
 pub fn clusters_path() -> PathBuf {
     current().map(|c| c.clusters()).unwrap_or_else(|| PathBuf::from("unit_clusters.json"))
+}
+
+/// Resolve the published analysis projection, with the pre-build corpus path
+/// as the local CLI fallback.
+pub fn analysis_path() -> PathBuf {
+    current()
+        .map(|current| current.analysis())
+        .unwrap_or_else(|| PathBuf::from("corpus/analysis.json"))
+}
+
+/// Resolve the published trace projection, with the pre-build corpus path as
+/// the local CLI fallback.
+pub fn trace_path() -> PathBuf {
+    current()
+        .map(|current| current.trace())
+        .unwrap_or_else(|| PathBuf::from("corpus/trace.json"))
+}
+
+/// Strict readiness for mediated readers: format-2 builds carry the compact
+/// raw-derived projections that keep requests bounded independently of raw
+/// retention. Older search-only builds remain usable by local CLI fallbacks.
+#[cfg(feature = "mcp-http")]
+pub fn mediated_ready() -> bool {
+    current().is_some_and(|current| {
+        current.format >= FORMAT && current.analysis().is_file() && current.trace().is_file()
+    })
 }
 
 pub fn index_dir() -> PathBuf {
@@ -151,10 +191,16 @@ pub fn gc(also_keep: &[String]) {
     }
 }
 
-/// The build id for a doc-hash manifest: identity of the corpus snapshot.
-pub fn build_id(doc_hashes: &[u64]) -> String {
-    let mut bytes = Vec::with_capacity(doc_hashes.len() * 8);
+/// The build id for the documents and their raw-derived projections. Analytics
+/// can change when a tool result or session end arrives without producing a
+/// search document, so projection hashes are part of the immutable identity.
+pub fn build_id(doc_hashes: &[u64], projection_hashes: &[u64]) -> String {
+    let mut bytes = Vec::with_capacity(4 + (doc_hashes.len() + projection_hashes.len()) * 8);
+    bytes.extend_from_slice(&FORMAT.to_le_bytes());
     for h in doc_hashes {
+        bytes.extend_from_slice(&h.to_le_bytes());
+    }
+    for h in projection_hashes {
         bytes.extend_from_slice(&h.to_le_bytes());
     }
     format!("{:016x}", crate::index::fnv1a(&bytes))
@@ -172,6 +218,8 @@ mod tests {
         assert_eq!(c.dir(), Path::new("index/builds/abc123"));
         assert!(c.docs().ends_with("index/builds/abc123/docs.jsonl"));
         assert!(c.clusters().ends_with("index/builds/abc123/unit_clusters.2.json"));
+        assert!(c.analysis().ends_with("index/builds/abc123/analysis.json"));
+        assert!(c.trace().ends_with("index/builds/abc123/trace.json"));
     }
 
     // Pointers from before the format field read as format 1; identity ignores
@@ -189,8 +237,13 @@ mod tests {
 
     #[test]
     fn build_id_is_stable_and_distinguishing() {
-        assert_eq!(build_id(&[1, 2, 3]), build_id(&[1, 2, 3]));
-        assert_ne!(build_id(&[1, 2, 3]), build_id(&[1, 2, 4]));
+        assert_eq!(build_id(&[1, 2, 3], &[7, 8]), build_id(&[1, 2, 3], &[7, 8]));
+        assert_ne!(build_id(&[1, 2, 3], &[7, 8]), build_id(&[1, 2, 4], &[7, 8]));
+        assert_ne!(
+            build_id(&[1, 2, 3], &[7, 8]),
+            build_id(&[1, 2, 3], &[7, 9]),
+            "analysis-only changes publish a new immutable build"
+        );
     }
 
     #[test]

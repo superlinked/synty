@@ -2,6 +2,7 @@
 name = "synty"
 version = "0.2.4"
 edition = "2024"
+rust-version = "1.97"
 description = "A passive, local-first memory of coding-agent sessions and GitHub activity, with ColBERT retrieval, local summaries, and an optional team bucket."
 license = "Apache-2.0"
 repository = "https://github.com/superlinked/synty"
@@ -35,14 +36,28 @@ s3 = [
     "dep:async-trait",
 ]
 gcs = ["dep:object_store", "object_store/gcp", "dep:tokio", "dep:futures"]
+# Authenticated Streamable HTTP transport for remote MCP clients. Stdio stays
+# available in every build; release/container artifacts opt into this feature.
+mcp-http = [
+    "dep:bytes",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:tokio",
+    "dep:tokio-rustls",
+]
 
 [dependencies]
 anyhow = "1.0.102"
 candle-core = "0.9.2"
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive"] }
+fs2 = "0.4.3"
 half = "2.7.1"
 libc = "0.2"
+regex = "1"
 
 # Local summarizer (the `llm` feature). candle-transformers/tokenizers are
 # already resolved transitively via pylate-rs; declaring them direct just lets
@@ -62,7 +77,7 @@ walkdir = "2.5.0"
 
 # Cloud bucket backends, pulled in only by the s3 / gcs features.
 object_store = { version = "0.11", optional = true, default-features = false }
-tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt-multi-thread", "net", "sync", "time"] }
 futures = { version = "0.3", optional = true }
 # The SDK config chain is only part of the opt-in S3 build. It gives Synty
 # rotating profile/credential_process/instance-role credentials instead of
@@ -72,3 +87,10 @@ futures = { version = "0.3", optional = true }
 aws-config = { version = "=1.8.8", optional = true, default-features = false, features = ["rt-tokio", "credentials-process", "default-https-client"] }
 aws-credential-types = { version = "=1.2.8", optional = true }
 async-trait = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", optional = true, features = ["http1", "server"] }
+hyper-util = { version = "0.1", optional = true, features = ["server", "tokio"] }
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", optional = true }

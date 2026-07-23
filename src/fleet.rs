@@ -72,7 +72,7 @@ pub fn detect_agent(text: &str, author: &str) -> Option<&'static str> {
 }
 
 /// One tracked machine, merged across its `edge-<machine>-<source>` streams.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Machine {
     pub machine: String,
     /// Agent labels seen on the machine's envelopes ("claude", "codex", …).
@@ -96,14 +96,14 @@ pub struct Machine {
 /// `agent` carries the agent label when their work named one (a Co-authored-by
 /// trailer, etc.) — a bonus signal, not the reason they're listed: most agent
 /// users leave no such artifact, so the roster lists everyone uncovered.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UntrackedAuthor {
     pub login: String,
     pub agent: Option<String>,
 }
 
 /// The fleet as the bucket sees it, joined against GitHub activity.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Roster {
     /// Active first, then newest last_ts.
     pub machines: Vec<Machine>,
@@ -470,6 +470,10 @@ mod tests {
                 repo: "r".into(),
                 author: author.into(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: String::new(),
                 ts: ts.into(),
                 number: None,
                 url: None,

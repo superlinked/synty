@@ -18,11 +18,15 @@ mod event;
 mod config;
 mod fleet;
 mod github;
+mod generation;
 mod identity;
 mod lease;
 mod mcp;
+mod mcp_http;
 mod metrics;
+mod policy;
 mod progress;
+mod redact;
 mod readmodel;
 mod init;
 mod related;
@@ -35,8 +39,10 @@ mod tui;
 mod units;
 mod up;
 mod view;
+mod words;
 mod index;
 mod ingest;
+mod import;
 mod model;
 #[cfg(feature = "llm")]
 mod qwen;
@@ -74,6 +80,16 @@ pub struct Meta {
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
+    pub campaign_id: String,
+    #[serde(default)]
+    pub campaign_role: String,
+    #[serde(default)]
+    pub backend: String,
+    /// Native envelope producer for agent docs (`harness`, `codex_cli`, ...).
+    /// GitHub docs leave this empty and use `source` directly.
+    #[serde(default)]
+    pub capture_source: String,
+    #[serde(default)]
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number: Option<i64>,
@@ -98,15 +114,18 @@ pub struct Doc {
 }
 
 pub fn load_docs(path: impl AsRef<std::path::Path>) -> Result<Vec<Doc>> {
+    use std::io::BufRead;
+
     let path = path.as_ref();
-    let data = std::fs::read_to_string(path)
+    let file = std::fs::File::open(path)
         .map_err(|e| anyhow::anyhow!("read {}: {e} (run `ingest` first)", path.display()))?;
     let mut v = Vec::new();
-    for line in data.lines() {
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        v.push(serde_json::from_str::<Doc>(line)?);
+        v.push(serde_json::from_str::<Doc>(&line)?);
     }
     Ok(v)
 }
@@ -131,12 +150,42 @@ pub fn short(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
-/// Write via a sibling tmp file + rename: readers never see a half-written
-/// read-model, and concurrent writers can't interleave (last full write wins).
+/// Reserve a process-safe sibling temporary file. Kubernetes containers often
+/// share PID 1 while mounting the same volume, so the PID alone is not a unique
+/// name during a rolling handoff.
+pub(crate) fn write_unique_temp(path: &std::path::Path, data: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    loop {
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_file_name(format!("{name}.tmp.{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(data) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(error.into());
+                }
+                return Ok(tmp);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Write via a uniquely reserved sibling tmp file + rename: readers never see
+/// a half-written read-model, and concurrent writers cannot steal one another's
+/// temporary file (last full write wins).
 pub fn write_atomic(path: &str, data: &[u8]) -> Result<()> {
-    let tmp = format!("{path}.tmp.{}", std::process::id());
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
+    let path = std::path::Path::new(path);
+    let tmp = write_unique_temp(path, data)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -161,6 +210,10 @@ enum Cmd {
         /// s3://, gs:// with the matching feature). Default: config, then .synty.
         #[arg(long)]
         bucket: Option<String>,
+        /// Reuse existing bucket embeddings but never write misses or publish
+        /// the completed read-model back to that bucket.
+        #[arg(long)]
+        read_only_bucket: bool,
     },
     /// Semantic search; --filter is a SQL WHERE over metadata
     Search {
@@ -258,6 +311,40 @@ enum Cmd {
         #[command(subcommand)]
         command: TraceCmd,
     },
+    /// Import canonical harness envelopes or Devin session events from NDJSON.
+    Import {
+        /// NDJSON path, or - for stdin.
+        #[arg(default_value = "-")]
+        input: String,
+        /// Input format: envelope, harness, or devin.
+        #[arg(long, default_value = "harness")]
+        format: String,
+        /// Machine id used in the owned output stream.
+        #[arg(long, default_value = "local")]
+        machine: String,
+        #[arg(long)]
+        campaign: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        actor: Option<String>,
+        /// Drop events before this `now`, date, or RFC3339 boundary.
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        /// Append rejected lines and reasons to this NDJSON file.
+        #[arg(long)]
+        quarantine: Option<String>,
+        /// Push newly imported events to this configured/explicit bucket.
+        #[arg(long)]
+        bucket: Option<String>,
+        /// Import redaction: off, standard, or mcp_safe.
+        #[arg(long, default_value = "standard")]
+        redaction: String,
+    },
     /// Initialize synty on this machine in one step: set the bucket (omit for a
     /// local trial), pin the GitHub identity, enable the login-time tracker, and
     /// run the first build. Idempotent — re-run with a bucket to switch a local
@@ -276,12 +363,32 @@ enum Cmd {
         /// Seconds between batched event uploads.
         #[arg(long)]
         upload_interval: Option<u64>,
+        /// Repository eligible for team upload/import (repeatable).
+        #[arg(long = "capture-repo")]
+        capture_repos: Vec<String>,
+        /// Team-upload redaction: off, standard, or mcp_safe. Off preserves
+        /// raw events as the rebuildable source of truth.
+        #[arg(long)]
+        upload_redaction: Option<String>,
+        /// Default MCP response redaction: off, standard, or mcp_safe.
+        #[arg(long)]
+        mcp_redaction: Option<String>,
+        /// Campaign id stamped into rollup_dim and session metadata.
+        #[arg(long)]
+        campaign: Option<String>,
+        /// Campaign agent role (primary, investigator, validator, ...).
+        #[arg(long)]
+        role: Option<String>,
         /// Machine id used in this machine's stream names
         #[arg(long, default_value = "local")]
         machine: String,
         /// Configure + enable tracking but skip the first build
         #[arg(long)]
         no_build: bool,
+        /// Skip launchd/systemd installation; a container or process supervisor
+        /// runs `synty track --watch` instead.
+        #[arg(long)]
+        no_autostart: bool,
     },
     /// Self-update from the latest GitHub Release: if a newer build is published
     /// for this platform, download it, verify its checksum, replace this binary,
@@ -295,9 +402,45 @@ enum Cmd {
         #[arg(long)]
         bucket: Option<String>,
     },
-    /// MCP server over stdio: synty_search / synty_topics / synty_recent /
-    /// synty_status as agent tools (add to a coding agent's MCP config)
-    Mcp,
+    /// Read-only MCP server. Stdio is the local default; --http enables an
+    /// authenticated Streamable HTTP endpoint for remote agents.
+    Mcp {
+        /// Bucket to pull before serving. Explicit container deployments need
+        /// not mutate shared configuration during startup.
+        #[arg(long)]
+        bucket: Option<String>,
+        /// Serve HTTP at /mcp instead of stdio.
+        #[arg(long)]
+        http: bool,
+        /// HTTP bind address.
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: String,
+        /// HTTP bearer token (or set SYNTY_MCP_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+        /// Permit a non-loopback bind. Put the endpoint behind TLS.
+        #[arg(long)]
+        listen_public: bool,
+        /// PEM certificate for HTTPS. Required with a non-loopback bind.
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<String>,
+        /// PEM private key for HTTPS. Required with a non-loopback bind.
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<String>,
+        /// Exact browser Origin allowed to call HTTP MCP (repeatable). Clients
+        /// without an Origin header, such as server-side agents, are allowed.
+        #[arg(long = "allowed-origin")]
+        allowed_origins: Vec<String>,
+        /// Tool policy: operator (all), primary, investigator, or validator.
+        #[arg(long, default_value = "operator")]
+        role: String,
+        /// JSON read-scope file with repos/campaigns/roles/sources allowlists.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Response redaction: off, standard, or mcp_safe.
+        #[arg(long)]
+        redaction: Option<String>,
+    },
     /// Session + topic summaries. With the `llm` feature, session summaries are
     /// generated by a local Qwen3 model and cached; topics stay extractive.
     Summarize {
@@ -355,6 +498,12 @@ enum Cmd {
         /// Seconds between batched bucket uploads (default: config, then 60)
         #[arg(long)]
         upload_interval: Option<u64>,
+        /// Campaign id stamped into rollup_dim and session metadata.
+        #[arg(long)]
+        campaign: Option<String>,
+        /// Campaign agent role (primary, investigator, validator, ...).
+        #[arg(long)]
+        role: Option<String>,
         /// Write an autostart unit and exit: launchd | systemd
         #[arg(long)]
         install: Option<String>,
@@ -463,6 +612,10 @@ enum TraceCmd {
         machine: Option<String>,
         #[arg(long)]
         source: Option<String>,
+        #[arg(long)]
+        campaign: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
         /// Exact factual status: ok, error, aborted, running, open, or unknown.
         #[arg(long)]
         status: Option<String>,
@@ -510,6 +663,10 @@ enum TraceCmd {
         source: Option<String>,
         #[arg(long)]
         kind: Option<String>,
+        #[arg(long)]
+        campaign: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long)]
@@ -563,7 +720,15 @@ fn main() -> Result<()> {
         Cmd::Ingest { bucket } => {
             ingest::run(CORPUS_DIR, DOCS_PATH, config::resolve_bucket_opt(bucket).as_deref())?
         }
-        Cmd::Index { bucket } => index::run(DOCS_PATH, &model_id(), &config::resolve_bucket(bucket))?,
+        Cmd::Index {
+            bucket,
+            read_only_bucket,
+        } => index::run(
+            DOCS_PATH,
+            &model_id(),
+            &config::resolve_bucket(bucket),
+            read_only_bucket,
+        )?,
         Cmd::Search { query, filter, k, bucket, json } => {
             search::run(&query, filter.as_deref(), k, &model_id(), &config::resolve_bucket(bucket), json)?
         }
@@ -650,6 +815,8 @@ fn main() -> Result<()> {
                     repo,
                     machine,
                     source,
+                    campaign,
+                    role,
                     status,
                     operation,
                     has_errors,
@@ -658,20 +825,31 @@ fn main() -> Result<()> {
                     sort,
                     limit,
                     json,
-                } => trace::list(
-                    entity.as_str(),
-                    repo.as_deref(),
-                    machine.as_deref(),
-                    source.as_deref(),
-                    status.as_deref(),
-                    operation.as_deref(),
-                    has_errors,
-                    since.as_deref(),
-                    min_ms,
-                    sort.as_str(),
-                    limit,
-                    json,
-                )?,
+                } => {
+                    let scope = policy::ReadScope {
+                        campaigns: campaign.into_iter().collect(),
+                        roles: role.into_iter().collect(),
+                        ..Default::default()
+                    };
+                    print!(
+                        "{}",
+                        trace::list_text(
+                            entity.as_str(),
+                            repo.as_deref(),
+                            machine.as_deref(),
+                            source.as_deref(),
+                            status.as_deref(),
+                            operation.as_deref(),
+                            has_errors,
+                            since.as_deref(),
+                            min_ms,
+                            sort.as_str(),
+                            limit,
+                            json,
+                            Some(&scope),
+                        )?
+                    );
+                }
                 TraceCmd::Show {
                     id,
                     before,
@@ -684,39 +862,138 @@ fn main() -> Result<()> {
                     machine,
                     source,
                     kind,
+                    campaign,
+                    role,
                     limit,
                     json,
-                } => trace::search(
-                    &query,
-                    repo.as_deref(),
-                    machine.as_deref(),
-                    source.as_deref(),
-                    kind.as_deref(),
-                    limit,
-                    json,
-                )?,
+                } => {
+                    let scope = policy::ReadScope {
+                        campaigns: campaign.into_iter().collect(),
+                        roles: role.into_iter().collect(),
+                        ..Default::default()
+                    };
+                    print!(
+                        "{}",
+                        trace::search_text(
+                            &query,
+                            repo.as_deref(),
+                            machine.as_deref(),
+                            source.as_deref(),
+                            kind.as_deref(),
+                            limit,
+                            json,
+                            Some(&scope),
+                        )?
+                    );
+                }
                 TraceCmd::Compare { left, right, json } => trace::compare(&left, &right, json)?,
             }
+        }
+        Cmd::Import {
+            input,
+            format,
+            machine,
+            campaign,
+            role,
+            repo,
+            actor,
+            since,
+            dry_run,
+            quarantine,
+            bucket,
+            redaction,
+        } => {
+            import::run(import::Opts {
+                input,
+                format: format.parse()?,
+                machine,
+                campaign,
+                role,
+                repo,
+                actor,
+                since_ms: since
+                    .as_deref()
+                    .map(config::capture_since_ms_from)
+                    .transpose()?
+                    .or_else(config::capture_since_ms),
+                dry_run,
+                quarantine: quarantine.map(std::path::PathBuf::from),
+                bucket: config::resolve_bucket_opt(bucket),
+                redaction: redaction.parse()?,
+            })?;
         }
         Cmd::Init {
             bucket,
             aws_profile,
             capture_since,
             upload_interval,
+            capture_repos,
+            upload_redaction,
+            mcp_redaction,
+            campaign,
+            role,
             machine,
             no_build,
-        } => init::run(
+            no_autostart,
+        } => init::run(init::Opts {
             bucket,
             aws_profile,
             capture_since,
             upload_interval,
-            &machine,
+            capture_repos,
+            upload_redaction,
+            mcp_redaction,
+            campaign,
+            role,
+            machine,
             no_build,
-        )?,
+            no_autostart,
+        })?,
         Cmd::Tui { bucket } => tui::run(model_id(), config::resolve_bucket(bucket))?,
-        Cmd::Mcp => {
-            pull_configured_for_read();
-            mcp::run(model_id())?
+        Cmd::Mcp {
+            bucket,
+            http,
+            bind,
+            token,
+            listen_public,
+            tls_cert,
+            tls_key,
+            allowed_origins,
+            role,
+            scope,
+            redaction,
+        } => {
+            let bucket = config::resolve_bucket_opt(bucket);
+            if let Some(bucket) = &bucket {
+                sync::pull_read_model_for_read(bucket);
+            }
+            policy::validate_scope_path(scope.as_deref())?;
+            let scope = policy::ReadScope::load(scope.as_deref())?;
+            let role = role.parse()?;
+            let redaction = match redaction {
+                Some(profile) => profile.parse()?,
+                None => config::mcp_redaction(),
+            };
+            if http {
+                let token = token
+                    .or_else(|| std::env::var("SYNTY_MCP_TOKEN").ok())
+                    .unwrap_or_default();
+                mcp_http::run(mcp_http::Opts {
+                    model_id: model_id(),
+                    bind,
+                    token,
+                    listen_public,
+                    tls_cert,
+                    tls_key,
+                    role,
+                    scope,
+                    redaction,
+                    allowed_origins,
+                    bucket,
+                })?
+            } else {
+                mcp::run(model_id(), role, scope, redaction, bucket)?
+            }
         }
         Cmd::Summarize {
             sessions,
@@ -763,6 +1040,8 @@ fn main() -> Result<()> {
             watch,
             poll,
             upload_interval,
+            campaign,
+            role,
             install,
             cursors,
             bucket,
@@ -782,6 +1061,8 @@ fn main() -> Result<()> {
                 upload_interval_secs: upload_interval
                     .unwrap_or_else(config::upload_interval_secs)
                     .max(1),
+                campaign: campaign.or_else(config::campaign_id),
+                role: role.or_else(config::campaign_role),
                 install,
                 cursors,
                 bucket: config::resolve_bucket_opt(bucket),
@@ -854,13 +1135,104 @@ mod tests {
             "2026-07-21",
             "--upload-interval",
             "120",
+            "--capture-repo",
+            "synty",
+            "--upload-redaction",
+            "off",
+            "--mcp-redaction",
+            "mcp_safe",
+            "--campaign",
+            "camp-1",
+            "--role",
+            "primary",
+            "--no-autostart",
         ])
         .expect("durable init settings parse");
         assert!(matches!(
             cli.cmd,
             Cmd::Init {
-                aws_profile: Some(p), capture_since: Some(s), upload_interval: Some(120), ..
-            } if p == "synty-writer" && s == "2026-07-21"
+                aws_profile: Some(p),
+                capture_since: Some(s),
+                upload_interval: Some(120),
+                capture_repos,
+                upload_redaction: Some(u),
+                mcp_redaction: Some(m),
+                campaign: Some(c),
+                role: Some(r),
+                no_autostart: true,
+                ..
+            } if p == "synty-writer" && s == "2026-07-21" && capture_repos == ["synty"]
+                && u == "off" && m == "mcp_safe" && c == "camp-1" && r == "primary"
+        ));
+    }
+
+    #[test]
+    fn index_parses_explicit_read_only_bucket_mode() {
+        let cli = Cli::try_parse_from([
+            "synty",
+            "index",
+            "--bucket",
+            "s3://team",
+            "--read-only-bucket",
+        ])
+        .expect("read-only index settings parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Index {
+                bucket: Some(bucket),
+                read_only_bucket: true,
+            } if bucket == "s3://team"
+        ));
+    }
+
+    #[test]
+    fn mcp_parses_http_role_scope_and_redaction() {
+        let cli = Cli::try_parse_from([
+            "synty",
+            "mcp",
+            "--bucket",
+            "s3://team",
+            "--http",
+            "--bind",
+            "127.0.0.1:9000",
+            "--token",
+            "secret",
+            "--tls-cert",
+            "tls.crt",
+            "--tls-key",
+            "tls.key",
+            "--role",
+            "investigator",
+            "--scope",
+            "scope.json",
+            "--redaction",
+            "mcp_safe",
+            "--allowed-origin",
+            "https://memory.example.com",
+        ])
+        .expect("mcp http settings parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Mcp {
+                bucket: Some(b),
+                http: true,
+                bind,
+                token: Some(t),
+                tls_cert: Some(cert),
+                tls_key: Some(key),
+                role,
+                scope: Some(s),
+                redaction: Some(r),
+                allowed_origins,
+                ..
+            } if b == "s3://team" && bind == "127.0.0.1:9000"
+                && t == "secret"
+                && cert == "tls.crt"
+                && key == "tls.key"
+                && role == "investigator"
+                && s == "scope.json"
+                && r == "mcp_safe"
+                && allowed_origins == ["https://memory.example.com"]
         ));
     }
 
@@ -972,5 +1344,28 @@ mod tests {
     fn excerpt_collapses_whitespace_and_caps() {
         assert_eq!(excerpt("a  b\n c", 100), "a b c");
         assert_eq!(excerpt("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_publish_only_complete_values() {
+        let root = std::env::temp_dir().join(format!("synty-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("shared.json");
+        let values: Vec<Vec<u8>> = (0..32).map(|i| vec![b'a' + i; 64 * 1024]).collect();
+        std::thread::scope(|scope| {
+            for value in &values {
+                let path = &path;
+                scope.spawn(move || crate::write_atomic(&path.to_string_lossy(), value).unwrap());
+            }
+        });
+        let published = std::fs::read(&path).unwrap();
+        assert!(values.contains(&published), "a writer exposed mixed or partial bytes");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "successful writers leave no temporary siblings"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

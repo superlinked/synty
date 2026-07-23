@@ -1,0 +1,196 @@
+{{- if .Values.mcp.enabled }}
+{{- if not .Values.networkPolicy.enabled }}
+{{- fail "networkPolicy.enabled must be true when MCP is enabled" }}
+{{- end }}
+{{- if not .Values.networkPolicy.ingressFrom }}
+{{- fail "networkPolicy.ingressFrom must select at least one trusted MCP caller" }}
+{{- end }}
+{{- if not .Values.networkPolicy.objectStoreCidrs }}
+{{- fail "networkPolicy.objectStoreCidrs must list the configured object-store endpoint ranges" }}
+{{- end }}
+{{- if gt (len .Values.networkPolicy.objectStoreCidrs) 64 }}
+{{- fail "networkPolicy.objectStoreCidrs must contain at most 64 endpoint ranges" }}
+{{- end }}
+{{- range .Values.networkPolicy.objectStoreCidrs }}
+{{- if not (regexMatch `^.+/[0-9]+$` .) }}
+{{- fail "networkPolicy.objectStoreCidrs entries must be CIDR ranges" }}
+{{- end }}
+{{- $prefix := atoi (last (splitList "/" .)) }}
+{{- if contains ":" . }}
+{{- if or (lt $prefix 32) (gt $prefix 128) }}
+{{- fail "networkPolicy.objectStoreCidrs IPv6 ranges must be /32 or narrower" }}
+{{- end }}
+{{- else }}
+{{- if or (lt $prefix 12) (gt $prefix 32) }}
+{{- fail "networkPolicy.objectStoreCidrs IPv4 ranges must be /12 or narrower" }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- range .Values.networkPolicy.ingressFrom }}
+{{- $hasPodSelector := hasKey . "podSelector" }}
+{{- $hasNamespaceSelector := hasKey . "namespaceSelector" }}
+{{- if not (or $hasPodSelector $hasNamespaceSelector) }}
+{{- fail "networkPolicy.ingressFrom entries must contain a constrained podSelector or namespaceSelector" }}
+{{- end }}
+{{- if $hasPodSelector }}
+{{- $selector := .podSelector | default dict }}
+{{- if or (not (kindIs "map" $selector)) (and (empty $selector.matchLabels) (empty $selector.matchExpressions)) }}
+{{- fail "networkPolicy podSelector must contain non-empty matchLabels or matchExpressions" }}
+{{- end }}
+{{- end }}
+{{- if $hasNamespaceSelector }}
+{{- $selector := .namespaceSelector | default dict }}
+{{- if or (not (kindIs "map" $selector)) (and (empty $selector.matchLabels) (empty $selector.matchExpressions)) }}
+{{- fail "networkPolicy namespaceSelector must contain non-empty matchLabels or matchExpressions" }}
+{{- end }}
+{{- end }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "synty.fullname" . }}-mcp
+spec:
+  replicas: 1
+  # The single replica mounts a ReadWriteOnce cache. Never surge a replacement
+  # until the old pod releases the claim, including when scheduling moves nodes.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "synty.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "synty.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: mcp
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      serviceAccountName: {{ include "synty.serviceAccountName" . }}
+      containers:
+        - name: mcp
+          image: {{ include "synty.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -- synty mcp --bucket "$SYNTY_BUCKET" --http --listen-public --bind "0.0.0.0:{{ .Values.mcp.port }}" --tls-cert /etc/synty/tls/tls.crt --tls-key /etc/synty/tls/tls.key --role "$SYNTY_MCP_ROLE" --scope /etc/synty/scope.json --redaction mcp_safe
+              {{- range .Values.mcp.allowedOrigins }}
+              set -- "$@" --allowed-origin {{ . | quote }}
+              {{- end }}
+              exec "$@"
+          env:
+            - { name: SYNTY_HOME, value: /var/synty }
+            - { name: SYNTY_BUCKET, value: {{ required "bucket is required" .Values.bucket | quote }} }
+            - { name: SYNTY_MCP_ROLE, value: {{ .Values.mcp.role | quote }} }
+            {{- if .Values.bucketRegion }}
+            - { name: AWS_REGION, value: {{ .Values.bucketRegion | quote }} }
+            - { name: AWS_DEFAULT_REGION, value: {{ .Values.bucketRegion | quote }} }
+            {{- end }}
+            - name: SYNTY_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "mcp.existingSecret is required" .Values.mcp.existingSecret }}
+                  key: {{ .Values.mcp.tokenKey }}
+          ports:
+            - { name: mcp, containerPort: {{ .Values.mcp.port }} }
+          volumeMounts:
+            - { name: synty-home, mountPath: /var/synty }
+            - { name: tmp, mountPath: /tmp }
+            - { name: scope, mountPath: /etc/synty, readOnly: true }
+            - { name: tls, mountPath: /etc/synty/tls, readOnly: true }
+          # Liveness proves the transport loop is responsive. Readiness also
+          # requires the compact analysis + trace projections from a format-2
+          # published build, so agents never discover a reader that must scan
+          # the raw lake on its first request.
+          startupProbe:
+            httpGet: { path: /health, port: mcp, scheme: HTTPS }
+            periodSeconds: 10
+            failureThreshold: 120
+          livenessProbe:
+            httpGet: { path: /health, port: mcp, scheme: HTTPS }
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /ready, port: mcp, scheme: HTTPS }
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.mcp.resources | nindent 12 }}
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - name: synty-home
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "synty.claimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: scope
+          configMap:
+            name: {{ include "synty.fullname" . }}
+        - name: tls
+          secret:
+            secretName: {{ required "mcp.tls.existingSecret is required when MCP is enabled" .Values.mcp.tls.existingSecret }}
+            items:
+              - key: {{ .Values.mcp.tls.certificateKey }}
+                path: tls.crt
+              - key: {{ .Values.mcp.tls.privateKeyKey }}
+                path: tls.key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "synty.fullname" . }}-mcp
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "synty.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mcp
+  ports:
+    - { name: mcp, port: {{ .Values.mcp.port }}, targetPort: mcp }
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "synty.fullname" . }}-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "synty.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: mcp
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        {{- toYaml .Values.networkPolicy.ingressFrom | nindent 8 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.mcp.port }} }
+  egress:
+    # Resolve the object-store hostname through cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Reach only the configured object-store address ranges over TLS.
+    - to:
+        {{- range .Values.networkPolicy.objectStoreCidrs }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 443 }
+{{- end }}
+{{- end }}

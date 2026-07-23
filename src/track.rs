@@ -32,6 +32,8 @@ pub struct Opts {
     pub watch: bool,
     pub poll_secs: u64,
     pub upload_interval_secs: u64,
+    pub campaign: Option<String>,
+    pub role: Option<String>,
     pub install: Option<String>,
     pub cursors: String,
     /// If set, push drained event chunks to this bucket under events/ (the
@@ -93,6 +95,8 @@ struct Stream {
     /// build on another machine attributes the session to its author, not to
     /// whoever runs the build.
     actor: String,
+    campaign: String,
+    campaign_role: String,
 }
 
 struct Tracker {
@@ -150,6 +154,8 @@ impl Tracker {
                 n_sessions: 0,
                 n_skipped: 0,
                 actor: actor.clone(),
+                campaign: o.campaign.clone().unwrap_or_default(),
+                campaign_role: o.role.clone().unwrap_or_default(),
                 src,
             });
         }
@@ -327,12 +333,22 @@ impl Stream {
             self.n_skipped += skipped;
 
             for e in &mut evts {
+                if !self.campaign.is_empty() {
+                    e.rollup_dim = self.campaign.clone();
+                }
+                if !self.campaign_role.is_empty() {
+                    e.payload["campaign_role"] = json!(self.campaign_role);
+                }
                 if e.kind == kind::SESSION_START {
                     e.payload["actor"] = json!(self.actor);
                     // Which synty produced this stream — distinct from the
                     // agent's own `version` the parser may have captured.
                     // Lets the fleet roster report upgrade lag per machine.
                     e.payload["tracker_version"] = json!(env!("CARGO_PKG_VERSION"));
+                    if !self.campaign.is_empty() {
+                        e.payload["campaign_id"] = json!(self.campaign);
+                    }
+                    e.payload["backend"] = json!(self.src.envelope_source());
                 }
             }
             if cutoff_ms > 0 {
@@ -381,6 +397,10 @@ impl Stream {
             let (_, last_ts) = self.open.remove(sid).unwrap();
             let (ts_ms, ts) = crate::tail::resolve_ts(&last_ts, 0);
             let key = format!("{}\0session_end\0{sid}\0{ts}", self.src.id());
+            let mut payload = json!({"reason": if all {"shutdown"} else {"idle"}});
+            if !self.campaign_role.is_empty() {
+                payload["campaign_role"] = json!(self.campaign_role);
+            }
             events.push(Event {
                 v: crate::event::ENVELOPE_V,
                 event_id: crate::event::deterministic_ulid(ts_ms.max(0) as u64, &key),
@@ -390,8 +410,8 @@ impl Stream {
                 source: self.src.envelope_source().to_string(),
                 session_id: sid.clone(),
                 kind: kind::SESSION_END.to_string(),
-                payload: json!({"reason": if all {"shutdown"} else {"idle"}}),
-                rollup_dim: String::new(),
+                payload,
+                rollup_dim: self.campaign.clone(),
             });
         }
         self.append(&events)?;
@@ -435,9 +455,28 @@ fn started_path(cursors: &Path) -> PathBuf {
 }
 
 fn default_roots(id: &str, home: &str) -> Vec<String> {
+    let claude_home = std::env::var("CLAUDE_CONFIG_DIR").ok().filter(|value| !value.is_empty());
+    let codex_home = std::env::var("CODEX_HOME").ok().filter(|value| !value.is_empty());
+    roots_with_overrides(id, home, claude_home.as_deref(), codex_home.as_deref())
+}
+
+fn roots_with_overrides(
+    id: &str,
+    home: &str,
+    claude_home: Option<&str>,
+    codex_home: Option<&str>,
+) -> Vec<String> {
+    let claude_home = claude_home.filter(|value| !value.is_empty());
+    let codex_home = codex_home.filter(|value| !value.is_empty());
     match id {
-        "claudecode" => vec![format!("{home}/.claude/projects")],
-        "codex" => vec![format!("{home}/.codex/sessions")],
+        "claudecode" => {
+            let base = claude_home.map(str::to_owned).unwrap_or_else(|| format!("{home}/.claude"));
+            vec![format!("{base}/projects")]
+        }
+        "codex" => {
+            let base = codex_home.map(str::to_owned).unwrap_or_else(|| format!("{home}/.codex"));
+            vec![format!("{base}/sessions")]
+        }
         "cowork" => vec![
             format!("{home}/Library/Application Support/Claude/local-agent-mode-sessions"),
             format!("{home}/Library/Application Support/Claude/claude-code-sessions"),
@@ -876,6 +915,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_home_overrides_change_only_the_selected_source() {
+        assert_eq!(
+            roots_with_overrides("codex", "/home/a", None, Some("/var/codex")),
+            vec!["/var/codex/sessions"]
+        );
+        assert_eq!(
+            roots_with_overrides("claudecode", "/home/a", Some("/var/claude"), None),
+            vec!["/var/claude/projects"]
+        );
+        assert_eq!(
+            roots_with_overrides("codex", "/home/a", None, None),
+            vec!["/home/a/.codex/sessions"]
+        );
+        assert_eq!(
+            roots_with_overrides("codex", "/home/a", None, Some("")),
+            vec!["/home/a/.codex/sessions"],
+            "an exported-but-empty CODEX_HOME falls back to HOME"
+        );
+        assert_eq!(
+            roots_with_overrides("claudecode", "/home/a", Some(""), None),
+            vec!["/home/a/.claude/projects"],
+            "an exported-but-empty CLAUDE_CONFIG_DIR falls back to HOME"
+        );
+    }
+
+    #[test]
+    fn tracker_options_reach_every_stream_scope() {
+        let dir = std::env::temp_dir().join(format!(
+            "synty-track-scope-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = Opts {
+            which: "all".into(),
+            out: dir.join("local").to_string_lossy().into_owned(),
+            max_age_days: 0,
+            capture_since_ms: None,
+            machine: "scope-test".into(),
+            watch: false,
+            poll_secs: 30,
+            upload_interval_secs: 60,
+            campaign: Some("campaign-42".into()),
+            role: Some("validator".into()),
+            install: None,
+            cursors: dir.join("cursors.json").to_string_lossy().into_owned(),
+            bucket: None,
+        };
+
+        let tracker = Tracker::new(&options).expect("tracker starts");
+        assert_eq!(tracker.streams.len(), 3);
+        assert!(tracker.streams.iter().all(|stream| stream.campaign == "campaign-42"));
+        assert!(tracker.streams.iter().all(|stream| stream.campaign_role == "validator"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn autostart_requires_both_unit_and_loaded_service() {
         assert!(autostart_ready(true, true));
         assert!(
@@ -1034,6 +1129,8 @@ mod tests {
             n_sessions: 0,
             n_skipped: 0,
             actor: "tester".into(),
+            campaign: String::new(),
+            campaign_role: String::new(),
         };
         let cutoff = chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
             .unwrap()
@@ -1074,7 +1171,7 @@ mod tests {
         let l1 = r#"{"type":"user","sessionId":"S1","version":"2.1.30","timestamp":"2026-05-31T20:00:00Z","message":{"content":"only prompt"}}"#;
         std::fs::write(root.join("s.jsonl"), format!("{l1}\n")).unwrap();
 
-        let end_id = |out: &str| {
+        let end_event = |out: &str| {
             let mut st = Stream {
                 src: Box::new(ClaudeCode),
                 roots: vec![root.to_string_lossy().into_owned()],
@@ -1087,15 +1184,19 @@ mod tests {
                 n_sessions: 0,
                 n_skipped: 0,
                 actor: "tester".into(),
+                campaign: "campaign-42".into(),
+                campaign_role: "validator".into(),
             };
             st.drain(0, &HashMap::new()).unwrap();
             st.flush_ends(i64::MAX - 1, true).unwrap();
             let body = read_stream(&dir.join(out));
             let line = body.lines().find(|l| l.contains("session_end")).expect("session_end emitted");
-            serde_json::from_str::<Event>(line).unwrap().event_id
+            serde_json::from_str::<Event>(line).unwrap()
         };
-        let (a, b) = (end_id("a"), end_id("b"));
-        assert_eq!(a, b, "session_end must mint the same id from the same last-event ts");
+        let (a, b) = (end_event("a"), end_event("b"));
+        assert_eq!(a.event_id, b.event_id, "session_end must mint the same id from the same last-event ts");
+        assert_eq!(a.rollup_dim, "campaign-42");
+        assert_eq!(a.payload["campaign_role"], "validator");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1125,6 +1226,8 @@ mod tests {
             n_sessions: 0,
             n_skipped: 0,
             actor: "tester".into(),
+            campaign: String::new(),
+            campaign_role: String::new(),
         };
 
         // First run: parse from the top, persist cursor + started set.
@@ -1173,6 +1276,8 @@ mod tests {
             n_sessions: 0,
             n_skipped: 0,
             actor: "tester".into(),
+            campaign: "camp-1".into(),
+            campaign_role: "investigator".into(),
         };
         st.drain(0, &HashMap::new()).unwrap();
 
@@ -1181,6 +1286,18 @@ mod tests {
         let e: Event = serde_json::from_str(line).unwrap();
         assert_eq!(e.payload["actor"], "tester", "actor stamp must survive alongside the version");
         assert_eq!(e.payload["tracker_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(e.rollup_dim, "camp-1");
+        assert_eq!(e.payload["campaign_id"], "camp-1");
+        assert_eq!(e.payload["campaign_role"], "investigator");
+        assert_eq!(e.payload["backend"], "claude_code");
+        let prompt: Event = serde_json::from_str(
+            out.lines()
+                .find(|line| line.contains("\"user_prompt\""))
+                .expect("prompt emitted"),
+        )
+        .unwrap();
+        assert_eq!(prompt.rollup_dim, "camp-1");
+        assert_eq!(prompt.payload["campaign_role"], "investigator");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1221,6 +1338,8 @@ mod tests {
                 n_sessions: 0,
                 n_skipped: 0,
                 actor: machine.into(),
+                campaign: String::new(),
+                campaign_role: String::new(),
             };
             st.drain(0, &HashMap::new()).unwrap();
             st.flush_ends(i64::MAX - 1, true).unwrap(); // close the session so it becomes a unit

@@ -1,0 +1,62 @@
+# Internal read-only MCP deployment. The tracker and builder are deliberately
+# separate writers and remain disabled in this release.
+bucket: s3://superlinked-synty-851725219920-us-west-2
+bucketRegion: us-west-2
+
+serviceAccount:
+  name: synty-mcp-reader
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::851725219920:role/synty-mcp-reader-sie-gw-cfg
+
+persistence:
+  # The cluster's legacy gp2 StorageClass cannot expand. This replacement
+  # claim retains enough space for raw data plus a staged immutable rebuild.
+  existingClaim: synty-synty-50gi
+  accessModes: [ReadWriteOnce]
+  size: 50Gi
+
+tracker:
+  enabled: false
+
+builder:
+  enabled: false
+
+mcp:
+  enabled: true
+  role: operator
+  tls:
+    existingSecret: synty-mcp-tls
+  # Empty allowlists deliberately expose all internal bucket records. The MCP
+  # surface remains read-only and applies mcp_safe response redaction.
+  scope:
+    repos: []
+    campaigns: []
+    roles: []
+    sources: []
+
+networkPolicy:
+  enabled: true
+  # Label harness pods explicitly; other pods and namespaces remain denied.
+  ingressFrom:
+    - podSelector:
+        matchLabels:
+          synty.superlinked.com/mcp-client: "true"
+  # AWS's published S3 prefixes for us-west-2. Refresh from ip-ranges.json when
+  # AWS announces a range change; the MCP pod otherwise fails closed.
+  objectStoreCidrs:
+    - 16.12.96.0/21
+    - 16.12.104.0/21
+    - 16.12.88.0/21
+    - 3.5.76.0/22
+    - 16.12.112.0/21
+    - 18.34.244.0/22
+    - 18.34.48.0/20
+    - 3.5.80.0/21
+    - 16.15.32.0/20
+    - 52.218.128.0/17
+    - 52.92.128.0/17
+    - 1.178.65.0/24
+    - 1.178.9.0/24
+    - 3.2.68.0/24
+    - 35.80.36.208/28
+    - 35.80.36.224/28

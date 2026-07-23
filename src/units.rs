@@ -6,14 +6,18 @@
 
 use crate::{first_line, load_docs, readmodel};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 pub(crate) const LOCAL_DIR: &str = "corpus/local";
 const FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
-/// A coding session as one unit of work.
+/// A coding session as one unit of work. The raw-derived fields are persisted
+/// in the published analysis snapshot; topic and summary are refreshed when
+/// the snapshot is read.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub repo: String,
@@ -40,6 +44,8 @@ pub struct Session {
     pub tool_err: usize,
     pub by_model: Vec<ModelUsage>, // per-model split of the same totals, tok_out desc
     pub source: String, // envelope source: claude_code | codex_cli | cowork
+    pub campaign_id: String,
+    pub campaign_role: String,
     pub summary: Option<String>, // abstractive one-liner (local LLM), if cached
     /// The actor the tracker stamped on session_start; empty for sessions
     /// tracked before stamping (callers fall back to the local actor).
@@ -58,7 +64,7 @@ impl Session {
 /// One model's share of a session's (or the fleet's) token usage. Codex
 /// reports no model on its cumulative snapshots, so its share carries the
 /// agent name instead.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub model: String,
     pub tok_in: u64,
@@ -157,6 +163,9 @@ pub struct Unit {
     pub author: String,    // PR/issue author, or the resolved actor for sessions
     pub doc_id: Option<i64>,    // for PR/issue → docs.jsonl
     pub session_id: Option<String>, // for sessions
+    pub campaign_id: String,
+    pub campaign_role: String,
+    pub source: String, // native producer, suitable for read-scope checks
 }
 
 /// A topic with its work units, time span, activity over weeks, and type mix.
@@ -227,6 +236,8 @@ struct Agg {
     tool_errs: HashMap<String, usize>, // per-name errors (Claude only: codex results carry no error flag)
     tool_chars: HashMap<String, u64>, // per-name payload volume: args + result content, chars
     source: String, // envelope source, first seen wins (a session has one tailer)
+    campaign_id: String,
+    campaign_role: String,
     model_usage: HashMap<String, ModelUsage>, // per-model split, same msg_id dedup
     /// Codex reports cumulative (input_total, cached, output) snapshots; the
     /// last one is the session total. Kept raw here, normalized in sessions().
@@ -243,7 +254,7 @@ fn fold_line(
     seen: &mut std::collections::HashSet<u64>,
     aggs: &mut HashMap<String, Agg>,
 ) {
-    fold_line_since(line, known, seen, aggs, None)
+    fold_line_since(line, known, seen, aggs, None, true)
 }
 
 fn fold_line_since(
@@ -252,6 +263,7 @@ fn fold_line_since(
     seen: &mut std::collections::HashSet<u64>,
     aggs: &mut HashMap<String, Agg>,
     capture_since_ms: Option<i64>,
+    collect_texts: bool,
 ) {
     if line.trim().is_empty() {
         return;
@@ -280,6 +292,17 @@ fn fold_line_since(
             a.source = src.to_string();
         }
     }
+    if a.campaign_id.is_empty() {
+        a.campaign_id = ev["rollup_dim"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .or_else(|| ev["payload"]["campaign_id"].as_str())
+            .unwrap_or("")
+            .to_string();
+    }
+    if a.campaign_role.is_empty() {
+        a.campaign_role = ev["payload"]["campaign_role"].as_str().unwrap_or("").to_string();
+    }
     if visible && !ts.is_empty() {
         if a.first.is_empty() || ts < a.first.as_str() {
             a.first = ts.to_string();
@@ -304,7 +327,9 @@ fn fold_line_since(
                 let t = t.trim();
                 if t.len() >= 12 && !crate::ingest::is_noise(t) {
                     a.prompts += 1;
-                    a.texts.push(t.to_string());
+                    if collect_texts {
+                        a.texts.push(t.to_string());
+                    }
                     if a.ask.is_empty() {
                         a.ask = crate::excerpt(t, 200);
                     }
@@ -313,7 +338,7 @@ fn fold_line_since(
         }
         "assistant_message" => {
             a.assistant += 1;
-            if let Some(t) = ev["payload"]["text"].as_str() {
+            if collect_texts && let Some(t) = ev["payload"]["text"].as_str() {
                 if t.trim().len() >= 12 {
                     a.texts.push(t.trim().to_string());
                 }
@@ -415,7 +440,7 @@ fn fold_line_since(
 /// panel's time series. Token fields follow the same accounting as the
 /// per-session aggregation (msg_id dedup, codex last-snapshot normalization);
 /// `sessions` counts the distinct sessions active that day.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct DayStat {
     pub tok_in: u64,
     pub tok_out: u64,
@@ -506,14 +531,152 @@ impl DayFold {
     }
 }
 
+const ANALYSIS_FORMAT: u32 = 2;
+
+/// Compact raw-derived facts published with the immutable search build. MCP
+/// readers use this instead of reparsing every event chunk for each request;
+/// raw envelopes remain the source of truth and builders regenerate it.
+#[derive(Clone, Serialize, Deserialize)]
+struct AnalysisSnapshot {
+    format: u32,
+    sessions: Vec<Session>,
+    days: BTreeMap<String, DayStat>,
+    tools: BTreeMap<String, ToolProfile>,
+    roster: crate::fleet::Roster,
+}
+
+type AnalysisCacheKey = (PathBuf, u64, u128);
+type AnalysisCache = Option<(AnalysisCacheKey, std::sync::Arc<AnalysisSnapshot>)>;
+static ANALYSIS_CACHE: std::sync::OnceLock<std::sync::Mutex<AnalysisCache>> =
+    std::sync::OnceLock::new();
+
+/// Cache identity changes whenever an atomically replaced projection changes.
+fn analysis_key(path: &Path) -> Option<AnalysisCacheKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((path.to_path_buf(), meta.len(), modified))
+}
+
+/// Load and share the current immutable analysis projection across requests.
+fn load_analysis_snapshot() -> Option<std::sync::Arc<AnalysisSnapshot>> {
+    let path = crate::readmodel::analysis_path();
+    let key = analysis_key(&path)?;
+    let cache = ANALYSIS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut cache = cache.lock().ok()?;
+    if let Some((cached_key, snapshot)) = cache.as_ref() {
+        if cached_key == &key {
+            return Some(std::sync::Arc::clone(snapshot));
+        }
+    }
+    let file = std::fs::File::open(&path).ok()?;
+    let snapshot: AnalysisSnapshot =
+        serde_json::from_reader(std::io::BufReader::new(file)).ok()?;
+    if snapshot.format != ANALYSIS_FORMAT {
+        return None;
+    }
+    let snapshot = std::sync::Arc::new(snapshot);
+    *cache = Some((key, std::sync::Arc::clone(&snapshot)));
+    Some(snapshot)
+}
+
+/// One build-side pass shared by session and daily analytics. Keeping this on
+/// the writer makes every mediated read proportional to the compact snapshot,
+/// not the fleet's retained raw bytes.
+pub(crate) struct AnalysisBuilder {
+    known: std::collections::HashSet<String>,
+    capture_since_ms: Option<i64>,
+    seen: std::collections::HashSet<u64>,
+    aggs: HashMap<String, Agg>,
+    days: DayFold,
+    tools: ToolProfilesFold,
+}
+
+impl AnalysisBuilder {
+    /// Start one deterministic analytics pass for the configured boundary.
+    pub(crate) fn new(
+        known: std::collections::HashSet<String>,
+        capture_since_ms: Option<i64>,
+    ) -> Self {
+        Self {
+            known,
+            capture_since_ms,
+            seen: std::collections::HashSet::new(),
+            aggs: HashMap::new(),
+            days: DayFold::default(),
+            tools: ToolProfilesFold::default(),
+        }
+    }
+
+    /// Fold one raw event chunk into session, daily, and tool aggregates.
+    pub(crate) fn fold_text(&mut self, text: &str) {
+        for line in text.lines() {
+            fold_line_since(
+                line,
+                &self.known,
+                &mut self.seen,
+                &mut self.aggs,
+                self.capture_since_ms,
+                false,
+            );
+            let visible = serde_json::from_str::<Value>(line)
+                .ok()
+                .is_none_or(|event| {
+                    crate::config::captured_at(
+                        event["ts"].as_str().unwrap_or(""),
+                        self.capture_since_ms,
+                    )
+                });
+            if visible {
+                self.days.fold(line);
+                self.tools.fold(line);
+            }
+        }
+    }
+
+    /// Atomically publish compact facts and emit their size/coverage metrics.
+    pub(crate) fn write(mut self, path: &Path, roster: crate::fleet::Roster) -> Result<()> {
+        self.aggs.retain(|_, agg| !agg.first.is_empty());
+        let snapshot = AnalysisSnapshot {
+            format: ANALYSIS_FORMAT,
+            sessions: session_rows(self.aggs),
+            days: self.days.finish().into_iter().collect(),
+            tools: self.tools.finish().into_iter().collect(),
+            roster,
+        };
+        let bytes = serde_json::to_vec(&snapshot)?;
+        crate::write_atomic(&path.to_string_lossy(), &bytes)?;
+        crate::metrics::Run::new("analysis")
+            .set("sessions", snapshot.sessions.len())
+            .set("days", snapshot.days.len())
+            .set("tools", snapshot.tools.len())
+            .set("bytes", bytes.len())
+            .emit();
+        Ok(())
+    }
+}
+
+/// Read the fleet roster attached to the same immutable build as its documents.
+pub(crate) fn analysis_roster() -> Option<crate::fleet::Roster> {
+    load_analysis_snapshot().map(|snapshot| snapshot.roster.clone())
+}
+
 /// Per-day usage/tool tallies from the raw envelopes, for the time-series view.
 pub fn day_stats() -> HashMap<String, DayStat> {
+    if let Some(snapshot) = load_analysis_snapshot() {
+        return snapshot.days.iter().map(|(day, stat)| (day.clone(), *stat)).collect();
+    }
+    use std::io::BufRead;
+
     let mut f = DayFold::default();
     for path in jsonl_files(Path::new(LOCAL_DIR)) {
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            for line in data.lines() {
-                f.fold(line);
-            }
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        for line in std::io::BufReader::new(file).lines().map_while(|line| line.ok()) {
+            f.fold(&line);
         }
     }
     f.finish()
@@ -597,16 +760,22 @@ fn combine_activity(
 /// Every distinct tool name seen in the envelopes — the suggestion pool when
 /// `synty tool <name>` misses. One light scan, called only on that miss.
 pub fn tool_names() -> Vec<String> {
+    use std::io::BufRead;
+
+    if let Some(snapshot) = load_analysis_snapshot() {
+        let mut names: Vec<String> = snapshot.tools.keys().cloned().collect();
+        names.sort();
+        return names;
+    }
     let mut names = std::collections::BTreeSet::new();
     for path in jsonl_files(Path::new(LOCAL_DIR)) {
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            for line in data.lines() {
-                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-                if v["kind"].as_str() == Some("tool_call") {
-                    if let Some(n) = v["payload"]["name"].as_str() {
-                        if !n.is_empty() {
-                            names.insert(n.to_string());
-                        }
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        for line in std::io::BufReader::new(file).lines().map_while(|line| line.ok()) {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if v["kind"].as_str() == Some("tool_call") {
+                if let Some(n) = v["payload"]["name"].as_str() {
+                    if !n.is_empty() {
+                        names.insert(n.to_string());
                     }
                 }
             }
@@ -635,13 +804,14 @@ pub fn week_start_for(gmax: i32, weeks: usize) -> i32 {
 /// per-day usage, which argument keys appear — and the common values of the
 /// low-cardinality ones — input sizes, and call→result latency where both
 /// sides carry timestamps. Computed on demand for the Status drill-down.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ToolProfile {
     pub name: String,
     pub agent: String, // "claude" / "codex" / … / "a+b" when mixed
     pub calls: u64,
     pub errs: u64,
     pub chars: u64, // args + result payload volume — context, as a ~chars/4 estimate
-    pub days: HashMap<String, u64>,
+    pub days: BTreeMap<String, u64>,
     pub arg_keys: Vec<(String, u64)>, // key → calls carrying it, desc
     pub arg_tops: Vec<(String, Vec<(String, u64)>)>, // low-cardinality keys → top values
     pub p50_ms: u64,
@@ -664,13 +834,56 @@ struct ToolFold {
     calls: u64,
     errs: u64,
     chars: u64,
-    days: HashMap<String, u64>,
+    days: BTreeMap<String, u64>,
     key_counts: HashMap<String, u64>,
     val_counts: HashMap<String, HashMap<String, u64>>,
     sizes: Vec<usize>,
     pending_ts: HashMap<String, i64>, // call id → call ts (ms)
     durs: Vec<u64>,
     samples: std::collections::VecDeque<String>,
+}
+
+/// Builds every tool profile in one event pass. Calls are routed to their
+/// named fold; results are offered to every known fold so only the owner of
+/// the pending call id consumes it. Tool cardinality is small and bounded by
+/// the actual event vocabulary, while the published profiles stay compact.
+#[derive(Default)]
+struct ToolProfilesFold {
+    folds: HashMap<String, ToolFold>,
+}
+
+impl ToolProfilesFold {
+    fn fold(&mut self, line: &str) {
+        let Ok(ev) = serde_json::from_str::<Value>(line) else { return };
+        match ev["kind"].as_str().unwrap_or("") {
+            "tool_call" => {
+                let Some(name) = ev["payload"]["name"].as_str().filter(|name| !name.is_empty())
+                else {
+                    return;
+                };
+                self.folds
+                    .entry(name.to_string())
+                    .or_insert_with(|| ToolFold {
+                        target: name.to_string(),
+                        ..Default::default()
+                    })
+                    .fold(line);
+            }
+            "tool_result" => {
+                for fold in self.folds.values_mut() {
+                    fold.fold(line);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> HashMap<String, ToolProfile> {
+        self.folds
+            .into_iter()
+            .map(|(name, fold)| (name, fold.finish()))
+            .collect()
+    }
 }
 
 fn ts_ms(ts: &str) -> Option<i64> {
@@ -834,19 +1047,40 @@ pub fn gh_loc_by_day() -> HashMap<String, (u64, u64)> {
 
 /// Profile one tool's use across every tracked session, on demand.
 pub fn tool_profile(name: &str) -> ToolProfile {
+    use std::io::BufRead;
+
+    if let Some(snapshot) = load_analysis_snapshot() {
+        return snapshot.tools.get(name).cloned().unwrap_or_else(|| ToolProfile {
+            name: name.to_string(),
+            agent: String::new(),
+            calls: 0,
+            errs: 0,
+            chars: 0,
+            days: BTreeMap::new(),
+            arg_keys: Vec::new(),
+            arg_tops: Vec::new(),
+            p50_ms: 0,
+            p95_ms: 0,
+            timed: 0,
+            input_p50: 0,
+            input_p95: 0,
+            samples: Vec::new(),
+        });
+    }
     let mut f = ToolFold { target: name.to_string(), ..Default::default() };
     for path in jsonl_files(Path::new(LOCAL_DIR)) {
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            for line in data.lines() {
-                f.fold(line);
-            }
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        for line in std::io::BufReader::new(file).lines().map_while(|line| line.ok()) {
+            f.fold(&line);
         }
     }
     f.finish()
 }
 
 /// Aggregate the raw envelopes under corpus/local into per-session tallies.
-fn aggregate() -> HashMap<String, Agg> {
+fn aggregate(collect_texts: bool) -> HashMap<String, Agg> {
+    use std::io::BufRead;
+
     // The org's repos (from the last back-fill) — fold worktree dirs onto them.
     let known: std::collections::HashSet<String> =
         crate::config::load().repos.into_iter().collect();
@@ -856,11 +1090,18 @@ fn aggregate() -> HashMap<String, Agg> {
     let mut seen = std::collections::HashSet::new();
     let capture_since_ms = crate::config::capture_since_ms();
     for f in jsonl_files(Path::new(LOCAL_DIR)) {
-        let Ok(data) = std::fs::read_to_string(&f) else {
+        let Ok(file) = std::fs::File::open(&f) else {
             continue;
         };
-        for line in data.lines() {
-            fold_line_since(line, &known, &mut seen, &mut aggs, capture_since_ms);
+        for line in std::io::BufReader::new(file).lines().map_while(|line| line.ok()) {
+            fold_line_since(
+                &line,
+                &known,
+                &mut seen,
+                &mut aggs,
+                capture_since_ms,
+                collect_texts,
+            );
         }
     }
     aggs.retain(|_, a| !a.first.is_empty());
@@ -870,10 +1111,25 @@ fn aggregate() -> HashMap<String, Agg> {
 /// Build session units from the raw envelopes, with topic membership, a
 /// normalized struggle score, and any cached LLM summary.
 pub fn sessions() -> Result<Vec<Session>> {
-    let aggs = aggregate();
+    let mut out = if let Some(snapshot) = load_analysis_snapshot() {
+        snapshot.sessions.clone()
+    } else {
+        session_rows(aggregate(false))
+    };
     let cache = load_summary_cache();
     let topic_of = unit_topics();
+    for session in &mut out {
+        session.topic = topic_of.get(&session.id).map(|topic| topic.cluster);
+        session.summary = cache
+            .get(&session.id)
+            .map(|cached| cached.summary.clone())
+            .filter(|summary| !summary.is_empty());
+    }
+    out.sort_by(|x, y| y.ended.cmp(&x.ended).then(x.id.cmp(&y.id)));
+    Ok(out)
+}
 
+fn session_rows(aggs: HashMap<String, Agg>) -> Vec<Session> {
     // Raw struggle signals → z-scores → summed → percentile-ranked to 0..1.
     let ids: Vec<String> = aggs.keys().cloned().collect();
     let sig = |a: &Agg| [a.thinking as f64, a.tools as f64, a.prompts as f64, duration_secs(a) as f64];
@@ -929,15 +1185,17 @@ pub fn sessions() -> Result<Vec<Session>> {
                 tool_err: a.tool_err,
                 by_model,
                 source: a.source.clone(),
-                topic: topic_of.get(id).map(|t| t.cluster),
+                campaign_id: a.campaign_id.clone(),
+                campaign_role: a.campaign_role.clone(),
+                topic: None,
                 struggle: scores[i],
-                summary: cache.get(id).map(|c| c.summary.clone()).filter(|s| !s.is_empty()),
+                summary: None,
                 author: a.actor.clone(),
             }
         })
         .collect();
-    out.sort_by(|x, y| y.ended.cmp(&x.ended));
-    Ok(out)
+    out.sort_by(|x, y| y.ended.cmp(&x.ended).then(x.id.cmp(&y.id)));
+    out
 }
 
 /// All work units (sessions + PRs + issues), newest first.
@@ -963,6 +1221,9 @@ pub fn units() -> Result<Vec<Unit>> {
             author: if s.author.is_empty() { local_actor.clone() } else { s.author.clone() },
             doc_id: None,
             session_id: Some(s.id),
+            campaign_id: s.campaign_id,
+            campaign_role: s.campaign_role,
+            source: s.source,
         })
         .collect();
 
@@ -990,6 +1251,13 @@ pub fn units() -> Result<Vec<Unit>> {
                 author: d.meta.author.clone(),
                 doc_id: Some(d.id),
                 session_id: None,
+                campaign_id: d.meta.campaign_id.clone(),
+                campaign_role: d.meta.campaign_role.clone(),
+                source: if d.meta.capture_source.is_empty() {
+                    d.meta.source.clone()
+                } else {
+                    d.meta.capture_source.clone()
+                },
             });
         }
     }
@@ -1028,6 +1296,49 @@ pub fn topic_units(weeks: usize) -> Result<Vec<TopicUnits>> {
         .collect();
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));
     Ok(out)
+}
+
+/// Apply every read-scope dimension before rebuilding topic facets. Cached
+/// names and summaries describe the full cluster, so restricted views replace
+/// them with an extractive label from an allowed member.
+pub fn topic_units_scoped(weeks: usize, scope: &crate::policy::ReadScope) -> Result<Vec<TopicUnits>> {
+    Ok(scope_topic_units(topic_units(weeks)?, weeks, scope))
+}
+
+fn scope_topic_units(
+    mut topics: Vec<TopicUnits>,
+    weeks: usize,
+    scope: &crate::policy::ReadScope,
+) -> Vec<TopicUnits> {
+    if !scope.restricted() {
+        return topics;
+    }
+    topics = topics
+        .into_iter()
+        .filter_map(|mut topic| {
+            topic.units.retain(|unit| scope.allows_unit(unit));
+            if topic.units.is_empty() {
+                return None;
+            }
+            let days: Vec<String> = topic.units.iter().map(|unit| unit.when.clone()).collect();
+            topic.last_active = days.iter().max().cloned().unwrap_or_default();
+            topic.activity = weekly_buckets(&days, weeks);
+            topic.mix = unit_mix(&topic.units);
+            topic.repos = by_count(
+                topic.units.iter().filter(|unit| !unit.repo.is_empty()).map(|unit| unit.repo.clone()),
+            );
+            topic.authors = by_count(
+                topic.units.iter().filter(|unit| !unit.author.is_empty()).map(|unit| unit.author.clone()),
+            );
+            topic.span = day_span(&days);
+            topic.label = topic.units.iter().min_by_key(|unit| unit.rank).map(|unit| unit.title.clone()).unwrap_or_default();
+            topic.summary = None;
+            topic.name = None;
+            Some(topic)
+        })
+        .collect();
+    topics.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.units.len().cmp(&a.units.len())));
+    topics
 }
 
 // ── struggle ────────────────────────────────────────────────────────────────
@@ -1174,7 +1485,7 @@ fn unit_mix(units: &[Unit]) -> (usize, usize, usize) {
 /// Per-session inputs for the LLM summarizer (ask + the longest turns). Shares
 /// aggregation with `sessions`.
 pub fn session_inputs() -> Result<Vec<SessionInput>> {
-    let aggs = aggregate();
+    let aggs = aggregate(true);
     let ids: Vec<String> = aggs.keys().cloned().collect();
     Ok(ids
         .iter()
@@ -1458,12 +1769,54 @@ mod tests {
         aggs
     }
 
+    #[test]
+    fn restricted_topics_rebuild_facets_and_drop_full_corpus_summaries() {
+        let unit = |repo: &str, title: &str, rank: i64| Unit {
+            kind: Kind::Session,
+            when: "2026-07-22".into(),
+            repo: repo.into(),
+            title: title.into(),
+            outcome: String::new(),
+            summary: None,
+            topic: Some(0),
+            rank,
+            dup: false,
+            struggle: 0.0,
+            author: repo.into(),
+            doc_id: None,
+            session_id: Some(repo.into()),
+            campaign_id: "campaign".into(),
+            campaign_role: "primary".into(),
+            source: "harness".into(),
+        };
+        let topics = vec![TopicUnits {
+            id: 0,
+            cache_key: "topic".into(),
+            label: "secret full label".into(),
+            units: vec![unit("allowed", "Allowed task", 1), unit("hidden", "Hidden task", 0)],
+            last_active: "2026-07-22".into(),
+            activity: vec![2],
+            mix: (0, 2, 0),
+            repos: vec!["allowed".into(), "hidden".into()],
+            authors: vec!["allowed".into(), "hidden".into()],
+            summary: Some("secret full summary".into()),
+            name: Some("Secret name".into()),
+            span: None,
+        }];
+        let scope = crate::policy::ReadScope { repos: vec!["allowed".into()], ..Default::default() };
+        let scoped = scope_topic_units(topics, 1, &scope);
+        assert_eq!(scoped[0].units.len(), 1);
+        assert_eq!(scoped[0].repos, ["allowed"]);
+        assert_eq!(scoped[0].label, "Allowed task");
+        assert!(scoped[0].summary.is_none() && scoped[0].name.is_none());
+    }
+
     fn aggs_since(text: &str, cutoff: i64) -> HashMap<String, Agg> {
         let known = std::collections::HashSet::new();
         let mut seen = std::collections::HashSet::new();
         let mut aggs = HashMap::new();
         for line in text.lines() {
-            fold_line_since(line, &known, &mut seen, &mut aggs, Some(cutoff));
+            fold_line_since(line, &known, &mut seen, &mut aggs, Some(cutoff), true);
         }
         aggs.retain(|_, a| !a.first.is_empty());
         aggs
@@ -1536,6 +1889,9 @@ mod tests {
             author: String::new(),
             doc_id: None,
             session_id: None,
+            campaign_id: String::new(),
+            campaign_role: String::new(),
+            source: String::new(),
         };
         let day: HashMap<String, DayStat> = [(
             "2026-06-01".to_string(),
@@ -1685,6 +2041,60 @@ mod tests {
         assert_eq!(p.agent, "codex");
     }
 
+    // A remote reader receives the same session, usage, and tool facts without
+    // any raw event files. This is the writer-side contract for the compact
+    // analysis artifact published with a build.
+    #[test]
+    fn published_analysis_contains_session_day_and_tool_facts() {
+        let lines = [
+            r#"{"event_id":"old-tool","session_id":"S","source":"harness","ts":"2026-07-21T23:00:00Z","kind":"tool_call","payload":{"tool_use_id":"old","name":"SecretTool","input":{"secret":"must-not-publish"}}}"#,
+            r#"{"event_id":"e0","session_id":"S","source":"harness","rollup_dim":"campaign-7","ts":"2026-07-21T23:30:00Z","kind":"session_start","payload":{"cwd":"/work/repo","campaign_role":"primary"}}"#,
+            r#"{"event_id":"e1","session_id":"S","source":"harness","ts":"2026-07-22T01:00:01Z","kind":"user_prompt","payload":{"text":"investigate the deployment bottleneck"}}"#,
+            r#"{"event_id":"e2","session_id":"S","source":"harness","ts":"2026-07-22T01:00:02Z","kind":"tool_call","payload":{"tool_use_id":"t1","name":"Bash","input":{"command":"kubectl get pods"}}}"#,
+            r#"{"event_id":"e3","session_id":"S","source":"harness","ts":"2026-07-22T01:00:03Z","kind":"tool_result","payload":{"tool_use_id":"t1","is_error":false,"content":"ready"}}"#,
+        ]
+        .join("\n");
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut builder = AnalysisBuilder::new(
+            std::collections::HashSet::from(["repo".to_string()]),
+            Some(cutoff),
+        );
+        builder.fold_text(&lines);
+        let path = std::env::temp_dir().join(format!(
+            "synty-analysis-snapshot-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("scenario")
+        ));
+        builder.write(&path, crate::fleet::Roster::default()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let snapshot: AnalysisSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot.format, ANALYSIS_FORMAT);
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].repo, "repo");
+        assert_eq!(snapshot.sessions[0].campaign_id, "campaign-7");
+        assert_eq!(snapshot.sessions[0].campaign_role, "primary");
+        assert_eq!(snapshot.days["2026-07-22"].tools, 1);
+        assert_eq!(snapshot.tools["Bash"].calls, 1);
+        assert_eq!(snapshot.tools["Bash"].timed, 1);
+        assert!(!snapshot.tools.contains_key("SecretTool"));
+        let second = path.with_extension("again.json");
+        let mut again = AnalysisBuilder::new(
+            std::collections::HashSet::from(["repo".to_string()]),
+            Some(cutoff),
+        );
+        again.fold_text(&lines);
+        again.write(&second, crate::fleet::Roster::default()).unwrap();
+        assert_eq!(
+            bytes,
+            std::fs::read(&second).unwrap(),
+            "identical inputs publish an identical immutable projection"
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(second).unwrap();
+    }
+
     // A session with prompts but no usage records must read as unmeasured —
     // the coverage denominator, and the no-fake-zero display rule.
     #[test]
@@ -1712,6 +2122,8 @@ mod tests {
             tool_err: 0,
             by_model: vec![],
             source: "cowork".into(),
+            campaign_id: String::new(),
+            campaign_role: String::new(),
             summary: None,
             author: String::new(),
         };

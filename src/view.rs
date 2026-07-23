@@ -128,6 +128,8 @@ pub fn status() -> Result<Status> {
     // effort). Independent of the bucket — it's about synty itself, not the data.
     let bucket = crate::config::load().bucket;
     let upgrade = crate::release::available();
+    let fleet = crate::units::analysis_roster()
+        .unwrap_or_else(|| crate::fleet::roster(&docs, std::path::Path::new(crate::units::LOCAL_DIR)));
     Ok(Status {
         docs: docs.len(),
         github,
@@ -144,7 +146,7 @@ pub fn status() -> Result<Status> {
         bucket,
         upgrade,
         stale: stale_note().is_some(),
-        fleet: crate::fleet::roster(&docs, std::path::Path::new(crate::units::LOCAL_DIR)),
+        fleet,
     })
 }
 
@@ -409,6 +411,28 @@ pub fn show_report(id: &str) -> Result<String> {
     })
 }
 
+pub fn show_report_scoped(id: &str, scope: &crate::policy::ReadScope) -> Result<String> {
+    if !scope.restricted() {
+        return show_report(id);
+    }
+    let mut docs = load_docs(readmodel::docs_path()).unwrap_or_default();
+    docs.retain(|doc| scope.allows_doc(&doc.meta));
+    let sessions = crate::units::sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|session| scope.allows_session(session))
+        .collect();
+    let topics = crate::units::topic_units_scoped(12, scope).unwrap_or_default();
+    let target = resolve_among(id, sessions, topics, &docs)?;
+    Ok(match &target {
+        ShowTarget::Session(session) => session_md(session, &session_prompts(&docs, &session.id)),
+        ShowTarget::Gh { doc, topic } => {
+            unit_md(doc, topic.as_ref().map(|(key, title)| (key.as_str(), title.as_str())))
+        }
+        ShowTarget::Topic(topic) => topic_md(topic),
+    })
+}
+
 pub fn show_json_report(id: &str) -> Result<String> {
     let (t, docs) = show_load(id)?;
     Ok(match &t {
@@ -456,7 +480,10 @@ fn resolve_among(
                 let topic = topics
                     .into_iter()
                     .find(|t| t.units.iter().any(|u| u.doc_id == Some(doc.id)))
-                    .map(|t| (crate::short(&t.cache_key), t.title().to_string()));
+                    .map(|t| {
+                        let title = t.title().to_string();
+                        (t.cache_key, title)
+                    });
                 Ok(ShowTarget::Gh { doc, topic })
             }
             None => anyhow::bail!("no PR/issue {repo}#{n} in the corpus — `synty github` pulls the active window"),
@@ -483,13 +510,13 @@ fn resolve_among(
             let mut cands: Vec<String> = s_hits
                 .iter()
                 .take(8)
-                .map(|&i| format!("{} session — {}", crate::short(&sessions[i].id), crate::excerpt(&sessions[i].ask, 48)))
+                .map(|&i| format!("{} session — {}", sessions[i].id, crate::excerpt(&sessions[i].ask, 48)))
                 .collect();
             cands.extend(
                 t_hits
                     .iter()
                     .take(8usize.saturating_sub(cands.len()))
-                    .map(|&i| format!("{} topic — {}", crate::short(&topics[i].cache_key), topics[i].title())),
+                    .map(|&i| format!("{} topic — {}", topics[i].cache_key, topics[i].title())),
             );
             anyhow::bail!("`{id}` is ambiguous — {} matches:\n  {}", s_hits.len() + t_hits.len(), cands.join("\n  "))
         }
@@ -716,12 +743,12 @@ pub fn work_md(units: &[Unit]) -> String {
     o
 }
 
-/// The inline id a session row carries (` [a1b2c3d4]`) so a follow-up
-/// `synty show <id>` needs nothing but this output. GitHub rows already lead
-/// their title with `repo#N`, which `show` accepts directly.
+/// The inline native id a session row carries so a follow-up `synty show <id>`
+/// needs nothing but this output, even when timestamp-derived ULID prefixes
+/// collide. GitHub rows already lead their title with `repo#N`.
 fn unit_id_tag(u: &Unit) -> String {
     match (&u.kind, &u.session_id) {
-        (Kind::Session, Some(s)) if !s.is_empty() => format!(" [{}]", crate::short(s)),
+        (Kind::Session, Some(s)) if !s.is_empty() => format!(" [{s}]"),
         _ => String::new(),
     }
 }
@@ -735,7 +762,7 @@ pub fn topics_md(topics: &[TopicUnits]) -> String {
         let wk = |i: usize| n.checked_sub(i).and_then(|x| t.activity.get(x)).copied().unwrap_or(0);
         o.push_str(&format!(
             "## [{}] {}\n{} units · last active {} · activity this/last/prior wk: {}/{}/{} · {sess} sessions / {prs} PRs / {issues} issues\n",
-            crate::short(&t.cache_key),
+            t.cache_key,
             t.title(),
             t.units.len(),
             t.last_active,
@@ -1119,6 +1146,8 @@ mod tests {
             tool_err: 0,
             by_model: vec![],
             source: "claude_code".into(),
+            campaign_id: String::new(),
+            campaign_role: String::new(),
             summary: None,
             author: String::new(),
         }
@@ -1359,6 +1388,10 @@ mod tests {
                 repo: repo.into(),
                 author: "alice".into(),
                 session_id: String::new(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: String::new(),
                 ts: "2026-06-01T10:00:00Z".into(),
                 number: Some(n),
                 url: Some("https://gh/7".into()),
@@ -1410,7 +1443,8 @@ mod tests {
         ];
         let e = show_err(resolve_among("aaaa", sessions, vec![], &[]));
         assert!(e.contains("ambiguous") && e.contains("2 matches"), "{e}");
-        assert!(e.contains("aaaa1111") && e.contains("aaaa2222"), "{e}");
+        assert!(e.contains("aaaa1111-0000-4000-8000-000000000001"), "{e}");
+        assert!(e.contains("aaaa2222-0000-4000-8000-000000000002"), "{e}");
         assert!(e.contains("first ask"), "candidates carry their ask: {e}");
     }
 
@@ -1442,6 +1476,10 @@ mod tests {
                 repo: "sie".into(),
                 author: String::new(),
                 session_id: s.id.clone(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: String::new(),
                 ts: String::new(),
                 number: None,
                 url: None,
@@ -1482,6 +1520,9 @@ mod tests {
                 author: "alice".into(),
                 doc_id: None,
                 session_id: Some(format!("000000{i:02}-0000-4000-8000-000000000000")),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                source: "claude_code".into(),
             })
             .collect();
         let md = topic_md(&t);
@@ -1490,7 +1531,10 @@ mod tests {
         for i in 0..8 {
             assert!(md.contains(&format!("session number {i}")), "member {i} missing: {md}");
         }
-        assert!(md.contains("[00000007]"), "member rows carry ids: {md}");
+        assert!(
+            md.contains("[00000007-0000-4000-8000-000000000000]"),
+            "member rows carry ids: {md}"
+        );
     }
 
     // PR detail names its state, link, author, topic, and excerpts the body.
@@ -1522,9 +1566,12 @@ mod tests {
             author: "alice".into(),
             doc_id: None,
             session_id: Some("a1b2c3d4-9999-4242-8888-777766665555".into()),
+            campaign_id: String::new(),
+            campaign_role: String::new(),
+            source: "claude_code".into(),
         };
         let md = work_md(&[unit]);
-        assert!(md.contains("session [a1b2c3d4]"), "{md}");
+        assert!(md.contains("session [a1b2c3d4-9999-4242-8888-777766665555]"), "{md}");
     }
 
     // Topic headers lead with the stable content-addressed key — the
@@ -1549,6 +1596,9 @@ mod tests {
                 author: "alice".into(),
                 doc_id: None,
                 session_id: Some("a1b2c3d4-9999-4242-8888-777766665555".into()),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                source: "claude_code".into(),
             }],
             last_active: "2026-06-01".into(),
             activity: vec![1],
@@ -1560,9 +1610,12 @@ mod tests {
             span: None,
         };
         let md = topics_md(&[t]);
-        assert!(md.contains("## [72a778f8] auth work"), "{md}");
+        assert!(md.contains("## [72a778f8aabbccdd] auth work"), "{md}");
         assert!(!md.contains("## 3 —"), "the positional id is gone from MD: {md}");
-        assert!(md.contains("session [a1b2c3d4]:"), "member rows carry ids too: {md}");
+        assert!(
+            md.contains("session [a1b2c3d4-9999-4242-8888-777766665555]:"),
+            "member rows carry ids too: {md}"
+        );
     }
 
     // Every --json output arrives in the same versioned envelope, so a script
@@ -1583,6 +1636,9 @@ mod tests {
             author: "alice".into(),
             doc_id: None,
             session_id: Some("S1".into()),
+            campaign_id: String::new(),
+            campaign_role: String::new(),
+            source: "claude_code".into(),
         };
         let w: serde_json::Value = serde_json::from_str(&work_json(&[unit])).unwrap();
         assert_eq!((w["v"].as_i64(), w["kind"].as_str()), (Some(1), Some("work")));
@@ -1630,6 +1686,10 @@ mod tests {
                 repo: repo.into(),
                 author: author.into(),
                 session_id: sid.into(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: String::new(),
                 ts: "2026-01-01T00:00:00Z".into(),
                 number: None,
                 url: None,

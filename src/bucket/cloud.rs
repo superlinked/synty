@@ -294,11 +294,7 @@ impl Bucket for Cloud {
             }
         });
         let results = self.rt.block_on(requests.buffer_unordered(OBJECT_CONCURRENCY).collect::<Vec<_>>());
-        let mut created = 0;
-        for (key, result) in results {
-            created += usize::from(result.map_err(|e| anyhow!("put_if_absent {key}: {e}"))?);
-        }
-        Ok(created)
+        summarize_batch_puts(results)
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -309,6 +305,26 @@ impl Bucket for Cloud {
             Err(e) => Err(anyhow!("delete {key}: {e}")),
         }
     }
+}
+
+fn summarize_batch_puts(
+    results: Vec<(String, object_store::Result<bool>)>,
+) -> Result<usize> {
+    let mut created = 0;
+    let mut first_error = None;
+    for (key, result) in results {
+        match result {
+            Ok(was_created) => created += usize::from(was_created),
+            Err(error) if first_error.is_none() => first_error = Some((key, error)),
+            Err(_) => {}
+        }
+    }
+    if let Some((key, error)) = first_error {
+        bail!(
+            "put_many_if_absent partially completed: {created} object(s) created; first failure at {key}: {error}"
+        );
+    }
+    Ok(created)
 }
 
 #[cfg(all(test, feature = "s3"))]
@@ -356,6 +372,53 @@ mod tests {
                 store: "scenario",
                 source: Box::new(std::io::Error::other("injected get failure")),
             })
+        }
+        async fn delete(&self, location: &OPath) -> object_store::Result<()> {
+            self.0.delete(location).await
+        }
+        fn list(&self, prefix: Option<&OPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+            self.0.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&OPath>) -> object_store::Result<ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+        async fn copy(&self, from: &OPath, to: &OPath) -> object_store::Result<()> {
+            self.0.copy(from, to).await
+        }
+        async fn copy_if_not_exists(&self, from: &OPath, to: &OPath) -> object_store::Result<()> {
+            self.0.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingPut(object_store::memory::InMemory);
+
+    impl std::fmt::Display for FailingPut {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("failing-put")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingPut {
+        async fn put_opts(&self, location: &OPath, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+            if location.as_ref() == "broken" {
+                return Err(object_store::Error::Generic {
+                    store: "scenario",
+                    source: Box::new(std::io::Error::other("injected put failure")),
+                });
+            }
+            self.0.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OPath,
+            opts: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &OPath, options: GetOptions) -> object_store::Result<GetResult> {
+            self.0.get_opts(location, options).await
         }
         async fn delete(&self, location: &OPath) -> object_store::Result<()> {
             self.0.delete(location).await
@@ -452,5 +515,30 @@ mod tests {
         let cloud = test_cloud(Arc::new(FailingGet(object_store::memory::InMemory::new())));
         let error = cloud.get_many(&["broken".into()]).unwrap_err().to_string();
         assert!(error.contains("injected get failure"), "backend error must remain actionable: {error}");
+    }
+
+    #[test]
+    fn cloud_batch_put_error_reports_every_successful_create() {
+        let cloud = test_cloud(Arc::new(FailingPut(object_store::memory::InMemory::new())));
+        let error = cloud
+            .put_many_if_absent(&[
+                ("created-before-error".into(), b"first".to_vec()),
+                ("broken".into(), b"failure".to_vec()),
+                ("created-after-error".into(), b"second".to_vec()),
+            ])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2 object(s) created"), "{error}");
+        assert!(error.contains("broken") && error.contains("injected put failure"), "{error}");
+        assert_eq!(
+            cloud.get("created-before-error").unwrap().as_deref(),
+            Some(&b"first"[..]),
+            "successful objects remain visible for an idempotent retry"
+        );
+        assert_eq!(
+            cloud.get("created-after-error").unwrap().as_deref(),
+            Some(&b"second"[..]),
+            "the whole concurrent batch is drained before reporting failure"
+        );
     }
 }

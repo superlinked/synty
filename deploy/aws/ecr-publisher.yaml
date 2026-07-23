@@ -1,0 +1,66 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Dedicated Synty ECR repository and tag-only GitHub Actions publisher
+
+Parameters:
+  GitHubOidcProviderArn:
+    Type: String
+    Default: arn:aws:iam::851725219920:oidc-provider/token.actions.githubusercontent.com
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: synty
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"Expire untagged build layers",
+          "selection":{"tagStatus":"untagged","countType":"sinceImagePushed",
+          "countUnit":"days","countNumber":7},"action":{"type":"expire"}}]}
+
+  PublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: synty-github-ecr-publisher
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: repo:superlinked/synty:ref:refs/tags/v*
+      Policies:
+        - PolicyName: push-synty-images
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+
+Outputs:
+  PublisherRoleArn:
+    Value: !GetAtt PublisherRole.Arn
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri

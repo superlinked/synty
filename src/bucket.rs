@@ -77,21 +77,15 @@ impl LocalFs {
     fn path(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }
-    /// A process-unique temp sibling for `p` — a fixed name would let two
-    /// concurrent writers of the same key rename each other's half-written tmp
-    /// into place.
-    fn tmp_for(p: &Path) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        p.with_file_name(format!("{name}.part.{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
-    }
 }
 
 /// Tmp-file marker — `list` skips these so a killed writer's leftovers never
 /// read as real objects.
 fn is_part(name: &str) -> bool {
-    name.ends_with(".part") || name.contains(".part.")
+    name.ends_with(".part")
+        || name.contains(".part.")
+        || name.ends_with(".tmp")
+        || name.contains(".tmp.")
 }
 
 impl Bucket for LocalFs {
@@ -102,10 +96,7 @@ impl Bucket for LocalFs {
         }
         // Write to a temp sibling then rename, so a reader never sees a partial
         // object (atomic on the same filesystem).
-        let tmp = Self::tmp_for(&p);
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &p)?;
-        Ok(())
+        crate::write_atomic(&p.to_string_lossy(), bytes)
     }
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         match std::fs::read(self.path(key)) {
@@ -147,8 +138,7 @@ impl Bucket for LocalFs {
         }
         // hard_link is atomic fail-if-exists on APFS/ext4 — the local stand-in
         // for a conditional PUT.
-        let tmp = Self::tmp_for(&p);
-        std::fs::write(&tmp, bytes)?;
+        let tmp = crate::write_unique_temp(&p, bytes)?;
         let created = match std::fs::hard_link(&tmp, &p) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -248,6 +238,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
         std::fs::write(dir.join("blobs/real"), b"x").unwrap();
         std::fs::write(dir.join("blobs/real.part.123-0"), b"half").unwrap();
+        std::fs::write(dir.join("blobs/real.tmp.1-0"), b"half").unwrap();
         assert_eq!(b.list("blobs").unwrap(), vec!["blobs/real"], "part files never read as objects");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -257,9 +248,7 @@ mod tests {
         assert!(open("/tmp/x").is_ok());
         assert!(open("file:///tmp/x").is_ok());
         // Cloud schemes only resolve when their feature is built in.
-        let s3 = open("s3://bucket/prefix");
         #[cfg(not(feature = "s3"))]
-        assert!(s3.is_err());
-        let _ = s3;
+        assert!(open("s3://bucket/prefix").is_err());
     }
 }

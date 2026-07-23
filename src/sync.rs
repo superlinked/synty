@@ -121,6 +121,17 @@ struct UploadState {
     /// registry, then continue each stream from a persisted key cursor.
     #[serde(default)]
     registered_streams: BTreeMap<String, BTreeSet<String>>,
+    /// The irreversible transform used for each bucket's uploaded chunks.
+    /// Changing it after advancing offsets would silently mix policies while
+    /// making the original local bytes impossible to replay.
+    #[serde(default)]
+    redaction_profiles: BTreeMap<String, String>,
+    /// Repository policy and the session ids it admitted. Persisting this
+    /// avoids rescanning the full append-only stream on every upload poll.
+    #[serde(default)]
+    capture_repo_policies: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    allowed_sessions: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
 }
 
 /// Default event upload path used by builds outside the long-lived tracker.
@@ -207,6 +218,27 @@ fn push_events_scoped(
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    let profile = crate::config::upload_redaction();
+    let config = crate::config::load();
+    let capture_repos = config.capture_repos;
+    let known_repos: std::collections::HashSet<String> = config.repos.into_iter().collect();
+    let profile_name = profile.as_str();
+    ensure_upload_policy_compatible(
+        &state,
+        bucket_uri,
+        profile_name,
+        &capture_repos,
+    )?;
+    let profile_changed = state
+        .redaction_profiles
+        .insert(bucket_uri.to_string(), profile_name.to_string())
+        .as_deref()
+        != Some(profile_name);
+    let repo_policy_changed = state.capture_repo_policies.get(bucket_uri) != Some(&capture_repos);
+    if repo_policy_changed {
+        state.capture_repo_policies.insert(bucket_uri.to_string(), capture_repos.clone());
+        state.allowed_sessions.remove(bucket_uri);
+    }
     let offsets = state.buckets.entry(bucket_uri.to_string()).or_default();
     let pending_starts = state
         .pending_starts
@@ -216,8 +248,9 @@ fn push_events_scoped(
         .registered_streams
         .entry(bucket_uri.to_string())
         .or_default();
+    let allowed_by_stream = state.allowed_sessions.entry(bucket_uri.to_string()).or_default();
     let (mut n, mut bytes_up) = (0, 0u64);
-    let mut changed = false;
+    let mut changed = profile_changed || repo_policy_changed;
     let mut files: Vec<std::path::PathBuf> = walkdir::WalkDir::new(local_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -273,7 +306,23 @@ fn push_events_scoped(
         let end = start + last_nl as u64 + 1;
         let filtered =
             filter_events_since(&pending[..=last_nl], capture_since_ms, stream, pending_starts);
-        for (part, chunk) in event_chunks(&filtered, EVENT_CHUNK_BYTES)
+        let repo_filtered = if capture_repos.is_empty() {
+            filtered
+        } else {
+            if !allowed_by_stream.contains_key(stream) {
+                let allowed = allowed_sessions_for_repos(
+                    &Path::new(local_dir).join(stream),
+                    &capture_repos,
+                    &known_repos,
+                );
+                allowed_by_stream.insert(stream.to_string(), allowed);
+            }
+            let allowed = allowed_by_stream.get_mut(stream).expect("stream policy initialized");
+            update_allowed_sessions(&filtered, &capture_repos, &known_repos, allowed);
+            filter_events_for_sessions(&filtered, allowed)
+        };
+        let redacted = redact_event_lines(&repo_filtered, profile);
+        for (part, chunk) in event_chunks(&redacted, EVENT_CHUNK_BYTES)
             .into_iter()
             .enumerate()
         {
@@ -303,6 +352,131 @@ fn push_events_scoped(
     }
     sync_metric("event_chunks_up", n, bytes_up);
     Ok(n)
+}
+
+fn ensure_upload_policy_compatible(
+    state: &UploadState,
+    bucket_uri: &str,
+    profile: &str,
+    capture_repos: &[String],
+) -> Result<()> {
+    let has_uploaded = state
+        .buckets
+        .get(bucket_uri)
+        .is_some_and(|offsets| offsets.values().any(|offset| *offset > 0));
+    if !has_uploaded {
+        return Ok(());
+    }
+    // Ledgers written before these fields existed represent the historical
+    // behavior: raw uploads with no repository allowlist.
+    let previous_profile = state
+        .redaction_profiles
+        .get(bucket_uri)
+        .map(String::as_str)
+        .unwrap_or("off");
+    anyhow::ensure!(
+        previous_profile == profile,
+        "upload redaction for {bucket_uri} changed from {previous_profile} to {profile} after upload offsets advanced; use a new bucket prefix or reset the upload ledger deliberately"
+    );
+    let previous_repos = state
+        .capture_repo_policies
+        .get(bucket_uri)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    anyhow::ensure!(
+        previous_repos == capture_repos,
+        "upload repository policy for {bucket_uri} changed after upload offsets advanced; use a new bucket prefix or reset the upload ledger deliberately"
+    );
+    Ok(())
+}
+
+fn update_allowed_sessions(
+    raw: &[u8],
+    capture_repos: &[String],
+    known_repos: &std::collections::HashSet<String>,
+    allowed: &mut BTreeSet<String>,
+) {
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else { continue };
+        if value["kind"].as_str() != Some("session_start") {
+            continue;
+        }
+        let Some(session) = value["session_id"].as_str().filter(|value| !value.is_empty()) else { continue };
+        let raw_repo = value["payload"]["repo"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .or_else(|| value["payload"]["cwd"].as_str())
+            .unwrap_or("");
+        let repo = crate::units::resolve_repo(raw_repo, known_repos);
+        if capture_repos.iter().any(|candidate| candidate == &repo) {
+            allowed.insert(session.to_string());
+        }
+    }
+}
+
+fn allowed_sessions_for_repos(
+    stream_dir: &Path,
+    capture_repos: &[String],
+    known_repos: &std::collections::HashSet<String>,
+) -> BTreeSet<String> {
+    let mut allowed = BTreeSet::new();
+    for path in crate::units::jsonl_files(stream_dir) {
+        let Ok(raw) = std::fs::read_to_string(path) else { continue };
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if value["kind"].as_str() != Some("session_start") {
+                continue;
+            }
+            let Some(session) = value["session_id"].as_str().filter(|value| !value.is_empty()) else { continue };
+            let raw_repo = value["payload"]["repo"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .or_else(|| value["payload"]["cwd"].as_str())
+                .unwrap_or("");
+            let repo = crate::units::resolve_repo(raw_repo, known_repos);
+            if capture_repos.iter().any(|candidate| candidate == &repo) {
+                allowed.insert(session.to_string());
+            }
+        }
+    }
+    allowed
+}
+
+/// A configured repository allowlist is an upload boundary. Unknown sessions
+/// fail closed: their start metadata may be in an older file, so the complete
+/// stream is scanned above before any pending bytes are accepted.
+fn filter_events_for_sessions(raw: &[u8], allowed: &BTreeSet<String>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else { continue };
+        if value["session_id"]
+            .as_str()
+            .is_some_and(|session| allowed.contains(session))
+        {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
+fn redact_event_lines(raw: &[u8], profile: crate::redact::Profile) -> Vec<u8> {
+    if profile == crate::redact::Profile::Off {
+        return raw.to_vec();
+    }
+    let mut out = Vec::new();
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        if let Some(redacted) = crate::redact::event_line(line, profile) {
+            out.extend_from_slice(&redacted);
+        } else {
+            let text = crate::redact::text(&String::from_utf8_lossy(line), profile);
+            out.extend_from_slice(text.trim_end_matches(['\r', '\n']).as_bytes());
+            out.push(b'\n');
+        }
+    }
+    out
 }
 
 /// Retain post-boundary events plus the session_start metadata for any session
@@ -508,21 +682,45 @@ fn pull_event_key(b: &dyn bucket::Bucket, key: &str, local_dir: &str) -> Result<
     Ok((true, size))
 }
 
-/// Bring a reader onto the fleet's latest raw-event and published read-model
-/// snapshots. Raw events are needed by status/stats/trace and also make an
-/// unpublished delta visible through `stale_note`; the read-model remains the
-/// fast query surface. Sync errors are advisory so an offline reader can keep
-/// using its last complete local snapshot.
-pub fn pull_for_read(bucket_uri: &str) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaderPull {
+    ReadModel,
+    Events,
+}
+
+// A large raw history must never delay the pointer + published query model.
+// Interactive local readers use this order; mediated MCP readers need only the
+// complete format-2 read model.
+const READER_PULL_ORDER: [ReaderPull; 2] = [ReaderPull::ReadModel, ReaderPull::Events];
+
+/// Pull only the complete published query model. Format-2 builds include the
+/// compact analysis and trace projections needed by mediated MCP readers.
+pub fn pull_read_model_for_read(bucket_uri: &str) {
+    match pull_if_stale(bucket_uri) {
+        Ok(true) => eprintln!("pulled published read-model from {bucket_uri}"),
+        Ok(false) => {}
+        Err(e) => eprintln!("read-model pull skipped ({e})"),
+    }
+}
+
+/// Pull raw events needed by status/stats/trace and unpublished-delta notices.
+/// Errors remain advisory so the last complete local snapshot stays usable.
+pub fn pull_events_for_read(bucket_uri: &str) {
     match pull_events(bucket_uri, "corpus/local") {
         Ok(n) if n > 0 => eprintln!("pulled {n} fleet event chunks from {bucket_uri}"),
         Ok(_) => {}
         Err(e) => eprintln!("event pull skipped ({e})"),
     }
-    match pull_if_stale(bucket_uri) {
-        Ok(true) => eprintln!("pulled published read-model from {bucket_uri}"),
-        Ok(false) => {}
-        Err(e) => eprintln!("read-model pull skipped ({e})"),
+}
+
+/// Bring a local reader onto the fleet's published query model first, then its
+/// raw event snapshot for building and unpublished-delta detection.
+pub fn pull_for_read(bucket_uri: &str) {
+    for step in READER_PULL_ORDER {
+        match step {
+            ReaderPull::ReadModel => pull_read_model_for_read(bucket_uri),
+            ReaderPull::Events => pull_events_for_read(bucket_uri),
+        }
     }
 }
 
@@ -678,6 +876,9 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
         return Ok(false);
     }
     let local = readmodel::current();
+    if local_format_is_newer(local.as_ref(), &remote) {
+        return Ok(false);
+    }
     if local.as_ref() == Some(&remote) {
         return Ok(false);
     }
@@ -694,7 +895,7 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
     next_plaid::MmapIndex::load(&dir.to_string_lossy())
         .map_err(|e| anyhow!("pulled build does not load: {e}"))?;
     let keep: Vec<String> = local.iter().map(|c| c.build.clone()).collect();
-    readmodel::repoint(&remote.build, remote.rev)?;
+    readmodel::repoint_current(&remote)?;
     readmodel::gc(&keep);
     crate::metrics::Run::new("sync")
         .set("phase", "pull_down")
@@ -705,10 +906,37 @@ pub fn pull_if_stale(bucket_uri: &str) -> Result<bool> {
     Ok(true)
 }
 
+fn local_format_is_newer(local: Option<&readmodel::Current>, remote: &readmodel::Current) -> bool {
+    local.is_some_and(|current| current.format > remote.format)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bucket::Bucket; // trait methods (put/get) on LocalFs in tests
+
+    #[test]
+    fn published_read_model_precedes_unbounded_raw_history() {
+        assert_eq!(READER_PULL_ORDER, [ReaderPull::ReadModel, ReaderPull::Events]);
+    }
+
+    #[test]
+    fn older_remote_format_never_replaces_a_newer_local_projection() {
+        let local = readmodel::Current {
+            build: "local-v2".into(),
+            rev: 0,
+            format: readmodel::FORMAT,
+            writer: "new".into(),
+        };
+        let remote = readmodel::Current {
+            build: "remote-v1".into(),
+            rev: 9,
+            format: 1,
+            writer: "old".into(),
+        };
+        assert!(local_format_is_newer(Some(&local), &remote));
+        assert!(!local_format_is_newer(None, &remote));
+    }
 
     struct RecordingBucket {
         inner: crate::bucket::LocalFs,
@@ -738,6 +966,57 @@ mod tests {
             self.inner.put_if_absent(key, bytes)
         }
         fn delete(&self, key: &str) -> Result<()> { self.inner.delete(key) }
+    }
+
+    #[test]
+    fn repository_upload_gate_drops_denied_and_unknown_sessions() {
+        let raw = concat!(
+            "{\"session_id\":\"allowed\",\"kind\":\"user_prompt\"}\n",
+            "{\"session_id\":\"denied\",\"kind\":\"user_prompt\"}\n",
+            "{\"kind\":\"agent_meta\"}\n",
+            "not-json\n",
+        );
+        let allowed = BTreeSet::from(["allowed".to_string()]);
+        let filtered = String::from_utf8(filter_events_for_sessions(raw.as_bytes(), &allowed)).unwrap();
+        assert!(filtered.contains("allowed"));
+        assert!(!filtered.contains("denied"));
+        assert!(!filtered.contains("agent_meta"));
+        assert!(!filtered.contains("not-json"));
+    }
+
+    #[test]
+    fn upload_redaction_removes_bearer_tokens_while_off_is_lossless() {
+        let raw = concat!(
+            r#"{"event_id":"E","kind":"tool_result","payload":{"text":"Authorization: Bearer abcdefghijklmnop"}}"#,
+            "\n",
+        )
+        .as_bytes();
+
+        assert_eq!(
+            redact_event_lines(raw, crate::redact::Profile::Off),
+            raw,
+            "raw bucket mode must preserve the source bytes"
+        );
+        let redacted = String::from_utf8(redact_event_lines(
+            raw,
+            crate::redact::Profile::Standard,
+        ))
+        .unwrap();
+        assert!(redacted.contains("[REDACTED]"), "{redacted}");
+        assert!(!redacted.contains("abcdefghijklmnop"), "{redacted}");
+    }
+
+    #[test]
+    fn advanced_uploads_refuse_irreversible_policy_changes() {
+        let bucket = "s3://team/events";
+        let mut state = UploadState::default();
+        state.buckets.insert(
+            bucket.into(),
+            BTreeMap::from([("edge/track.jsonl".into(), 42)]),
+        );
+        assert!(ensure_upload_policy_compatible(&state, bucket, "off", &[]).is_ok());
+        assert!(ensure_upload_policy_compatible(&state, bucket, "standard", &[]).is_err());
+        assert!(ensure_upload_policy_compatible(&state, bucket, "off", &["synty".into()]).is_err());
     }
 
     fn event(id: &str, sid: &str, kind: &str, ts: &str, text: &str) -> String {

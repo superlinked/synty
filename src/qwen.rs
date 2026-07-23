@@ -181,7 +181,11 @@ fn content_words(s: &str) -> std::collections::HashSet<String> {
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric() && c != '-')
         .map(|w| w.trim_matches('-'))
-        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w) && w.chars().any(|c| c.is_alphabetic()))
+        .filter(|w| {
+            w.len() >= 3
+                && !crate::words::DEVELOPER_STOPWORDS.contains(w)
+                && w.chars().any(|c| c.is_alphabetic())
+        })
         .map(str::to_string)
         .collect()
 }
@@ -246,19 +250,6 @@ fn name_grounded(name: &str, terms: &[String]) -> bool {
     // compound terms we keep for distinctiveness never match a spaced name.
     terms.iter().any(|t| t.split(|c: char| !c.is_alphanumeric()).filter(|p| p.len() >= 3).any(|p| words.contains(p)))
 }
-
-/// Generic developer vocabulary that must not count as a cluster's term at all —
-/// a name should match on a concrete subject, not "update"/"fix"/"feature".
-pub(crate) const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "was", "were", "with", "that", "this", "from", "into", "are", "has", "have",
-    "had", "not", "added", "add", "adds", "fix", "fixes", "fixed", "update", "updates", "updated",
-    "updating", "implement", "implemented", "implementing", "support", "new", "using", "use", "used",
-    "via", "across", "their", "its", "which", "while", "when", "also", "now", "set", "get", "include",
-    "includes", "including", "improve", "improved", "improving", "enhance", "enhanced", "enhancing",
-    "project", "work", "feature", "features", "changes", "change", "code", "file", "files", "repo",
-    "repository", "dependencies", "dependency", "data", "based", "various", "tools", "system",
-    "feat", "chore", "subject", // commit-convention ceremony leaking from PR-title summaries
-];
 
 /// Meta-opener clauses the 0.6B stacks in front of summaries, generated as every
 /// SUBJECT × VERB combination ("this area addresses …", "the project involves …",

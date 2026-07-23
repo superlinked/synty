@@ -11,6 +11,8 @@ use crate::{encode::Encoder, load_docs, readmodel};
 use anyhow::{Context, Result};
 use ndarray::Array2;
 use next_plaid::{IndexConfig, MmapIndex, UpdateConfig};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
 
@@ -26,9 +28,24 @@ fn index_batches(start: usize, end: usize) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
-pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
+pub fn run(
+    docs_path: &str,
+    model_id: &str,
+    bucket: &str,
+    read_only_bucket: bool,
+) -> Result<()> {
+    // Ingest holds the same lock across all three atomic file replacements.
+    // Keep it through the pointer move so the build identity, embeddings,
+    // metadata, and copied projections all come from that single generation.
+    let _generation = crate::generation::exclusive(docs_path)?;
     let docs = load_docs(docs_path)?;
     anyhow::ensure!(!docs.is_empty(), "no docs at {docs_path}; run `ingest` first");
+    let analysis_path = Path::new(docs_path).with_file_name("analysis.json");
+    let trace_path = Path::new(docs_path).with_file_name("trace.json");
+    anyhow::ensure!(
+        analysis_path.is_file() && trace_path.is_file(),
+        "raw-derived read snapshots are missing; run `ingest` first"
+    );
 
     let texts: Vec<String> = docs.iter().map(|d| d.text.clone()).collect();
     let hashes: Vec<u64> = texts.iter().map(|t| fnv1a(t.as_bytes())).collect();
@@ -36,20 +53,27 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
         .iter()
         .map(|d| serde_json::to_value(&d.meta))
         .collect::<std::result::Result<_, _>>()?;
-    let build = readmodel::build_id(&hashes);
+    let projection_hashes = [file_hash(&analysis_path)?, file_hash(&trace_path)?];
+    let build = readmodel::build_id(&hashes, &projection_hashes);
 
     // Unchanged corpus → the current build already matches; skip the rebuild
     // but still ensure the bucket has it (publish is a no-op if current).
     let prev = readmodel::current();
     let prev_hashes = prev.as_ref().and_then(|c| load_manifest(&c.dir()));
     if let Some(cur) = &prev {
-        if prev_hashes.as_deref() == Some(hashes.as_slice())
+        if cur.format == readmodel::FORMAT
+            && cur.build == build
+            && cur.analysis().is_file()
+            && cur.trace().is_file()
+            && prev_hashes.as_deref() == Some(hashes.as_slice())
             && MmapIndex::load(&cur.dir().to_string_lossy()).is_ok()
         {
             eprintln!("index up to date ({} docs, corpus unchanged)", docs.len());
-            let published = crate::sync::publish(bucket)?;
-            if published > 0 {
-                eprintln!("published {published} read-model objects → {bucket}");
+            if !read_only_bucket {
+                let published = crate::sync::publish(bucket)?;
+                if published > 0 {
+                    eprintln!("published {published} read-model objects → {bucket}");
+                }
             }
             return Ok(());
         }
@@ -96,7 +120,11 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     // are large enough that retaining a 30-day corpus as f32 until the final
     // index call exceeds workstation memory; next-plaid's streaming entrypoint
     // keeps only this slice resident while its completed chunks stay on disk.
-    let store = EmbStore::open(bucket, model_id)?;
+    let store = if read_only_bucket {
+        EmbStore::open_read_only(bucket, model_id)?
+    } else {
+        EmbStore::open(bucket, model_id)?
+    };
     let n_new = texts.len() - start;
     let known = store.known_hashes()?;
     let listed_reused = hashes[start..].iter().filter(|hash| known.contains(hash)).count();
@@ -181,6 +209,8 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     // clusters carried forward so topics keep displaying until `cluster` runs.
     std::fs::write(path.join("doc_hashes.json"), serde_json::to_string(&hashes)?)?;
     std::fs::copy(docs_path, path.join("docs.jsonl"))?;
+    std::fs::copy(&analysis_path, path.join("analysis.json"))?;
+    std::fs::copy(&trace_path, path.join("trace.json"))?;
     if let Some(cur) = &prev {
         let _ = std::fs::copy(cur.clusters(), path.join("unit_clusters.0.json"));
     }
@@ -199,11 +229,30 @@ pub fn run(docs_path: &str, model_id: &str, bucket: &str) -> Result<()> {
     );
 
     // Publish the read-model so other devices can query without rebuilding.
-    let published = crate::sync::publish(bucket)?;
-    if published > 0 {
-        eprintln!("published {published} read-model objects → {bucket}");
+    if read_only_bucket {
+        eprintln!("index: bucket is read-only; kept the complete read-model local");
+    } else {
+        let published = crate::sync::publish(bucket)?;
+        if published > 0 {
+            eprintln!("published {published} read-model objects → {bucket}");
+        }
     }
     Ok(())
+}
+
+/// Stream a projection fingerprint without retaining its serialized bytes.
+fn file_hash(path: &Path) -> Result<u64> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buf[..read]);
+    }
+    Ok(u64::from_le_bytes(digest.finalize()[..8].try_into().unwrap()))
 }
 
 /// More than 1/PATCH_FRAC of the previous index departing → full rebuild:

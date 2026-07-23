@@ -3,22 +3,72 @@
 // resolved to a doc-id subset via next-plaid's filtering module, then passed
 // to MaxSim search. Renders Markdown to stdout — the agent-facing surface.
 
-use crate::{encode::Encoder, excerpt, first_line, load_docs, readmodel, short, Doc};
+use crate::{Doc, encode::Encoder, excerpt, first_line, load_docs, readmodel};
 use anyhow::{anyhow, Result};
 use next_plaid::{MmapIndex, QueryResult, SearchParameters};
 
 /// Filter is `column=value` (e.g. `repo=sie-web`); bound as a parameter so the
 /// next-plaid WHERE validator accepts it.
 pub fn subset_for(filter: Option<&str>) -> Result<Option<Vec<i64>>> {
-    let Some(f) = filter else { return Ok(None) };
-    let (col, val) = f.split_once('=').ok_or_else(|| anyhow!("filter must be col=value: {f}"))?;
+    subset_for_scope(filter, &crate::policy::ReadScope::default())
+}
+
+pub fn subset_for_scope(
+    filter: Option<&str>,
+    scope: &crate::policy::ReadScope,
+) -> Result<Option<Vec<i64>>> {
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+    if let Some(f) = filter {
+        let (col, val) =
+            f.split_once('=').ok_or_else(|| anyhow!("filter must be col=value: {f}"))?;
+        clauses.push(format!("{} = ?", col.trim()));
+        params.push(serde_json::json!(val.trim()));
+    }
+    append_scope_clause(&mut clauses, &mut params, "repo", &scope.repos);
+    append_scope_clause(&mut clauses, &mut params, "campaign_id", &scope.campaigns);
+    append_scope_clause(&mut clauses, &mut params, "campaign_role", &scope.roles);
+    append_source_scope_clause(&mut clauses, &mut params, &scope.sources);
+    if clauses.is_empty() {
+        return Ok(None);
+    }
     let ids = next_plaid::filtering::where_condition(
         &readmodel::index_dir().to_string_lossy(),
-        &format!("{} = ?", col.trim()),
-        &[serde_json::json!(val.trim())],
+        &clauses.join(" AND "),
+        &params,
     )
-    .map_err(|e| anyhow!("filter `{f}`: {e}"))?;
+    .map_err(|e| anyhow!("filter: {e}"))?;
     Ok(Some(ids))
+}
+
+fn append_source_scope_clause(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<serde_json::Value>,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    let placeholders = std::iter::repeat_n("?", values.len()).collect::<Vec<_>>().join(",");
+    clauses.push(format!("(capture_source IN ({placeholders}) OR (capture_source = '' AND source IN ({placeholders})))"));
+    params.extend(values.iter().map(|value| serde_json::json!(value)));
+    params.extend(values.iter().map(|value| serde_json::json!(value)));
+}
+
+fn append_scope_clause(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<serde_json::Value>,
+    column: &str,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    clauses.push(format!(
+        "{column} IN ({})",
+        std::iter::repeat_n("?", values.len()).collect::<Vec<_>>().join(",")
+    ));
+    params.extend(values.iter().map(|value| serde_json::json!(value)));
 }
 
 pub fn run(
@@ -114,8 +164,48 @@ fn card(d: &Doc, rank: usize, score: f32) -> String {
             "{rank}. [{score:.1}] _{} · {} · {}_\n   {}\n",
             d.meta.kind,
             if d.meta.repo.is_empty() { "—" } else { &d.meta.repo },
-            short(&d.meta.session_id),
+            if d.meta.session_id.is_empty() { "—" } else { &d.meta.session_id },
             excerpt(&d.text, 160)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::card;
+    use crate::{Doc, Meta};
+
+    fn session_doc(id: &str) -> Doc {
+        Doc {
+            id: 0,
+            text: "Measured the GPU bottleneck".into(),
+            meta: Meta {
+                source: "agent".into(),
+                kind: "assistant_message".into(),
+                repo: String::new(),
+                author: String::new(),
+                session_id: id.into(),
+                campaign_id: String::new(),
+                campaign_role: String::new(),
+                backend: String::new(),
+                capture_source: "codex_cli".into(),
+                ts: "2026-07-23T00:00:00Z".into(),
+                number: None,
+                url: None,
+                state: None,
+                labels: vec![],
+                agent_attr: None,
+            },
+        }
+    }
+
+    // Search ids are direct synty_show arguments even when two ULIDs share
+    // their timestamp prefix, as observed in the live harness corpus.
+    #[test]
+    fn session_cards_print_full_native_ids() {
+        let first = card(&session_doc("019f7d1e-0000-4000-8000-000000000001"), 1, 7.3);
+        let second = card(&session_doc("019f7d1e-0000-4000-8000-000000000002"), 2, 7.1);
+        assert!(first.contains("019f7d1e-0000-4000-8000-000000000001"), "{first}");
+        assert!(second.contains("019f7d1e-0000-4000-8000-000000000002"), "{second}");
     }
 }
