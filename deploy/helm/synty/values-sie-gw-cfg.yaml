@@ -9,8 +9,11 @@ serviceAccount:
     eks.amazonaws.com/role-arn: arn:aws:iam::851725219920:role/synty-mcp-reader-sie-gw-cfg
 
 persistence:
+  # The cluster's legacy gp2 StorageClass cannot expand. This replacement
+  # claim retains enough space for raw data plus a staged immutable rebuild.
+  existingClaim: synty-synty-50gi
   accessModes: [ReadWriteOnce]
-  size: 20Gi
+  size: 50Gi
 
 tracker:
   enabled: false

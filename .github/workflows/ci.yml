@@ -35,6 +35,7 @@ jobs:
         run: |
           helm lint deploy/helm/synty --set bucket=s3://example/synty
           helm template synty deploy/helm/synty --set bucket=s3://example/synty >/tmp/synty.yaml
+          grep -q 'helm.sh/resource-policy: keep' /tmp/synty.yaml
           if helm template synty deploy/helm/synty \
             --set bucket=s3://example/synty --set mcp.enabled=true >/tmp/synty-insecure.yaml; then
             echo "MCP rendered without a TLS Secret" >&2
