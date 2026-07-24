@@ -46,6 +46,12 @@ networkPolicy:
     - podSelector:
         matchLabels:
           synty.superlinked.com/mcp-client: "true"
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: sie-harness
+      podSelector:
+        matchLabels:
+          synty.superlinked.com/mcp-client: "true"
   # AWS's published S3 prefixes for us-west-2. Refresh from ip-ranges.json when
   # AWS announces a range change; the MCP pod otherwise fails closed.
   objectStoreCidrs:
