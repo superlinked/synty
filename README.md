@@ -267,7 +267,9 @@ CIDR configuration is capped at 64 ranges and rejects IPv4 prefixes broader
 than `/12` or IPv6 prefixes broader than `/32`, including split-default-route
 combinations. The Service remains cluster-internal, and its default ingress
 accepts only same-namespace pods labeled
-`synty.superlinked.com/mcp-client: "true"`.
+`synty.superlinked.com/mcp-client: "true"`. The `sie-gw-cfg` values additionally
+admit that label from the `sie-harness` namespace; both selectors must match, so
+other namespaces and unlabeled harness pods remain denied.
 Size persistent storage for the raw corpus plus both the current and staged
 immutable build. Chart-created PVCs carry Helm's `keep` policy so an upgrade
 cannot discard the corpus; use `persistence.existingClaim` when a cluster's
