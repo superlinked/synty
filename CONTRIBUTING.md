@@ -50,11 +50,11 @@ runs the test suite, builds each platform, and attaches `synty-<os>-<arch>`
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-The matrix builds `macos-14` (`--features metal,s3,gcs,mcp-http`, Apple Silicon) and
-`ubuntu-latest` (`--features s3,gcs,mcp-http`, Linux x64); the `s3`/`gcs` features read
-the team's data bucket and are independent of where the binary ships. Add rows
-for more platforms (Intel Mac `macos-13`, `ubuntu-24.04-arm`) as needed. Users
-then update with `synty upgrade`, which reads the same release.
+The matrix builds `macos-14` (`--features metal,s3,gcs,mcp-http,athena`, Apple
+Silicon) and `ubuntu-latest` (`--features s3,gcs,mcp-http,athena`, Linux x64);
+the bucket features read the team's data, while `athena` enables bounded remote
+trace queries. Add binary-asset rows for more platforms as needed. Users then
+update with `synty upgrade`, which reads the same release.
 
 The same tag publishes a verified multi-architecture (`linux/amd64` +
 `linux/arm64`) container to
