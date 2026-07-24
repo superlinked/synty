@@ -46,8 +46,8 @@ runs the test suite, builds each platform, and attaches `synty-<os>-<arch>`
 (plus a `.sha256`) to the release:
 
 ```sh
-# bump the Cargo.toml version, commit, then:
-git tag v0.2.0 && git push origin v0.2.0
+# bump the Cargo.toml version, commit, then replace X.Y.Z with that version:
+git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
 The matrix builds `macos-14` (`--features metal,s3,gcs,mcp-http,athena`, Apple
