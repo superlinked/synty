@@ -36,6 +36,38 @@ data.
 - **Agents are first-class readers.** The primary agent surface is a CLI that
   prints Markdown to stdout; humans get a TUI over the same data.
 
+## Team query architecture
+
+```mermaid
+flowchart LR
+    W["Trackers and harness import"] -->|"immutable JSONL chunks"| S3["S3 raw event lake"]
+    S3 --> B["Builder"]
+    B --> E["Content-addressed embeddings"]
+    B --> P["Published next-plaid read model"]
+    E --> B
+    P -->|"download + mmap"| MCP["Read-only MCP"]
+    S3 -->|"external table; no migration"| G["Glue Data Catalog"]
+    G --> A["Bounded Athena SELECT"]
+    A -->|"bounded raw envelopes"| F["Rust trace fold"]
+    F --> MCP
+    MCP --> H["Harness agents"]
+```
+
+Semantic and forensic reads deliberately take different paths. Search and
+related-work use the published next-plaid index; `embeddings/` remains a
+builder-side content-addressed cache and is not downloaded per MCP query.
+Remote `synty_trace_*` tools use Athena to prune immutable raw envelopes by
+stream and day, then reuse the normal Rust fold to derive turns, spans, and
+jobs. The MCP pod does not need a trace projection job or `trace.json` on its
+volume. Local CLI/TUI operation stays self-contained and can use the local
+projection offline.
+
+The raw-table overlay is the zero-copy bootstrap, not a columnar rewrite:
+Athena still scans the selected JSONL object bytes. If daily raw volume reaches
+the workgroup cutoff, a follow-up can write a separate immutable Parquet
+projection partitioned for session lookup while leaving the authoritative raw
+prefix untouched. This path deliberately creates no compaction job or migration.
+
 ## Engine
 
 - **Encode:** `pylate-rs` (ColBERT on Candle, ModernBERT backend). Default
@@ -180,11 +212,17 @@ runs on CI or a server without a developer machine.
   `--tls-key`. `--scope`, `--redaction`, and repeatable `--allowed-origin`
   configure the mediated boundary. The transport validates exact browser
   origins and protocol versions, bounds requests, and
-  keeps health responsive while tool calls run. It pulls the published query
-  model before serving and refreshes only that model in the background; it does
-  not mirror the raw event lake. Format-2 builds include compact session/tool/
-  fleet facts and bounded trace evidence. `/health` remains a liveness check,
-  while `/ready` requires both mediated projections. Analysis calls use a
+  keeps health responsive while tool calls run. It pulls the published semantic
+  index and compact analysis projection before serving and refreshes only those
+  artifacts in the background; it does not mirror the raw event lake. With
+  `--athena-workgroup`, trace calls issue only bounded `SELECT` statements over
+  the existing S3 event chunks and fold the returned rows in Rust. The backend
+  discovers injected stream partitions from `event-streams/`, caps the time
+  window at seven days, rows at 50,000, returned bytes at 64 MiB, query time at
+  50 seconds, and relies on a workgroup scan cutoff as the final cost guard.
+  `/health` remains a liveness check, while `/ready` requires the semantic
+  index, compact analysis projection, and both dispatchers; local-projection
+  mode additionally requires `trace.json`. Analysis calls use a
   serialized one-slot dispatcher so concurrent first loads cannot multiply
   memory or block semantic search. Each dispatcher has a bounded queue; HTTP
   clients have a 120-second response deadline and a per-client
@@ -230,11 +268,13 @@ a long wait. A continuation without a captured initiating call remains visible
 and is labeled `continuation_only` rather than guessed onto another command.
 Every duration says whether the source reported it or it is merely an event
 gap; the latter may include human approval or idle time and is deliberately not
-presented as tool runtime. Ingest regenerates the projection from JSONL and
-publishes it inside the immutable read-model. Event search evidence is capped at
-512 characters and rendered commands/outputs at 360, which makes query memory
-depend on a compact event vocabulary rather than retained raw bytes. The raw
-envelopes remain authoritative and lossless for local rebuilds. *Built.*
+presented as tool runtime. Local builds retain the compact projection for
+offline compatibility. Remote S3 MCP uses the Glue/Athena raw-event path
+instead: the external table exposes each JSONL envelope as one `line` column
+and partition projection maps `(stream, day)` directly onto existing keys.
+There is no one-time data migration or crawler. Returned rows are folded into
+the same trace structures, then the existing scope and rendering logic runs.
+The raw envelopes remain authoritative and lossless. *Built.*
 
 ## Tiers and the trust boundary
 
@@ -305,7 +345,8 @@ builds/<build>.<rev>.json              manifest: filename → blob, per (build, 
 current.json                           the pointer, PUT last; readers never see
                                         a torn build; rev versions the clusters;
                                         format 2 includes analysis.json and
-                                        trace.json in each immutable build
+                                        a local-compatible trace.json, which
+                                        Athena MCP readers omit when pulling
 lease/build                            soft TTL lease electing one index builder
 ```
 
@@ -318,8 +359,9 @@ A `Bucket` trait abstracts this store (local dir always; S3/GCS behind
 `--features s3/gcs`, with conditional PUT for write-once and the lease). The
 fleet model is **no designated builder**: every tracker pushes events; whoever
 opens a local viewer pulls all raw streams and the published read-model, then
-contributes a build. MCP-only readers pull the complete published model without
-bucket write access or a raw-history mirror. Local commands can inspect and
+contributes a build. MCP-only readers pull semantic/analysis artifacts without
+bucket write access or a raw-history mirror; an S3 reader can query trace rows
+through the read-only Glue/Athena overlay. Local commands can inspect and
 rebuild from every machine, while semantic results cover the latest published
 build and warn when newer raw chunks are pending.
 Write-once stores are the collaboration primitive: a viewer encodes and
@@ -363,9 +405,10 @@ follows `Chart.appVersion`, runs each container as UID 10001 with a read-only
 root filesystem, and exposes MCP only as a cluster Service. Remote MCP is
 disabled by default; enabling it requires an application TLS Secret and a
 NetworkPolicy with explicit source selectors and object-store destination
-CIDRs. Its egress is limited to cluster DNS and those ranges on TCP 443; the
-chart accepts at most 64 ranges and rejects IPv4 prefixes broader than `/12`
-and IPv6 prefixes broader than `/32`.
+CIDRs. Athena mode additionally requires explicit AWS API destination CIDRs.
+Its egress is limited to cluster DNS and those ranges on TCP 443; each list is
+capped at 64 entries and rejects IPv4 prefixes broader than `/12` and IPv6
+prefixes broader than `/32`.
 
 ## Data compatibility
 
@@ -382,8 +425,8 @@ and IPv6 prefixes broader than `/32`.
 - **The read-model pointer carries `format` + the writer's version.** A reader
   meeting a newer format refuses to pull it and says to upgrade; an unreadable
   derived blob is a cache miss, never an error. Format 2 publishes compact
-  analysis and trace projections alongside documents, so mediated readers need
-  no raw bucket objects.
+  analysis and local trace projections alongside documents. Athena-backed MCP
+  omits the trace blob and queries bounded raw rows without mirroring them.
 
 ## What's built (kernel)
 
@@ -397,7 +440,8 @@ and the completed pointer local), `search [--filter col=value] [--json]`, `topic
 `mcp` (stdio + optional HTTP), `import`, `cluster [--resolution]`, `summarize`,
 `eval`, plus the scenario test suite (`cargo test`, pure). The bucket backplane
 (local always, S3/GCS opt-in) gives fleet-wide encode-once and collaborative
-builds. MCP-HTTP is an optional mediated transport for remote clients.
+builds. MCP-HTTP is an optional mediated transport for remote clients; the
+`athena` feature adds the read-only S3 trace path.
 Validated at M0/M1 on real data (3,938 docs / 770 K embeddings): retrieval 12/12
 relevant top-3, agent task-start dogfood 3/3, session summaries specific and
 accurate (extractive in the core; one-line abstractive from a local Qwen3-0.6B

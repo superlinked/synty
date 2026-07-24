@@ -11,18 +11,27 @@
 {{- if gt (len .Values.networkPolicy.objectStoreCidrs) 64 }}
 {{- fail "networkPolicy.objectStoreCidrs must contain at most 64 endpoint ranges" }}
 {{- end }}
-{{- range .Values.networkPolicy.objectStoreCidrs }}
+{{- if and .Values.mcp.athena.enabled (not .Values.mcp.athena.workgroup) }}
+{{- fail "mcp.athena.workgroup is required when Athena trace is enabled" }}
+{{- end }}
+{{- if and .Values.mcp.athena.enabled (not .Values.networkPolicy.awsApiCidrs) }}
+{{- fail "networkPolicy.awsApiCidrs must list Athena and credential endpoint ranges when Athena trace is enabled" }}
+{{- end }}
+{{- if gt (len .Values.networkPolicy.awsApiCidrs) 64 }}
+{{- fail "networkPolicy.awsApiCidrs must contain at most 64 endpoint ranges" }}
+{{- end }}
+{{- range concat .Values.networkPolicy.objectStoreCidrs .Values.networkPolicy.awsApiCidrs }}
 {{- if not (regexMatch `^.+/[0-9]+$` .) }}
-{{- fail "networkPolicy.objectStoreCidrs entries must be CIDR ranges" }}
+{{- fail "networkPolicy endpoint entries must be CIDR ranges" }}
 {{- end }}
 {{- $prefix := atoi (last (splitList "/" .)) }}
 {{- if contains ":" . }}
 {{- if or (lt $prefix 32) (gt $prefix 128) }}
-{{- fail "networkPolicy.objectStoreCidrs IPv6 ranges must be /32 or narrower" }}
+{{- fail "networkPolicy endpoint IPv6 ranges must be /32 or narrower" }}
 {{- end }}
 {{- else }}
 {{- if or (lt $prefix 12) (gt $prefix 32) }}
-{{- fail "networkPolicy.objectStoreCidrs IPv4 ranges must be /12 or narrower" }}
+{{- fail "networkPolicy endpoint IPv4 ranges must be /12 or narrower" }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -83,6 +92,9 @@ spec:
           args:
             - |
               set -- synty mcp --bucket "$SYNTY_BUCKET" --http --listen-public --bind "0.0.0.0:{{ .Values.mcp.port }}" --tls-cert /etc/synty/tls/tls.crt --tls-key /etc/synty/tls/tls.key --role "$SYNTY_MCP_ROLE" --scope /etc/synty/scope.json --redaction mcp_safe
+              {{- if .Values.mcp.athena.enabled }}
+              set -- "$@" --athena-workgroup {{ .Values.mcp.athena.workgroup | quote }} --athena-database {{ .Values.mcp.athena.database | quote }} --athena-table {{ .Values.mcp.athena.table | quote }}
+              {{- end }}
               {{- range .Values.mcp.allowedOrigins }}
               set -- "$@" --allowed-origin {{ . | quote }}
               {{- end }}
@@ -107,10 +119,9 @@ spec:
             - { name: tmp, mountPath: /tmp }
             - { name: scope, mountPath: /etc/synty, readOnly: true }
             - { name: tls, mountPath: /etc/synty/tls, readOnly: true }
-          # Liveness proves the transport loop is responsive. Readiness also
-          # requires the compact analysis + trace projections from a format-2
-          # published build, so agents never discover a reader that must scan
-          # the raw lake on its first request.
+          # Liveness proves the transport loop is responsive. Readiness
+          # requires the semantic index and compact analysis projection; local
+          # trace mode also requires trace.json, while Athena mode does not.
           startupProbe:
             httpGet: { path: /health, port: mcp, scheme: HTTPS }
             periodSeconds: 10
@@ -185,9 +196,9 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
-    # Reach only the configured object-store address ranges over TLS.
+    # Reach only the configured object-store and AWS API address ranges over TLS.
     - to:
-        {{- range .Values.networkPolicy.objectStoreCidrs }}
+        {{- range concat .Values.networkPolicy.objectStoreCidrs .Values.networkPolicy.awsApiCidrs }}
         - ipBlock: { cidr: {{ . | quote }} }
         {{- end }}
       ports:

@@ -149,7 +149,7 @@ struct TurnBuilder {
 }
 
 #[derive(Default)]
-struct TraceStore {
+pub(crate) struct TraceStore {
     events: Vec<TraceEvent>,
     spans: Vec<Span>,
     jobs: Vec<Job>,
@@ -444,6 +444,17 @@ impl TraceStore {
             }
         }
         Ok(builder.finish())
+    }
+
+    /// Fold a bounded raw-event selection into the same query model used by
+    /// local projections. Remote readers use this after Athena has already
+    /// pruned the event lake by stream and time.
+    #[cfg(feature = "athena")]
+    pub(crate) fn from_text(text: &str) -> Self {
+        let known: HashSet<String> = crate::config::load().repos.into_iter().collect();
+        let mut builder = SnapshotBuilder::new(known, None);
+        builder.fold_text(text);
+        builder.finish()
     }
 
     #[cfg(test)]
@@ -1029,6 +1040,29 @@ pub fn list_text(
     scope: Option<&crate::policy::ReadScope>,
 ) -> Result<String> {
     let store = TraceStore::load()?;
+    list_store_text(
+        &store, entity, repo, machine, source, status, operation, has_errors, since, min_ms, sort,
+        limit, json_out, scope,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn list_store_text(
+    store: &TraceStore,
+    entity: &str,
+    repo: Option<&str>,
+    machine: Option<&str>,
+    source: Option<&str>,
+    status: Option<&str>,
+    operation: Option<&str>,
+    has_errors: bool,
+    since: Option<&str>,
+    min_ms: Option<u64>,
+    sort: &str,
+    limit: usize,
+    json_out: bool,
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<String> {
     let out = match entity {
         "turns" => {
             let mut rows: Vec<&Turn> = store
@@ -1051,7 +1085,7 @@ pub fn list_text(
                     )
                 })
                 .filter(|t| !has_errors || t.errors > 0)
-                .filter(|t| scope_allows(&store, &t.session_id, &t.repo, &t.source, scope))
+                .filter(|t| scope_allows(store, &t.session_id, &t.repo, &t.source, scope))
                 .filter(|t| {
                     operation.is_none_or(|q| {
                         t.span_indexes
@@ -1089,7 +1123,7 @@ pub fn list_text(
                     )
                 })
                 .filter(|s| operation.is_none_or(|q| span_operation_matches(s, q)))
-                .filter(|s| scope_allows(&store, &s.session_id, &s.repo, &s.source, scope))
+                .filter(|s| scope_allows(store, &s.session_id, &s.repo, &s.source, scope))
                 .collect();
             sort_spans(&mut rows, sort);
             rows.truncate(limit);
@@ -1120,7 +1154,7 @@ pub fn list_text(
                     )
                 })
                 .filter(|j| !has_errors || j.errors > 0)
-                .filter(|j| scope_allows(&store, &j.session_id, &j.repo, &j.source, scope))
+                .filter(|j| scope_allows(store, &j.session_id, &j.repo, &j.source, scope))
                 .filter(|j| operation.is_none_or(|q| job_operation_matches(j, q)))
                 .collect();
             sort_jobs(&mut rows, sort);
@@ -1248,14 +1282,25 @@ pub fn show_text(
     scope: Option<&crate::policy::ReadScope>,
 ) -> Result<String> {
     let store = TraceStore::load()?;
-    let resolved = resolve(&store, id, scope)?;
-    anyhow::ensure!(resolved_allowed(&store, &resolved, scope), "trace id is outside the read scope");
+    show_store_text(&store, id, before, after, json_out, scope)
+}
+
+pub(crate) fn show_store_text(
+    store: &TraceStore,
+    id: &str,
+    before: usize,
+    after: usize,
+    json_out: bool,
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<String> {
+    let resolved = resolve(store, id, scope)?;
+    anyhow::ensure!(resolved_allowed(store, &resolved, scope), "trace id is outside the read scope");
     match resolved {
-        Resolved::Job(i) => show_job_text(&store, i, json_out),
-        Resolved::Turn(i) => show_turn_text(&store, i, json_out),
-        Resolved::Span(i) => show_span_text(&store, i, before, after, json_out),
-        Resolved::Event(i) => show_event_text(&store, i, before, after, json_out),
-        Resolved::Session(sid) => show_session_text(&store, &sid, json_out),
+        Resolved::Job(i) => show_job_text(store, i, json_out),
+        Resolved::Turn(i) => show_turn_text(store, i, json_out),
+        Resolved::Span(i) => show_span_text(store, i, before, after, json_out),
+        Resolved::Event(i) => show_event_text(store, i, before, after, json_out),
+        Resolved::Session(sid) => show_session_text(store, &sid, json_out),
     }
 }
 
@@ -1271,15 +1316,25 @@ pub fn compare_text(
     scope: Option<&crate::policy::ReadScope>,
 ) -> Result<String> {
     let store = TraceStore::load()?;
-    let left_resolved = resolve(&store, left, scope)?;
-    let right_resolved = resolve(&store, right, scope)?;
+    compare_store_text(&store, left, right, json_out, scope)
+}
+
+pub(crate) fn compare_store_text(
+    store: &TraceStore,
+    left: &str,
+    right: &str,
+    json_out: bool,
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<String> {
+    let left_resolved = resolve(store, left, scope)?;
+    let right_resolved = resolve(store, right, scope)?;
     anyhow::ensure!(
-        resolved_allowed(&store, &left_resolved, scope)
-            && resolved_allowed(&store, &right_resolved, scope),
+        resolved_allowed(store, &left_resolved, scope)
+            && resolved_allowed(store, &right_resolved, scope),
         "trace id is outside the read scope"
     );
-    let l = comparable(&store, left_resolved)?;
-    let r = comparable(&store, right_resolved)?;
+    let l = comparable(store, left_resolved)?;
+    let r = comparable(store, right_resolved)?;
     let mut differences = Vec::new();
     if let (Some(lm), Some(rm)) = (l.as_object(), r.as_object()) {
         let mut keys: Vec<&String> = lm.keys().chain(rm.keys()).collect();
@@ -1327,7 +1382,25 @@ pub fn search_text(
         bail!("trace search: query cannot be empty");
     }
     let store = TraceStore::load()?;
-    let hits = search_hits(&store, query, repo, machine, source, kind, limit, scope);
+    search_store_text(&store, query, repo, machine, source, kind, limit, json_out, scope)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_store_text(
+    store: &TraceStore,
+    query: &str,
+    repo: Option<&str>,
+    machine: Option<&str>,
+    source: Option<&str>,
+    kind: Option<&str>,
+    limit: usize,
+    json_out: bool,
+    scope: Option<&crate::policy::ReadScope>,
+) -> Result<String> {
+    if query.trim().is_empty() {
+        bail!("trace search: query cannot be empty");
+    }
+    let hits = search_hits(store, query, repo, machine, source, kind, limit, scope);
     if json_out {
         Ok(crate::view::envelope("trace_search", json!(hits)))
     } else {

@@ -21,9 +21,10 @@ pub fn run(
     scope: crate::policy::ReadScope,
     redaction: crate::redact::Profile,
     bucket: Option<String>,
+    athena: Option<AthenaTraceOptions>,
 ) -> Result<()> {
-    start_bucket_refresh(bucket.clone());
-    let mut srv = Server::new(model_id, role, scope, redaction, true, bucket);
+    start_bucket_refresh(bucket.clone(), athena.is_none());
+    let mut srv = Server::new(model_id, role, scope, redaction, true, bucket, athena);
     eprintln!("synty mcp: serving tools over stdio");
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -41,12 +42,158 @@ pub fn run(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "athena"), allow(dead_code))]
+pub(crate) struct AthenaTraceOptions {
+    pub(crate) workgroup: String,
+    pub(crate) database: String,
+    pub(crate) table: String,
+}
+
+enum TraceBackend {
+    Local,
+    #[cfg(feature = "athena")]
+    Athena(Box<crate::trace_athena::Backend>),
+    Unavailable(String),
+}
+
+impl TraceBackend {
+    fn new(bucket: Option<&str>, options: Option<AthenaTraceOptions>) -> Self {
+        let Some(options) = options else { return Self::Local };
+        let Some(bucket) = bucket else {
+            return Self::Unavailable("--athena-workgroup requires --bucket s3://...".into());
+        };
+        #[cfg(feature = "athena")]
+        {
+            let result = crate::trace_athena::Config::new(
+                bucket.to_string(),
+                options.workgroup,
+                options.database,
+                options.table,
+            )
+            .and_then(crate::trace_athena::Backend::new);
+            match result {
+                Ok(backend) => Self::Athena(Box::new(backend)),
+                Err(error) => Self::Unavailable(error.to_string()),
+            }
+        }
+        #[cfg(not(feature = "athena"))]
+        {
+            let _ = (bucket, options);
+            Self::Unavailable(
+                "Athena trace is not in this binary; rebuild with --features athena".into(),
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn list(
+        &mut self,
+        entity: &str,
+        repo: Option<&str>,
+        machine: Option<&str>,
+        source: Option<&str>,
+        status: Option<&str>,
+        operation: Option<&str>,
+        has_errors: bool,
+        since: Option<&str>,
+        min_ms: Option<u64>,
+        sort: &str,
+        limit: usize,
+        scope: &crate::policy::ReadScope,
+    ) -> Result<String> {
+        match self {
+            Self::Local => trace::list_text(
+                entity,
+                repo,
+                machine,
+                source,
+                status,
+                operation,
+                has_errors,
+                since,
+                min_ms,
+                sort,
+                limit,
+                false,
+                Some(scope),
+            ),
+            #[cfg(feature = "athena")]
+            Self::Athena(backend) => backend.list(
+                entity, repo, machine, source, status, operation, has_errors, since, min_ms, sort,
+                limit, scope,
+            ),
+            Self::Unavailable(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+
+    fn show(
+        &mut self,
+        id: &str,
+        before: usize,
+        after: usize,
+        scope: &crate::policy::ReadScope,
+    ) -> Result<String> {
+        match self {
+            Self::Local => trace::show_text(id, before, after, false, Some(scope)),
+            #[cfg(feature = "athena")]
+            Self::Athena(backend) => backend.show(id, before, after, scope),
+            Self::Unavailable(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search(
+        &mut self,
+        query: &str,
+        repo: Option<&str>,
+        machine: Option<&str>,
+        source: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+        scope: &crate::policy::ReadScope,
+    ) -> Result<String> {
+        match self {
+            Self::Local => trace::search_text(
+                query,
+                repo,
+                machine,
+                source,
+                kind,
+                limit,
+                false,
+                Some(scope),
+            ),
+            #[cfg(feature = "athena")]
+            Self::Athena(backend) => {
+                backend.search(query, repo, machine, source, kind, limit, scope)
+            }
+            Self::Unavailable(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+
+    fn compare(
+        &mut self,
+        left: &str,
+        right: &str,
+        scope: &crate::policy::ReadScope,
+    ) -> Result<String> {
+        match self {
+            Self::Local => trace::compare_text(left, right, false, Some(scope)),
+            #[cfg(feature = "athena")]
+            Self::Athena(backend) => backend.compare(left, right, scope),
+            Self::Unavailable(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+}
+
 pub(crate) struct Server {
     model_id: String,
     role: crate::policy::McpRole,
     scope: crate::policy::ReadScope,
     redaction: crate::redact::Profile,
     allow_repo_paths: bool,
+    trace: TraceBackend,
     /// The build the engine serves + encoder + index — loaded on the first
     /// search call, kept warm, reopened when the pointer moves.
     engine: Option<(readmodel::Current, Encoder, MmapIndex)>,
@@ -59,14 +206,17 @@ impl Server {
         scope: crate::policy::ReadScope,
         redaction: crate::redact::Profile,
         allow_repo_paths: bool,
-        _bucket: Option<String>,
+        bucket: Option<String>,
+        athena: Option<AthenaTraceOptions>,
     ) -> Self {
+        let trace = TraceBackend::new(bucket.as_deref(), athena);
         Self {
             model_id,
             role,
             scope,
             redaction,
             allow_repo_paths,
+            trace,
             engine: None,
         }
     }
@@ -137,7 +287,7 @@ impl Server {
                 if entity.is_empty() {
                     Err(anyhow::anyhow!("type is required (turns, spans, or jobs)"))
                 } else {
-                    trace::list_text(
+                    self.trace.list(
                         entity,
                         string_arg(a, "repo"),
                         string_arg(a, "machine"),
@@ -149,8 +299,7 @@ impl Server {
                         a["min_ms"].as_u64(),
                         a["sort"].as_str().unwrap_or("recent"),
                         bounded_positive(a, "limit", 20, 100),
-                        false,
-                        Some(&self.scope),
+                        &self.scope,
                     )
                 }
             }
@@ -159,12 +308,11 @@ impl Server {
                 if id.is_empty() {
                     Err(anyhow::anyhow!("id is required — trace ids appear in synty_trace_list"))
                 } else {
-                    trace::show_text(
+                    self.trace.show(
                         id,
                         bounded(a, "before", 6, 100),
                         bounded(a, "after", 12, 100),
-                        false,
-                        Some(&self.scope),
+                        &self.scope,
                     )
                 }
             }
@@ -175,15 +323,14 @@ impl Server {
                 } else if query.chars().count() > 4096 {
                     Err(anyhow::anyhow!("query exceeds 4096 characters"))
                 } else {
-                    trace::search_text(
+                    self.trace.search(
                         query,
                         string_arg(a, "repo"),
                         string_arg(a, "machine"),
                         string_arg(a, "source"),
                         string_arg(a, "kind"),
                         bounded_positive(a, "limit", 20, 100),
-                        false,
-                        Some(&self.scope),
+                        &self.scope,
                     )
                 }
             }
@@ -193,7 +340,7 @@ impl Server {
                 if left.is_empty() || right.is_empty() {
                     Err(anyhow::anyhow!("left and right trace ids are required"))
                 } else {
-                    trace::compare_text(left, right, false, Some(&self.scope))
+                    self.trace.compare(left, right, &self.scope)
                 }
             }
             other => return Err(format!("unknown tool: {other}")),
@@ -275,13 +422,12 @@ impl Server {
     }
 }
 
-/// Keep the complete published read model fresh without holding the MCP
-/// dispatcher lock. Format-2 builds include compact session and trace
-/// projections, so a mediated reader never downloads the raw event lake.
-pub(crate) fn start_bucket_refresh(bucket: Option<String>) {
+/// Keep the selected published model fresh without holding the dispatcher.
+/// Athena readers omit trace.json; neither mode mirrors the raw event lake.
+pub(crate) fn start_bucket_refresh(bucket: Option<String>, include_trace: bool) {
     let Some(bucket) = bucket else { return };
     std::thread::spawn(move || loop {
-        crate::sync::pull_read_model_for_read(&bucket);
+        crate::sync::pull_read_model_for_mcp(&bucket, include_trace);
         std::thread::sleep(std::time::Duration::from_secs(30));
     });
 }
@@ -461,6 +607,7 @@ mod tests {
             crate::redact::Profile::Off,
             true,
             None,
+            None,
         )
     }
 
@@ -493,6 +640,7 @@ mod tests {
             crate::policy::ReadScope { repos: vec!["synty".into()], ..Default::default() },
             crate::redact::Profile::Off,
             true,
+            None,
             None,
         );
         let listed = server.handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap();

@@ -120,13 +120,20 @@ pub fn trace_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("corpus/trace.json"))
 }
 
-/// Strict readiness for mediated readers: format-2 builds carry the compact
-/// raw-derived projections that keep requests bounded independently of raw
-/// retention. Older search-only builds remain usable by local CLI fallbacks.
+/// Strict readiness for mediated readers. Athena-backed trace readers require
+/// only the compact analysis projection; local trace readers additionally
+/// require the published trace snapshot.
 #[cfg(feature = "mcp-http")]
-pub fn mediated_ready() -> bool {
-    current().is_some_and(|current| {
-        current.format >= FORMAT && current.analysis().is_file() && current.trace().is_file()
+pub fn mediated_ready(require_trace: bool) -> bool {
+    mediated_ready_from(current(), require_trace)
+}
+
+#[cfg(feature = "mcp-http")]
+fn mediated_ready_from(current: Option<Current>, require_trace: bool) -> bool {
+    current.is_some_and(|current| {
+        current.format >= FORMAT
+            && current.analysis().is_file()
+            && (!require_trace || current.trace().is_file())
     })
 }
 
@@ -244,6 +251,29 @@ mod tests {
             build_id(&[1, 2, 3], &[7, 9]),
             "analysis-only changes publish a new immutable build"
         );
+    }
+
+    #[cfg(feature = "mcp-http")]
+    #[test]
+    fn mediated_readiness_requires_trace_only_for_projection_mode() {
+        let dir =
+            std::env::temp_dir().join(format!("synty-mediated-ready-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("analysis.json"), b"{}").unwrap();
+        let current = Current {
+            build: dir.to_string_lossy().into_owned(),
+            rev: 0,
+            format: FORMAT,
+            writer: String::new(),
+        };
+
+        assert!(mediated_ready_from(Some(current.clone()), false));
+        assert!(!mediated_ready_from(Some(current.clone()), true));
+        std::fs::write(dir.join("trace.json"), b"{}").unwrap();
+        assert!(mediated_ready_from(Some(current), true));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

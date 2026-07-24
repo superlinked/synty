@@ -19,10 +19,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
       - run: cargo test --locked --no-default-features
-      - run: cargo test --locked --features s3,gcs,mcp-http
+      - run: cargo test --locked --features s3,gcs,mcp-http,athena
       - name: Exercise the HTTP MCP listener
         run: |
-          cargo build --locked --features s3,gcs,mcp-http
+          cargo build --locked --features s3,gcs,mcp-http,athena
           scripts/mcp-http-smoke.sh target/debug/synty
       - run: git diff --check
 
@@ -75,13 +75,18 @@ jobs:
           --set mcp.enabled=true
           --set mcp.tls.existingSecret=synty-mcp-tls
           --set mcp.allowedOrigins[0]=https://memory.example.com
+          --set mcp.athena.enabled=true
+          --set mcp.athena.workgroup=synty-mcp-readonly
           --set-json 'networkPolicy.objectStoreCidrs=["203.0.113.10/32"]'
+          --set-json 'networkPolicy.awsApiCidrs=["198.51.100.20/32"]'
           --set persistence.enabled=false >/tmp/synty-options.yaml
       - name: Assert MCP probe and egress contracts
         run: |
           grep -q 'path: /ready' /tmp/synty-options.yaml
           grep -q 'scheme: HTTPS' /tmp/synty-options.yaml
           grep -q '203.0.113.10/32' /tmp/synty-options.yaml
+          grep -q -- '--athena-workgroup "synty-mcp-readonly"' /tmp/synty-options.yaml
+          grep -q '198.51.100.20/32' /tmp/synty-options.yaml
           if grep -q -- '- {}' /tmp/synty-options.yaml; then
             echo "MCP rendered an unrestricted NetworkPolicy rule" >&2
             exit 1

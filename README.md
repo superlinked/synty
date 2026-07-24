@@ -115,6 +115,7 @@ synty import run.ndjson --format harness --machine eval-1 --campaign c42 \
 # Streamable HTTP; a non-loopback bind additionally requires HTTPS material.
 synty mcp --role investigator --scope scope.json --redaction mcp_safe
 SYNTY_MCP_TOKEN="$token" synty mcp --http --bind 0.0.0.0:8765 \
+  --bucket s3://my-team-synty --athena-workgroup synty-mcp-readonly \
   --listen-public --tls-cert tls.crt --tls-key tls.key \
   --allowed-origin https://memory.example.com --scope scope.json
 ```
@@ -168,11 +169,15 @@ tracker starts at boot without an SSH login, then run `init` normally:
 sudo loginctl enable-linger "$USER"
 ```
 
-That bucket is the only shared infrastructure: no build server, no coordination
-service. Each machine writes a stable `edge-<machine>-<source>` stream, so
+The bucket is the durable shared backplane; an S3 deployment may optionally add
+Glue catalog metadata and a bounded Athena workgroup for remote trace queries.
+There is still no migration, crawler, build server, or coordination service.
+Each machine writes a stable `edge-<machine>-<source>` stream, so
 writers do not overwrite one another. Local readers and builders pull every
-stream plus the latest published read-model. MCP-only readers pull just that
-read-model, which includes compact session, tool, fleet, and trace projections.
+stream plus the latest published read-model. MCP-only readers pull the semantic
+index and compact analysis projection. With `--athena-workgroup`, their trace
+tools query time/stream-pruned raw event rows directly and do not download
+`trace.json` or mirror raw chunks.
 A bounded stream registry and per-stream local key cursors avoid relisting
 historical chunks on each local read. The TUI builds unpublished event deltas in the background;
 `synty build` does the same explicitly, while `search` warns if raw events are
@@ -198,10 +203,12 @@ For S3, scope each writer/reader role to the chosen bucket (or URI prefix):
 `s3:DeleteObject` on its objects. Delete is used only to release the soft build
 lease; event chunks and content-addressed derived objects are immutable.
 An MCP-only workload needs no writes: `deploy/aws/mcp-reader.yaml` creates an
-IRSA role with only bucket location/list and object get permissions. Use it
-with the tracker and builder disabled. If EKS and S3 are in different regions,
-set Helm's `bucketRegion` to the bucket's region so requests are signed for the
-correct endpoint.
+IRSA role with bucket location/list/object-get plus query-only access to one
+Athena workgroup and one Glue table. `deploy/aws/athena-trace.yaml` creates that
+external table and a managed-results workgroup without writing, crawling, or
+rewriting bucket objects. Use it with the tracker and builder disabled. If EKS
+and S3 are in different regions, set Helm's `bucketRegion` to the bucket's
+region so S3 and Athena requests are signed there.
 
 A one-shot local projection migration can still reuse that bucket's existing
 fleet embeddings without broadening the reader role:
@@ -227,11 +234,16 @@ name native producers such as `harness`, `codex_cli`, or `github`. Restricted
 scopes omit fleet-wide status/stat/tool surfaces and rebuild topic facets only
 from allowed members. HTTP `synty_related` accepts client-supplied `context`
 and never reads a caller-provided path on the server.
-MCP pulls the complete published read-model before serving and refreshes it on
-a background thread; it never mirrors the raw event lake. Format-2 builds carry
-compact session/tool/fleet facts plus a trace projection whose searchable
-evidence, commands, and outputs are capped per event. `/health` reports
-transport liveness and `/ready` waits for both projections. Analysis tools are
+MCP pulls the published semantic index and compact analysis projection before
+serving and refreshes them on a background thread; it never mirrors the raw
+event lake. In Athena mode it deliberately omits the legacy `trace.json` blob.
+Each trace request is a read-only `SELECT`, partition-pruned by stream and day,
+limited to seven days, 50,000 events, 64 MiB of returned envelopes, a 50-second
+query timeout, and the workgroup's 20 GiB scan cutoff. Limit hits fail closed
+and ask the caller for a narrower time/machine/source/operation filter.
+`/health` reports transport liveness and `/ready` waits for the semantic index
+and analysis projection, plus both dispatchers (`trace.json` is required only
+in local-projection mode). Analysis tools are
 serialized on a one-slot dispatcher so concurrent first loads cannot multiply
 memory. HTTP work is bounded by separate semantic and analysis queues, a
 120-second response deadline, 32 in-flight requests, 64 live connections,
@@ -248,8 +260,9 @@ tags build each architecture on a native GitHub runner, then publish a verified
 `deploy/aws/ecr-publisher.yaml` once and set the repository variable
 `AWS_ECR_PUBLISH_ROLE_ARN` to its role output. Remote MCP is disabled by default;
 enabling it requires a TLS Secret and a NetworkPolicy whose source selectors
-name trusted callers. The policy also requires explicit object-store CIDRs;
-cluster DNS and only those destinations on TCP 443 are allowed for egress.
+name trusted callers. The policy also requires explicit object-store CIDRs and,
+in Athena mode, regional AWS API CIDRs; cluster DNS and only those destinations
+on TCP 443 are allowed for egress.
 CIDR configuration is capped at 64 ranges and rejects IPv4 prefixes broader
 than `/12` or IPv6 prefixes broader than `/32`, including split-default-route
 combinations. The Service remains cluster-internal, and its default ingress
@@ -280,12 +293,12 @@ on-real-data validation lives in [`evals/`](evals/).
 
 ```sh
 cargo build --release                          # plain CPU, portable (the shipped core)
-cargo build --release --features s3,gcs,mcp-http   # team + remote MCP container build
+cargo build --release --features s3,gcs,mcp-http,athena   # team + remote MCP container build
 ```
 
 On Apple Silicon, add `--features metal` for GPU encode (~5.7× faster);
 `accelerate` (macOS) and `mkl` (Linux) are CPU-BLAS alternatives. Release assets
-and the Dockerfile include `mcp-http`. The embedding model (~127 MB) downloads
+and the Dockerfile include `mcp-http` and `athena`. The embedding model (~127 MB) downloads
 on first use; the summarizer (~1.2 GB) the first time anything summarizes. For
 an air-gapped setup and the per-stage pipeline, see
 [`docs/design.md`](docs/design.md) and [CONTRIBUTING](CONTRIBUTING.md).
