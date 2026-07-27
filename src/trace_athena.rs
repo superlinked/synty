@@ -729,6 +729,33 @@ mod tests {
     }
 
     #[test]
+    fn parquet_line_table_preserves_the_raw_query_contract() {
+        let config = Config::new(
+            "s3://bucket".into(),
+            "wg".into(),
+            "synty".into(),
+            "trace_events_v1".into(),
+        )
+        .unwrap();
+        let sql = select_sql(
+            &config,
+            &["edge-m-codex".into()],
+            Window {
+                since: parse_time("2026-07-23T10:00:00Z").unwrap(),
+                until: parse_time("2026-07-23T11:00:00Z").unwrap(),
+            },
+            &Predicate::default(),
+            20,
+        )
+        .unwrap();
+
+        assert!(sql.starts_with("SELECT line"));
+        assert!(sql.contains("FROM \"synty\".\"trace_events_v1\""));
+        assert!(sql.contains("stream IN ('edge-m-codex')"));
+        assert!(sql.contains("day BETWEEN '2026-07-23' AND '2026-07-23'"));
+    }
+
+    #[test]
     fn raw_athena_rows_reconstruct_the_existing_span_surface() {
         let lines = vec![
             event(

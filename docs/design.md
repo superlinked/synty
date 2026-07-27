@@ -46,8 +46,11 @@ flowchart LR
     B --> P["Published next-plaid read model"]
     E --> B
     P -->|"download + mmap"| MCP["Read-only MCP"]
-    S3 -->|"external table; no migration"| G["Glue Data Catalog"]
+    S3 -->|"external table; zero-copy fallback"| G["Glue raw_events"]
+    S3 -.->|"separate authorized projector"| Q["Immutable Parquet copy"]
+    Q --> GP["Glue trace_events_v1"]
     G --> A["Bounded Athena SELECT"]
+    GP --> A
     A -->|"bounded raw envelopes"| F["Rust trace fold"]
     F --> MCP
     MCP --> H["Harness agents"]
@@ -63,10 +66,15 @@ volume. Local CLI/TUI operation stays self-contained and can use the local
 projection offline.
 
 The raw-table overlay is the zero-copy bootstrap, not a columnar rewrite:
-Athena still scans the selected JSONL object bytes. If daily raw volume reaches
-the workgroup cutoff, a follow-up can write a separate immutable Parquet
-projection partitioned for session lookup while leaving the authoritative raw
-prefix untouched. This path deliberately creates no compaction job or migration.
+Athena still scans selected JSONL object bytes. The catalog also defines an
+empty, schema-compatible Parquet table under a separate derived prefix. A
+separately authorized projector can backfill existing `(stream, day)`
+partitions and compact new closed days without moving or deleting raw objects;
+the read-only MCP then switches table names without changing its query or fold.
+The catalog/read path is built. The projector and typed turn/span/job Parquet
+tables are not: line-compatible Parquet reduces scan and small-file overhead,
+but precomputed entities are the later step that removes the 64 MiB
+raw-envelope transfer ceiling for broad forensic queries.
 
 ## Engine
 
@@ -274,7 +282,11 @@ instead: the external table exposes each JSONL envelope as one `line` column
 and partition projection maps `(stream, day)` directly onto existing keys.
 There is no one-time data migration or crawler. Returned rows are folded into
 the same trace structures, then the existing scope and rendering logic runs.
-The raw envelopes remain authoritative and lossless. *Built.*
+An optional Parquet table preserves that exact three-column query contract at a
+separate derived prefix, allowing a no-code reader switch after a historical
+backfill. The JSONL objects remain authoritative and lossless; backfill copies
+and compacts them but never relocates them. *Raw and Parquet catalog/read
+contracts built; projector planned.*
 
 ## Tiers and the trust boundary
 

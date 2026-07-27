@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Read-only Glue catalog and bounded Athena workgroup for Synty raw event traces
+Description: Read-only Glue catalog and bounded Athena workgroup for Synty raw and Parquet event traces
 
 Parameters:
   BucketName:
@@ -12,6 +12,15 @@ Parameters:
     Type: String
     Default: raw_events
     AllowedPattern: "[a-z0-9_]+"
+  ParquetTableName:
+    Type: String
+    Default: trace_events_v1
+    AllowedPattern: "[a-z0-9_]+"
+  ParquetPrefix:
+    Type: String
+    Default: derived/trace-events/v1
+    AllowedPattern: "[a-zA-Z0-9/_-]+"
+    Description: Empty derived prefix populated separately; raw event objects are never moved.
   WorkGroupName:
     Type: String
     Default: synty-mcp-readonly
@@ -78,11 +87,53 @@ Resources:
             Parameters:
               input.regex: "^(.*)$"
 
+  ParquetEventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref TraceDatabase
+      TableInput:
+        Name: !Ref ParquetTableName
+        Description: Optional immutable Parquet copy of Synty event envelopes
+        Owner: synty
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: "TRUE"
+          classification: parquet
+          projection.enabled: "true"
+          projection.stream.type: injected
+          projection.day.type: date
+          projection.day.format: yyyy-MM-dd
+          projection.day.interval: "1"
+          projection.day.interval.unit: DAYS
+          projection.day.range: !Sub "${FirstEventDay},NOW"
+          storage.location.template: !Sub
+            - "s3://${Bucket}/${Prefix}/stream=${!stream}/day=${!day}/"
+            - Bucket: !Ref BucketName
+              Prefix: !Ref ParquetPrefix
+        PartitionKeys:
+          - Name: stream
+            Type: string
+          - Name: day
+            Type: string
+        StorageDescriptor:
+          Columns:
+            - Name: line
+              Type: string
+              Comment: Complete immutable event envelope
+          Compressed: true
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          Location: !Sub "s3://${BucketName}/${ParquetPrefix}/"
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            Name: synty-parquet-line
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+
   TraceWorkGroup:
     Type: AWS::Athena::WorkGroup
     Properties:
       Name: !Ref WorkGroupName
-      Description: Read-only bounded queries over Synty raw event envelopes
+      Description: Read-only bounded queries over Synty event envelopes
       State: ENABLED
       RecursiveDeleteOption: true
       WorkGroupConfiguration:
@@ -105,5 +156,9 @@ Outputs:
     Value: !Ref TraceDatabase
   TableName:
     Value: !Ref RawEventsTable
+  ParquetTableName:
+    Value: !Ref ParquetEventsTable
+  ParquetPrefix:
+    Value: !Ref ParquetPrefix
   WorkGroupName:
     Value: !Ref TraceWorkGroup

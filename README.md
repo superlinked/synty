@@ -204,11 +204,15 @@ For S3, scope each writer/reader role to the chosen bucket (or URI prefix):
 lease; event chunks and content-addressed derived objects are immutable.
 An MCP-only workload needs no writes: `deploy/aws/mcp-reader.yaml` creates an
 IRSA role with bucket location/list/object-get plus query-only access to one
-Athena workgroup and one Glue table. `deploy/aws/athena-trace.yaml` creates that
-external table and a managed-results workgroup without writing, crawling, or
-rewriting bucket objects. Use it with the tracker and builder disabled. If EKS
-and S3 are in different regions, set Helm's `bucketRegion` to the bucket's
-region so S3 and Athena requests are signed there.
+Athena workgroup and the raw/Parquet Glue tables.
+`deploy/aws/athena-trace.yaml` creates the existing JSONL overlay, an empty
+schema-compatible `trace_events_v1` Parquet table, and a managed-results
+workgroup without crawling or rewriting bucket objects. Raw remains the default.
+After a separately authorized projector fills the derived prefix, set
+`mcp.athena.table=trace_events_v1`; the MCP reader needs no write permission or
+binary change. Use it with the tracker and builder disabled. If EKS and S3 are
+in different regions, set Helm's `bucketRegion` to the bucket's region so S3
+and Athena requests are signed there.
 
 A one-shot local projection migration can still reuse that bucket's existing
 fleet embeddings without broadening the reader role:
@@ -241,6 +245,13 @@ Each trace request is a read-only `SELECT`, partition-pruned by stream and day,
 limited to seven days, 50,000 events, 64 MiB of returned envelopes, a 50-second
 query timeout, and the workgroup's 20 GiB scan cutoff. Limit hits fail closed
 and ask the caller for a narrower time/machine/source/operation filter.
+The optional Parquet table preserves the same `line`, `stream`, and `day`
+contract, so it reduces raw-byte scanning and compacts small JSONL objects
+without changing trace semantics. It is an additive derived copy: historical
+coverage needs a one-time backfill and new closed-day partitions need an
+incremental projector. Neither operation moves or deletes raw JSONL.
+The immutable layout, validation contract, and typed-entity follow-up are in
+[`docs/parquet-traces.md`](docs/parquet-traces.md).
 `/health` reports transport liveness and `/ready` waits for the semantic index
 and analysis projection, plus both dispatchers (`trace.json` is required only
 in local-projection mode). Analysis tools are

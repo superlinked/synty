@@ -30,6 +30,9 @@ Parameters:
   GlueTable:
     Type: String
     Default: raw_events
+  GlueParquetTable:
+    Type: String
+    Default: trace_events_v1
 
 Resources:
   ReaderRole:
@@ -81,6 +84,7 @@ Resources:
                   - !Sub arn:${AWS::Partition}:glue:${AthenaRegion}:${AWS::AccountId}:catalog
                   - !Sub arn:${AWS::Partition}:glue:${AthenaRegion}:${AWS::AccountId}:database/${GlueDatabase}
                   - !Sub arn:${AWS::Partition}:glue:${AthenaRegion}:${AWS::AccountId}:table/${GlueDatabase}/${GlueTable}
+                  - !Sub arn:${AWS::Partition}:glue:${AthenaRegion}:${AWS::AccountId}:table/${GlueDatabase}/${GlueParquetTable}
 
 Outputs:
   ReaderRoleArn:
