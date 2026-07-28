@@ -1700,22 +1700,52 @@ mod tests {
             last_indexed: None,
             last_tracked: None,
             autostart: false,
-            bucket: None,
+            bucket: Some("s3://team-synty".into()),
             upgrade: None,
-            bucket_newest_event: None,
-            bucket_published_read_model: None,
-            bucket_read_model_format: None,
-            bucket_checked_at: None,
-            bucket_freshness_error: None,
+            bucket_newest_event: Some("2026-07-22T11:00:00Z".into()),
+            bucket_published_read_model: Some("2026-07-22T12:00:00Z".into()),
+            bucket_read_model_format: Some(2),
+            bucket_checked_at: Some("2026-07-22T12:01:00Z".into()),
+            bucket_freshness_error: Some("raw index unavailable".into()),
             stale: false,
             fleet: Default::default(),
         };
-        let s: serde_json::Value = serde_json::from_str(&status_json(&s)).unwrap();
-        assert_eq!((s["v"].as_i64(), s["kind"].as_str()), (Some(1), Some("status")));
-        assert_eq!(s["data"]["docs"], 3, "the data keeps the prior object shape");
-        assert!(s["data"]["fleet"]["machines"].is_array());
-        // Activation + the upgrade nag are exposed to agents (null here).
-        let data = s["data"].as_object().unwrap();
+        let markdown = status_md(&s);
+        for value in [
+            "2026-07-22T11:00:00Z",
+            "2026-07-22T12:00:00Z",
+            "format: 2",
+            "2026-07-22T12:01:00Z",
+            "raw index unavailable",
+        ] {
+            assert!(markdown.contains(value), "missing {value} from:\n{markdown}");
+        }
+        let json: serde_json::Value = serde_json::from_str(&status_json(&s)).unwrap();
+        assert_eq!(
+            (json["v"].as_i64(), json["kind"].as_str()),
+            (Some(1), Some("status"))
+        );
+        assert_eq!(json["data"]["docs"], 3, "the data keeps the prior object shape");
+        assert!(json["data"]["fleet"]["machines"].is_array());
+        assert_eq!(
+            json["data"]["bucket_newest_event"],
+            "2026-07-22T11:00:00Z"
+        );
+        assert_eq!(
+            json["data"]["bucket_published_read_model"],
+            "2026-07-22T12:00:00Z"
+        );
+        assert_eq!(json["data"]["bucket_read_model_format"], 2);
+        assert_eq!(
+            json["data"]["bucket_checked_at"],
+            "2026-07-22T12:01:00Z"
+        );
+        assert_eq!(
+            json["data"]["bucket_freshness_error"],
+            "raw index unavailable"
+        );
+        // Activation + the upgrade nag remain explicit fields for agents.
+        let data = json["data"].as_object().unwrap();
         assert!(data.contains_key("bucket"), "activation in json");
         assert!(data.contains_key("upgrade"), "upgrade availability in json");
     }

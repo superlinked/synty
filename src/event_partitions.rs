@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const PREFIX: &str = "event-partitions";
 const FORMAT: u32 = 1;
+const WRITER_LAYOUT: u32 = 1;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct EventTimeRange {
@@ -21,10 +22,17 @@ pub(crate) struct EventTimeRange {
 
 impl EventTimeRange {
     fn record(&mut self, ts: &str) {
-        if self.min_ts.is_empty() || ts < self.min_ts.as_str() {
+        let Some(timestamp) = parse_time(ts) else {
+            return;
+        };
+        if self.min_ts.is_empty()
+            || parse_time(&self.min_ts).is_some_and(|current| timestamp < current)
+        {
             self.min_ts = ts.to_string();
         }
-        if self.max_ts.is_empty() || ts > self.max_ts.as_str() {
+        if self.max_ts.is_empty()
+            || parse_time(&self.max_ts).is_some_and(|current| timestamp > current)
+        {
             self.max_ts = ts.to_string();
         }
     }
@@ -53,6 +61,16 @@ pub(crate) struct EventPartitionIndex {
     /// Physical day → inclusive event-time range for every object in that day.
     #[serde(default)]
     pub partitions: BTreeMap<String, EventTimeRange>,
+    /// Highest immutable object key published for each event day. Readers
+    /// compare this watermark with their per-day cursor and list only days
+    /// that changed, including a newly published older day.
+    #[serde(default)]
+    pub object_cursors: BTreeMap<String, String>,
+    /// New writers maintain `object_cursors`. Missing means an older writer
+    /// may still append outside those watermarks and needs the compatibility
+    /// stream scan.
+    #[serde(default)]
+    pub writer_layout: u32,
     #[serde(default)]
     pub updated_at: String,
 }
@@ -68,16 +86,10 @@ impl EventPartitionIndex {
             stream: stream.to_string(),
             legacy_days: BTreeSet::new(),
             partitions: BTreeMap::new(),
+            object_cursors: BTreeMap::new(),
+            writer_layout: 0,
             updated_at: String::new(),
         }
-    }
-
-    pub(crate) fn physical_days(&self) -> BTreeSet<String> {
-        self.legacy_days
-            .iter()
-            .chain(self.partitions.keys())
-            .cloned()
-            .collect()
     }
 
     #[cfg_attr(not(feature = "athena"), allow(dead_code))]
@@ -102,6 +114,13 @@ impl EventPartitionIndex {
             .filter_map(|range| parse_time(&range.max_ts))
             .max()
             .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+    }
+
+    pub(crate) fn record_object(&mut self, day: &str, key: &str) {
+        let cursor = self.object_cursors.entry(day.to_string()).or_default();
+        if key > cursor.as_str() {
+            *cursor = key.to_string();
+        }
     }
 
     /// Mark a historical physical day as completely indexed. This is the
@@ -256,6 +275,7 @@ pub(crate) fn load_or_initialize(bucket: &dyn Bucket, stream: &str) -> Result<Ev
 
 pub(crate) fn save(bucket: &dyn Bucket, index: &EventPartitionIndex) -> Result<()> {
     let mut index = index.clone();
+    index.writer_layout = WRITER_LAYOUT;
     index.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     bucket.put(&key(&index.stream), &serde_json::to_vec(&index)?)
 }
@@ -263,25 +283,25 @@ pub(crate) fn save(bucket: &dyn Bucket, index: &EventPartitionIndex) -> Result<(
 /// Newest indexed raw-event timestamp across the bucket. This reads only the
 /// small per-stream metadata objects, never the JSONL event bodies.
 pub(crate) fn bucket_newest_event(bucket: &dyn Bucket) -> Result<Option<String>> {
-    let mut newest = None;
-    for key in bucket.list(&format!("{PREFIX}/"))? {
+    let mut newest: Option<DateTime<Utc>> = None;
+    for key in bucket.list(crate::sync::EVENT_STREAMS)? {
         let Some(stream) = key
-            .strip_prefix(&format!("{PREFIX}/"))
-            .and_then(|name| name.strip_suffix(".json"))
-            .filter(|stream| !stream.contains('/'))
+            .strip_prefix(&format!("{}/", crate::sync::EVENT_STREAMS))
+            .filter(|stream| !stream.is_empty() && !stream.contains('/'))
         else {
             continue;
         };
         let Some(index) = load(bucket, stream)? else {
             continue;
         };
-        if let Some(timestamp) = index.newest_event()
-            && newest.as_deref().is_none_or(|current| timestamp.as_str() > current)
+        if let Some(timestamp) = index.newest_event().as_deref().and_then(parse_time)
+            && newest.is_none_or(|current| timestamp > current)
         {
             newest = Some(timestamp);
         }
     }
-    Ok(newest)
+    Ok(newest
+        .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)))
 }
 
 /// Split complete JSONL lines by each event's UTC day and update the exact
@@ -390,6 +410,58 @@ mod tests {
             index.partitions["2026-07-22"].max_ts,
             "2026-07-22T10:30:00Z"
         );
+    }
+
+    #[test]
+    fn partition_ranges_order_whole_and_fractional_seconds_by_instant() {
+        let mut range = EventTimeRange::default();
+        range.record("2026-07-22T10:00:00.500Z");
+        range.record("2026-07-22T10:00:00Z");
+
+        assert_eq!(range.min_ts, "2026-07-22T10:00:00Z");
+        assert_eq!(range.max_ts, "2026-07-22T10:00:00.500Z");
+    }
+
+    #[test]
+    fn bucket_freshness_uses_the_stream_registry_and_parsed_instants() {
+        let root =
+            std::env::temp_dir().join(format!("synty-event-freshness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bucket = crate::bucket::LocalFs::new(&root);
+        for (stream, timestamp) in [
+            ("edge-a-codex", "2026-07-22T10:00:00Z"),
+            ("edge-b-codex", "2026-07-22T10:00:00.500Z"),
+        ] {
+            bucket
+                .put(&format!("{}/{stream}", crate::sync::EVENT_STREAMS), b"")
+                .unwrap();
+            bucket
+                .put(
+                    &key(stream),
+                    serde_json::to_vec(&serde_json::json!({
+                        "format": 1,
+                        "stream": stream,
+                        "partitions": {
+                            "2026-07-22": {"min_ts": timestamp, "max_ts": timestamp}
+                        }
+                    }))
+                    .unwrap()
+                    .as_slice(),
+                )
+                .unwrap();
+        }
+        bucket
+            .put(
+                "event-partitions/ignored/track.2026-07-22.json",
+                b"not a stream index",
+            )
+            .unwrap();
+
+        assert_eq!(
+            bucket_newest_event(&bucket).unwrap().as_deref(),
+            Some("2026-07-22T10:00:00.500Z")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

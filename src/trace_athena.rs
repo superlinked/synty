@@ -8,6 +8,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_athena::types::{QueryExecutionContext, QueryExecutionState};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::time::{Duration as StdDuration, Instant};
 
 const DEFAULT_LIST_HOURS: i64 = 1;
@@ -21,6 +22,30 @@ const MAX_PATH_PREDICATE_BYTES: usize = 200_000;
 const REQUEST_QUERY_TIMEOUT: StdDuration = StdDuration::from_secs(45);
 const AWS_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const AWS_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+
+#[derive(Debug)]
+enum TraceQueryError {
+    Timeout(String),
+    Limit(String),
+}
+
+impl fmt::Display for TraceQueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout(message) | Self::Limit(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for TraceQueryError {}
+
+fn timeout_error(message: impl Into<String>) -> anyhow::Error {
+    TraceQueryError::Timeout(message.into()).into()
+}
+
+fn limit_error(message: impl Into<String>) -> anyhow::Error {
+    TraceQueryError::Limit(message.into()).into()
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
@@ -98,6 +123,15 @@ impl AwsEventQuery {
             database: config.database.clone(),
         })
     }
+
+    fn stop_execution(&self, id: &str) {
+        let _ = self.runtime.block_on(
+            self.client
+                .stop_query_execution()
+                .query_execution_id(id)
+                .send(),
+        );
+    }
 }
 
 impl EventQuery for AwsEventQuery {
@@ -111,10 +145,11 @@ impl EventQuery for AwsEventQuery {
                 sql.trim_start().to_ascii_uppercase().starts_with("SELECT "),
                 "Athena trace only permits SELECT statements"
             );
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "Athena trace request timed out before query execution"
-            );
+            if Instant::now() >= deadline {
+                return Err(timeout_error(
+                    "Athena trace request timed out before query execution",
+                ));
+            }
             let execution = self
                 .runtime
                 .block_on(
@@ -137,45 +172,52 @@ impl EventQuery for AwsEventQuery {
 
             scanned_bytes = loop {
                 if Instant::now() >= deadline {
-                    let _ = self.runtime.block_on(
-                        self.client
-                            .stop_query_execution()
-                            .query_execution_id(&id)
-                            .send(),
-                    );
-                    bail!("Athena trace request timed out after its shared query budget");
+                    self.stop_execution(&id);
+                    return Err(timeout_error(
+                        "Athena trace request timed out after its shared query budget",
+                    ));
                 }
-                let execution = self
-                    .runtime
-                    .block_on(
-                        self.client
-                            .get_query_execution()
-                            .query_execution_id(&id)
-                            .send(),
-                    )
-                    .context("poll Athena trace query")?;
-                let query = execution
-                    .query_execution()
-                    .context("Athena returned no query execution")?;
-                let status = query.status().context("Athena returned no query status")?;
-                match status.state() {
-                    Some(QueryExecutionState::Succeeded) => {
-                        break query
-                            .statistics()
-                            .and_then(|statistics| statistics.data_scanned_in_bytes())
-                            .unwrap_or(0);
+                let poll = (|| {
+                    let execution = self
+                        .runtime
+                        .block_on(
+                            self.client
+                                .get_query_execution()
+                                .query_execution_id(&id)
+                                .send(),
+                        )
+                        .context("poll Athena trace query")?;
+                    let query = execution
+                        .query_execution()
+                        .context("Athena returned no query execution")?;
+                    let status = query.status().context("Athena returned no query status")?;
+                    match status.state() {
+                        Some(QueryExecutionState::Succeeded) => Ok(Some(
+                            query
+                                .statistics()
+                                .and_then(|statistics| statistics.data_scanned_in_bytes())
+                                .unwrap_or(0),
+                        )),
+                        Some(QueryExecutionState::Failed | QueryExecutionState::Cancelled) => {
+                            bail!(
+                                "Athena trace query {}: {}",
+                                status
+                                    .state()
+                                    .map(|state| state.as_str())
+                                    .unwrap_or("failed"),
+                                status.state_change_reason().unwrap_or("no reason returned")
+                            )
+                        }
+                        _ => Ok(None),
                     }
-                    Some(QueryExecutionState::Failed | QueryExecutionState::Cancelled) => {
-                        bail!(
-                            "Athena trace query {}: {}",
-                            status
-                                .state()
-                                .map(|state| state.as_str())
-                                .unwrap_or("failed"),
-                            status.state_change_reason().unwrap_or("no reason returned")
-                        );
+                })();
+                match poll {
+                    Ok(Some(bytes)) => break bytes,
+                    Ok(None) => std::thread::sleep(StdDuration::from_millis(250)),
+                    Err(error) => {
+                        self.stop_execution(&id);
+                        return Err(error);
                     }
-                    _ => std::thread::sleep(StdDuration::from_millis(250)),
                 }
             };
 
@@ -183,10 +225,11 @@ impl EventQuery for AwsEventQuery {
             let mut next_token = None;
             let mut first_page = true;
             loop {
-                anyhow::ensure!(
-                    Instant::now() < deadline,
-                    "Athena trace result retrieval timed out after its shared query budget"
-                );
+                if Instant::now() >= deadline {
+                    return Err(timeout_error(
+                        "Athena trace result retrieval timed out after its shared query budget",
+                    ));
+                }
                 let mut request = self
                     .client
                     .get_query_results()
@@ -210,17 +253,19 @@ impl EventQuery for AwsEventQuery {
                             continue;
                         };
                         result_bytes = result_bytes.saturating_add(line.len());
-                        anyhow::ensure!(
-                            result_bytes <= MAX_RESULT_BYTES,
-                            "Athena trace selection exceeds {} MiB; narrow the time, machine, source, or operation filter",
-                            MAX_RESULT_BYTES / 1024 / 1024
-                        );
+                        if result_bytes > MAX_RESULT_BYTES {
+                            return Err(limit_error(format!(
+                                "Athena trace selection exceeds {} MiB; narrow the time, machine, source, or operation filter",
+                                MAX_RESULT_BYTES / 1024 / 1024
+                            )));
+                        }
                         lines.push(line.to_string());
                         row_count = lines.len();
-                        anyhow::ensure!(
-                            lines.len() <= MAX_EVENTS,
-                            "Athena trace selection exceeds {MAX_EVENTS} events; narrow the time, machine, source, or operation filter"
-                        );
+                        if lines.len() > MAX_EVENTS {
+                            return Err(limit_error(format!(
+                                "Athena trace selection exceeds {MAX_EVENTS} events; narrow the time, machine, source, or operation filter"
+                            )));
+                        }
                     }
                 }
                 first_page = false;
@@ -234,7 +279,7 @@ impl EventQuery for AwsEventQuery {
         let outcome = result
             .as_ref()
             .err()
-            .map(|error| query_outcome(&error.to_string()))
+            .map(query_outcome)
             .unwrap_or("success");
         metrics::Run::new("athena_trace")
             .set("outcome", outcome)
@@ -254,6 +299,7 @@ pub(crate) struct Backend {
     // for every tool call so newly enrolled streams appear without a restart.
     streams: Option<Vec<String>>,
     // Tests may inject physical partitions without opening a real bucket.
+    #[cfg(test)]
     days: Option<Vec<String>>,
     cached: Option<trace::TraceStore>,
 }
@@ -265,6 +311,7 @@ impl Backend {
             config,
             query,
             streams: None,
+            #[cfg(test)]
             days: None,
             cached: None,
         })
@@ -315,7 +362,6 @@ impl Backend {
             false,
             Some(scope),
         )?;
-        self.cached = Some(store);
         Ok(out)
     }
 
@@ -426,10 +472,11 @@ impl Backend {
         };
         let first = self.select(&streams, window, &predicate, deadline)?;
         let sessions = event_sessions(&first.lines);
-        anyhow::ensure!(
-            sessions.len() <= MAX_SESSIONS,
-            "Athena trace selection spans more than {MAX_SESSIONS} sessions; narrow the time, machine, source, or operation filter"
-        );
+        if sessions.len() > MAX_SESSIONS {
+            return Err(limit_error(format!(
+                "Athena trace selection spans more than {MAX_SESSIONS} sessions; narrow the time, machine, source, or operation filter"
+            )));
+        }
         let context_window = Window {
             since: std::cmp::max(
                 window.since - Duration::days(1),
@@ -484,6 +531,13 @@ impl Backend {
     ) -> Result<QueryRows> {
         let selection = self.selected_objects(streams, window)?;
         if selection.paths.is_empty() {
+            metrics::Run::new("athena_trace")
+                .set("outcome", "empty")
+                .set("rows", 0)
+                .set("result_bytes", 0)
+                .set("scanned_bytes", 0)
+                .set("elapsed_ms", 0)
+                .emit();
             return Ok(QueryRows { lines: Vec::new() });
         }
         let sql = select_sql(
@@ -521,11 +575,11 @@ impl Backend {
             streams
         };
         let machine = machine.map(str::to_ascii_lowercase);
-        let requested_source = source.and_then(canonical_source);
+        let requested_source = source.map(normalized_stream_source);
         let scope_sources = scope
             .sources
             .iter()
-            .filter_map(|source| canonical_source(source))
+            .map(|source| normalized_stream_source(source))
             .collect::<BTreeSet<_>>();
         streams.retain(|stream| {
             let Some((stream_machine, stream_source)) = crate::identity::stream_parts(stream)
@@ -535,10 +589,11 @@ impl Backend {
             machine
                 .as_deref()
                 .is_none_or(|wanted| stream_machine.eq_ignore_ascii_case(wanted))
-                && requested_source.is_none_or(|wanted| stream_source.eq_ignore_ascii_case(wanted))
+                && requested_source
+                    .as_deref()
+                    .is_none_or(|wanted| stream_source.eq_ignore_ascii_case(wanted))
                 && (scope_sources.is_empty()
-                    || canonical_source(stream_source)
-                        .is_some_and(|source| scope_sources.contains(&source)))
+                    || scope_sources.contains(&normalized_stream_source(stream_source)))
         });
         anyhow::ensure!(
             !streams.is_empty(),
@@ -548,6 +603,7 @@ impl Backend {
     }
 
     fn selected_objects(&self, streams: &[String], window: Window) -> Result<ObjectSelection> {
+        #[cfg(test)]
         if let Some(days) = &self.days {
             let stream = streams.first().context("Athena trace needs a test stream")?;
             return Ok(ObjectSelection {
@@ -566,27 +622,11 @@ impl Backend {
         let bucket = bucket::open(&self.config.bucket)?;
         let mut selected = BTreeSet::new();
         for stream in streams {
-            let physical = bucket
-                .list(&format!("events/{stream}/chunks/"))?
-                .into_iter()
-                .collect::<BTreeSet<_>>();
             if let Some(index) = event_partitions::load(bucket.as_ref(), stream)? {
-                let mut days = index.candidate_days(window.since, window.until);
-                let indexed = index.physical_days();
-                days.extend(
-                    physical
-                        .iter()
-                        .filter_map(|key| event_partitions::day_from_event_key(key))
-                        .filter(|day| !indexed.contains(*day))
-                        .map(str::to_string),
-                );
-                for day in days {
-                    let physical_day = physical
-                        .iter()
-                        .filter(|key| {
-                            event_partitions::day_from_event_key(key) == Some(day.as_str())
-                        })
-                        .cloned()
+                for day in index.candidate_days(window.since, window.until) {
+                    let physical_day = bucket
+                        .list(&format!("events/{stream}/chunks/track.{day}/"))?
+                        .into_iter()
                         .collect::<BTreeSet<_>>();
                     if let Some(objects) =
                         event_partitions::load_objects(bucket.as_ref(), stream, &day)?
@@ -606,22 +646,33 @@ impl Backend {
                     }
                 }
             } else {
-                selected.extend(physical);
+                let days = window_days(window);
+                selected.extend(
+                    bucket
+                        .list(&format!("events/{stream}/chunks/"))?
+                        .into_iter()
+                        .filter(|key| {
+                            event_partitions::day_from_event_key(key)
+                                .is_some_and(|day| days.contains(day))
+                        }),
+                );
             }
         }
-        anyhow::ensure!(
-            selected.len() <= MAX_OBJECT_PATHS,
-            "Athena trace selection needs {} raw objects, exceeding the {MAX_OBJECT_PATHS}-object query limit; narrow the machine, source, or time filter, or backfill object-range metadata",
-            selected.len()
-        );
+        if selected.len() > MAX_OBJECT_PATHS {
+            return Err(limit_error(format!(
+                "Athena trace selection needs {} raw objects, exceeding the {MAX_OBJECT_PATHS}-object query limit; narrow the machine, source, or time filter, or backfill object-range metadata",
+                selected.len()
+            )));
+        }
         let path_bytes = selected
             .iter()
             .map(|key| key.len() + self.config.bucket.len() + 4)
             .sum::<usize>();
-        anyhow::ensure!(
-            path_bytes <= MAX_PATH_PREDICATE_BYTES,
-            "Athena trace object paths need {path_bytes} SQL bytes, exceeding the {MAX_PATH_PREDICATE_BYTES}-byte path-predicate limit; narrow the machine, source, or time filter"
-        );
+        if path_bytes > MAX_PATH_PREDICATE_BYTES {
+            return Err(limit_error(format!(
+                "Athena trace object paths need {path_bytes} SQL bytes, exceeding the {MAX_PATH_PREDICATE_BYTES}-byte path-predicate limit; narrow the machine, source, or time filter"
+            )));
+        }
         let days = selected
             .iter()
             .filter_map(|key| event_partitions::day_from_event_key(key).map(str::to_string))
@@ -665,10 +716,11 @@ impl Window {
             None => until - Duration::hours(default_hours),
         };
         anyhow::ensure!(since < until, "trace since must be before until");
-        anyhow::ensure!(
-            until - since <= Duration::hours(MAX_LOOKBACK_HOURS),
-            "Athena trace windows are limited to {MAX_LOOKBACK_HOURS} hours"
-        );
+        if until - since > Duration::hours(MAX_LOOKBACK_HOURS) {
+            return Err(limit_error(format!(
+                "Athena trace windows are limited to {MAX_LOOKBACK_HOURS} hours"
+            )));
+        }
         Ok(Self { since, until })
     }
 }
@@ -837,25 +889,42 @@ fn query_id(id: &str) -> &str {
     id.strip_prefix("job:").unwrap_or(id)
 }
 
-fn canonical_source(source: &str) -> Option<&'static str> {
+fn normalized_stream_source(source: &str) -> String {
     match source.to_ascii_lowercase().as_str() {
-        "codex" | "codex_cli" | "codex-cli" => Some("codex"),
-        "claude" | "claudecode" | "claude_code" | "claude-code" => Some("claudecode"),
-        "cowork" => Some("cowork"),
-        "harness" => Some("harness"),
-        "devin" => Some("devin"),
-        _ => None,
+        "codex" | "codex_cli" | "codex-cli" => "codex".into(),
+        "claude" | "claudecode" | "claude_code" | "claude-code" => "claudecode".into(),
+        "cowork" => "cowork".into(),
+        "harness" => "harness".into(),
+        "devin" => "devin".into(),
+        other => other.to_string(),
     }
 }
 
-fn query_outcome(error: &str) -> &'static str {
-    let error = error.to_ascii_lowercase();
-    if error.contains("timed out") {
-        "timeout"
-    } else if error.contains("exceeds") || error.contains("limited to") {
-        "limit"
-    } else {
-        "error"
+fn window_days(window: Window) -> BTreeSet<String> {
+    let mut days = BTreeSet::new();
+    let mut day = window.since.date_naive();
+    loop {
+        let start = day
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight exists")
+            .and_utc();
+        if start >= window.until {
+            break;
+        }
+        days.insert(day.format("%Y-%m-%d").to_string());
+        let Some(next) = day.succ_opt() else {
+            break;
+        };
+        day = next;
+    }
+    days
+}
+
+fn query_outcome(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<TraceQueryError>() {
+        Some(TraceQueryError::Timeout(_)) => "timeout",
+        Some(TraceQueryError::Limit(_)) => "limit",
+        None => "error",
     }
 }
 
@@ -995,6 +1064,10 @@ mod tests {
             .unwrap();
         assert!(out.contains("exec_command"));
         assert!(out.contains("call-1"));
+        assert!(
+            backend.cached.is_none(),
+            "a list slice must not satisfy a later show or compare lookup"
+        );
         assert!(
             calls
                 .lock()
@@ -1189,6 +1262,25 @@ mod tests {
                 .unwrap(),
             vec!["edge-dev-box-codex"]
         );
+        assert!(
+            backend
+                .selected_streams(None, Some("unknown-agent"), &ReadScope::default())
+                .is_err(),
+            "an explicit unknown source must fail closed"
+        );
+        assert!(
+            backend
+                .selected_streams(
+                    None,
+                    None,
+                    &ReadScope {
+                        sources: vec!["unknown-agent".into()],
+                        ..Default::default()
+                    },
+                )
+                .is_err(),
+            "an all-unknown source scope must fail closed"
+        );
     }
 
     #[test]
@@ -1219,7 +1311,7 @@ mod tests {
                 serde_json::to_string(&json!({
                     "format": 1,
                     "stream": "edge-m-codex",
-                    "legacy_days": ["2026-07-19"],
+                    "legacy_days": ["2026-07-19", "2026-07-24"],
                     "partitions": {
                         "2026-07-20": {
                             "min_ts": "2026-07-22T10:00:00Z",
@@ -1290,9 +1382,71 @@ mod tests {
 
     #[test]
     fn query_metrics_classify_timeouts_and_limits() {
-        assert_eq!(query_outcome("request timed out"), "timeout");
-        assert_eq!(query_outcome("selection exceeds 50000 events"), "limit");
-        assert_eq!(query_outcome("AWS rejected the request"), "error");
+        let timeout = Err::<(), _>(timeout_error("request timed out"))
+            .context("Athena request")
+            .unwrap_err();
+        assert_eq!(
+            query_outcome(&timeout),
+            "timeout"
+        );
+        assert_eq!(
+            query_outcome(&limit_error("selection exceeds 50000 events")),
+            "limit"
+        );
+        assert_eq!(
+            query_outcome(&anyhow::anyhow!("AWS rejected the request")),
+            "error"
+        );
+    }
+
+    #[test]
+    fn legacy_streams_limit_object_paths_to_the_requested_physical_days() {
+        use crate::bucket::Bucket;
+
+        let root = std::env::temp_dir().join(format!(
+            "synty-athena-legacy-window-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bucket = crate::bucket::LocalFs::new(&root);
+        for day in ["2026-07-20", "2026-07-22", "2026-07-23"] {
+            bucket
+                .put(
+                    &format!("events/edge-m-codex/chunks/track.{day}/one.jsonl"),
+                    b"{}\n",
+                )
+                .unwrap();
+        }
+        let backend = Backend {
+            config: Config {
+                bucket: root.to_string_lossy().into_owned(),
+                workgroup: "wg".into(),
+                database: "synty".into(),
+                table: "raw_events".into(),
+            },
+            query: Box::new(FakeQuery {
+                lines: Vec::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+            streams: Some(vec!["edge-m-codex".into()]),
+            days: None,
+            cached: None,
+        };
+
+        let selection = backend
+            .selected_objects(
+                &["edge-m-codex".into()],
+                Window {
+                    since: parse_time("2026-07-22T10:00:00Z").unwrap(),
+                    until: parse_time("2026-07-23T00:00:00Z").unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(selection.days, ["2026-07-22"]);
+        assert_eq!(selection.paths.len(), 1);
+        assert!(selection.paths[0].contains("track.2026-07-22"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

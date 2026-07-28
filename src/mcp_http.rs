@@ -417,9 +417,7 @@ async fn handle(
         let dispatchers_ready =
             state.dispatcher.is_alive() && state.analysis_dispatcher.is_alive();
         let freshness = mcp::bucket_freshness();
-        let remote_format_ready = freshness
-            .read_model_format
-            .is_some_and(|format| format >= crate::readmodel::FORMAT);
+        let remote_format_ready = freshness.remote_format_ready();
         let ready = ready_state(
             state.require_read_model,
             read_model,
@@ -437,7 +435,7 @@ async fn handle(
             "bucket_published_read_model": freshness.published_read_model,
             "bucket_read_model_format": freshness.read_model_format,
             "bucket_checked_at": freshness.checked_at,
-            "bucket_freshness_error": freshness.error,
+            "bucket_freshness_error": health_freshness_error(freshness.error.as_deref()),
             "dispatchers": dispatchers_ready,
             "trace_backend": if state.require_trace_projection { "projection" } else { "athena" },
             "name": "synty",
@@ -569,6 +567,11 @@ where
 #[cfg(any(feature = "mcp-http", test))]
 fn health_code(ready: bool) -> u16 {
     if ready { 200 } else { 503 }
+}
+
+#[cfg(any(feature = "mcp-http", test))]
+fn health_freshness_error(error: Option<&str>) -> Option<&'static str> {
+    error.map(|_| "bucket metadata unavailable")
 }
 
 #[cfg(any(feature = "mcp-http", test))]
@@ -745,6 +748,14 @@ mod tests {
         assert!(!protocol_version_supported(Some("2099-01-01")));
         assert_eq!(health_code(true), 200);
         assert_eq!(health_code(false), 503);
+        assert_eq!(health_freshness_error(None), None);
+        assert_eq!(
+            health_freshness_error(Some(
+                "AccessDenied: bucket super-secret-bucket in account 123"
+            )),
+            Some("bucket metadata unavailable"),
+            "unauthenticated health responses expose no provider diagnostics"
+        );
         assert!(ready_state(true, true, true, true, true));
         assert!(!ready_state(true, true, true, true, false));
         assert!(!ready_state(true, true, false, true, true));

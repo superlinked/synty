@@ -17,7 +17,7 @@ use std::path::Path;
 
 const POINTER_KEY: &str = "current.json";
 const EVENTS: &str = "events";
-const EVENT_STREAMS: &str = "event-streams";
+pub(crate) const EVENT_STREAMS: &str = "event-streams";
 const EVENT_CHUNK_BYTES: usize = 1 << 20;
 
 /// Filename → blob hash for one (build, rev).
@@ -369,12 +369,14 @@ fn push_events_scoped(
                     "{EVENTS}/{stream}/chunks/{stem}/{start:016x}-{end:016x}-{part:04}-{short_hash}.jsonl"
                 );
                 event_partitions::record_object(&mut object_index, &key, &chunk);
+                partition_index.record_object(&day, &key);
                 objects.push((key, chunk));
             }
             // Like the day range, exact object coverage is visible first. A
             // referenced-but-not-yet-present path scans nothing; the inverse
             // ordering could briefly make a new object invisible.
             event_partitions::save_objects(b.as_ref(), &object_index)?;
+            event_partitions::save(b.as_ref(), partition_index)?;
             for (key, chunk) in objects {
                 if b.put_if_absent(&key, &chunk)? {
                     bytes_up += chunk.len() as u64;
@@ -624,6 +626,11 @@ struct DownloadState {
     /// are globally append-sorted.
     #[serde(default)]
     partitions: BTreeMap<String, BTreeMap<String, String>>,
+    /// Streams whose pre-watermark history was scanned once by this reader.
+    /// New writers advertise exact per-day object cursors, so future pulls can
+    /// skip the global compatibility LIST until an old writer is observed.
+    #[serde(default)]
+    compatibility_scanned: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Download all devices' event files from the bucket into `local_dir`. Writers
@@ -648,6 +655,10 @@ fn pull_events_from(
         .unwrap_or_default();
     let cursors = state.buckets.entry(bucket_uri.to_string()).or_default();
     let partition_cursors = state.partitions.entry(bucket_uri.to_string()).or_default();
+    let compatibility_scanned = state
+        .compatibility_scanned
+        .entry(bucket_uri.to_string())
+        .or_default();
     let (mut n, mut bytes_down) = (0, 0u64);
     let markers = b.list(EVENT_STREAMS)?;
     let mut cursor_changed = false;
@@ -668,7 +679,34 @@ fn pull_events_from(
                 continue;
             }
             if let Some(index) = event_partitions::load(b, stream)? {
-                for day in index.physical_days() {
+                // A new-layout writer publishes an exact high-water key per
+                // event day. One global scan seeds a reader with any history
+                // that predates those watermarks; after that, only changed
+                // days need a LIST. If an older writer later rewrites the
+                // metadata without the layout marker, resume the compatibility
+                // cursor until the new writer takes over again.
+                if index.writer_layout == 0 || !compatibility_scanned.contains(stream) {
+                    let chunk_prefix = format!("{EVENTS}/{stream}/chunks/");
+                    let mut cursor = cursors.get(stream).cloned().unwrap_or_default();
+                    if !cursor.is_empty() && !event_dest(local_dir, &cursor)?.is_file() {
+                        cursor.clear();
+                    }
+                    for key in b.list_after(&chunk_prefix, &cursor)? {
+                        let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
+                        n += usize::from(fetched);
+                        bytes_down += bytes;
+                        cursor = key.clone();
+                        cursors.insert(stream.to_string(), cursor.clone());
+                        record_partition_cursor(partition_cursors, stream, &key);
+                        cursor_changed = true;
+                    }
+                    if index.writer_layout > 0
+                        && compatibility_scanned.insert(stream.to_string())
+                    {
+                        cursor_changed = true;
+                    }
+                }
+                for (day, remote_cursor) in &index.object_cursors {
                     let partition = format!("{stream}\0{day}");
                     let chunk_prefix = format!("{EVENTS}/{stream}/chunks/track.{day}/");
                     let mut cursor = partition_cursors
@@ -678,6 +716,9 @@ fn pull_events_from(
                     if !cursor.is_empty() && !event_dest(local_dir, &cursor)?.is_file() {
                         cursor.clear();
                     }
+                    if !cursor.is_empty() && cursor >= *remote_cursor {
+                        continue;
+                    }
                     for key in b.list_after(&chunk_prefix, &cursor)? {
                         let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
                         n += usize::from(fetched);
@@ -686,23 +727,6 @@ fn pull_events_from(
                         partition_cursors.insert(partition.clone(), cursor.clone());
                         cursor_changed = true;
                     }
-                }
-                // Mixed-version compatibility: an older writer does not know
-                // about the partition index. Its wall-clock day and increasing
-                // byte-range keys still append to the global stream ordering,
-                // so retain that cursor until every tracker has rolled forward.
-                let chunk_prefix = format!("{EVENTS}/{stream}/chunks/");
-                let mut cursor = cursors.get(stream).cloned().unwrap_or_default();
-                if !cursor.is_empty() && !event_dest(local_dir, &cursor)?.is_file() {
-                    cursor.clear();
-                }
-                for key in b.list_after(&chunk_prefix, &cursor)? {
-                    let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
-                    n += usize::from(fetched);
-                    bytes_down += bytes;
-                    cursor = key;
-                    cursors.insert(stream.to_string(), cursor.clone());
-                    cursor_changed = true;
                 }
             } else {
                 let chunk_prefix = format!("{EVENTS}/{stream}/chunks/");
@@ -736,6 +760,22 @@ fn pull_events_from(
     }
     sync_metric("events_down", n, bytes_down);
     Ok(n)
+}
+
+fn record_partition_cursor(
+    partition_cursors: &mut BTreeMap<String, String>,
+    stream: &str,
+    key: &str,
+) {
+    let Some(day) = event_partitions::day_from_event_key(key) else {
+        return;
+    };
+    let cursor = partition_cursors
+        .entry(format!("{stream}\0{day}"))
+        .or_default();
+    if key > cursor.as_str() {
+        *cursor = key.to_string();
+    }
 }
 
 fn event_dest(local_dir: &str, key: &str) -> Result<std::path::PathBuf> {
@@ -1465,9 +1505,12 @@ mod tests {
         ).unwrap(), 0);
         let calls = store.calls.lock().unwrap().clone();
         assert!(!calls.iter().any(|c| c == "list:events"), "historical event namespace was relisted: {calls:?}");
-        assert!(calls.iter().any(|c| c.starts_with(
-            "after:events/edge-m-codex/chunks/track.2026-07-21/:events/edge-m-codex/chunks/track.2026-07-21/"
-        )), "missing persisted partition cursor: {calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("after:events/edge-m-codex/chunks/")),
+            "unchanged historical days must not issue LIST calls: {calls:?}"
+        );
 
         use std::io::Write;
         std::fs::OpenOptions::new().append(true).open(&file).unwrap()
@@ -1479,12 +1522,28 @@ mod tests {
             upload_state.to_str().unwrap(),
             None,
         ).unwrap(), 1);
+        store.calls.lock().unwrap().clear();
         assert_eq!(pull_events_from(
             &store,
             bucket.to_str().unwrap(),
             reader.to_str().unwrap(),
             &download_state,
         ).unwrap(), 1);
+        let calls = store.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("after:events/edge-m-codex/chunks/"))
+                .count(),
+            1,
+            "only the day whose object watermark advanced should be listed: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|call| call.starts_with(
+                "after:events/edge-m-codex/chunks/track.2026-07-21/"
+            )),
+            "the changed day must continue from its persisted cursor: {calls:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1557,6 +1616,15 @@ mod tests {
             .filter_map(|path| std::fs::read_to_string(path).ok())
             .collect::<String>();
         assert!(body.contains("\"event_id\":\"late\""), "{body}");
+        let mut old_writer_index =
+            event_partitions::load(&store, "edge-m-codex").unwrap().unwrap();
+        old_writer_index.writer_layout = 0;
+        store
+            .put(
+                &event_partitions::key("edge-m-codex"),
+                &serde_json::to_vec(&old_writer_index).unwrap(),
+            )
+            .unwrap();
         store
             .put(
                 "events/edge-m-codex/chunks/track.2026-07-24/legacy-writer.jsonl",

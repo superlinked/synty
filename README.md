@@ -178,17 +178,21 @@ stream plus the latest published read-model. MCP-only readers pull the semantic
 index and compact analysis projection. With `--athena-workgroup`, their trace
 tools query time/stream-pruned raw event rows directly and do not download
 `trace.json` or mirror raw chunks.
-A bounded stream registry and per-day local key cursors avoid rereading
-historical chunks. New uploads use each event's UTC day, while
+A bounded stream registry, per-day object watermarks, and local key cursors
+avoid relisting unchanged historical chunks. A reader scans pre-watermark
+history once, then lists only days whose published high-water key advanced.
+New uploads use each event's UTC day, while
 `event-partitions/<stream>.json` records the event-time range of every physical
 day and `event-partitions/<stream>/track.<day>.json` records each immutable
 object's range. Athena combines projected stream/day partitions with its hidden
 `$path` column, so a wide legacy capture day can prune unrelated objects.
-Readers always include historical or unindexed objects conservatively, so the
-layout change needs no raw-object migration and cannot hide delayed events.
-Existing objects remain queryable without metadata, but a one-time metadata-only
-range scan is recommended before broad historical MCP use; it writes only these
-small indexes and does not copy, rewrite, or delete JSONL. The TUI builds
+Once a stream index exists, readers include its legacy days and objects missing
+from the object index conservatively. A stream with no partition metadata falls
+back to physical days overlapping the requested window; initialize or backfill
+the metadata before relying on delayed historical event-time lookups. No raw
+object migration is required. A one-time metadata-only range scan is recommended
+before broad historical MCP use; it writes only these small indexes and does
+not copy, rewrite, or delete JSONL. The TUI builds
 unpublished event deltas in the background;
 `synty build` does the same explicitly, while `search` warns if raw events are
 newer than the published index. One tokened machine scrapes GitHub for everyone.

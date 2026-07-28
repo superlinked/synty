@@ -66,8 +66,9 @@ The raw-table overlay is a zero-copy query path, not a columnar rewrite:
 Athena still scans the selected JSONL object bytes. A compact per-stream
 partition-range index maps event-time windows onto physical days, including
 legacy capture-day chunks; per-day object-range indexes then prune immutable
-files through Athena's hidden `$path` column. Neither rewrites the authoritative
-objects.
+files through Athena's hidden `$path` column. Per-day object high-water keys let
+local readers list only partitions that changed after a one-time compatibility
+scan. Neither metadata path rewrites the authoritative objects.
 
 ## Engine
 
@@ -223,12 +224,16 @@ runs on CI or a server without a developer machine.
   window at seven days, rows at 50,000, returned bytes at 64 MiB, and all
   Athena work for one request at a shared 45-second budget. Queries include at
   most 1,000 exact raw-object `$path` values. A workgroup scan cutoff is the
-  final cost guard; missing partition or object coverage is included
-  conservatively.
+  final cost guard. Indexed streams include declared legacy days and physically
+  present objects missing from per-object metadata conservatively; a completely
+  unindexed stream falls back to the requested physical-day span.
   `/health` remains a liveness check, while `/ready` requires the semantic
   index, compact analysis projection, a compatible bucket read-model format,
   and both dispatchers; local-projection mode additionally requires
-  `trace.json`. Health and status expose bucket raw/model freshness. Analysis calls use a
+  `trace.json`. Health and status expose bucket raw/model freshness; the
+  unauthenticated HTTP endpoints return only a generic metadata-error indicator,
+  while detailed provider diagnostics stay in server logs and protected status.
+  Analysis calls use a
   serialized one-slot dispatcher so concurrent first loads cannot multiply
   memory or block semantic search. Each dispatcher has a bounded queue; HTTP
   clients have a 120-second response deadline and a per-client
@@ -338,7 +343,8 @@ events/<stream>/chunks/track.<event-day>/<range-hash>.jsonl
                                         stream = edge-<machine>-<source>, so many
                                         trackers' files coexist without collision
 event-streams/<stream>                immutable bounded discovery registry
-event-partitions/<stream>.json        physical day → complete event-time range;
+event-partitions/<stream>.json        physical day → complete event-time range
+                                        plus day → highest immutable object key;
                                         legacy/unindexed days remain unconditional
                                         query candidates (metadata-only; mutable)
 event-partitions/<stream>/track.<day>.json
