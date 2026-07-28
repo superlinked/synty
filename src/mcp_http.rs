@@ -416,10 +416,15 @@ async fn handle(
         let mediated = crate::readmodel::mediated_ready(state.require_trace_projection);
         let dispatchers_ready =
             state.dispatcher.is_alive() && state.analysis_dispatcher.is_alive();
+        let freshness = mcp::bucket_freshness();
+        let remote_format_ready = freshness
+            .read_model_format
+            .is_some_and(|format| format >= crate::readmodel::FORMAT);
         let ready = ready_state(
             state.require_read_model,
             read_model,
             mediated,
+            remote_format_ready,
             dispatchers_ready,
         );
         let liveness = path == "/health";
@@ -428,6 +433,11 @@ async fn handle(
             "ready": ready,
             "read_model": read_model,
             "mediated_projections": mediated,
+            "bucket_newest_event": freshness.newest_raw_event,
+            "bucket_published_read_model": freshness.published_read_model,
+            "bucket_read_model_format": freshness.read_model_format,
+            "bucket_checked_at": freshness.checked_at,
+            "bucket_freshness_error": freshness.error,
             "dispatchers": dispatchers_ready,
             "trace_backend": if state.require_trace_projection { "projection" } else { "athena" },
             "name": "synty",
@@ -566,9 +576,10 @@ fn ready_state(
     require_read_model: bool,
     read_model: bool,
     mediated: bool,
+    remote_format: bool,
     dispatchers: bool,
 ) -> bool {
-    dispatchers && (!require_read_model || (read_model && mediated))
+    dispatchers && (!require_read_model || (read_model && mediated && remote_format))
 }
 
 #[cfg(any(feature = "mcp-http", test))]
@@ -734,9 +745,11 @@ mod tests {
         assert!(!protocol_version_supported(Some("2099-01-01")));
         assert_eq!(health_code(true), 200);
         assert_eq!(health_code(false), 503);
-        assert!(ready_state(true, true, true, true));
-        assert!(!ready_state(true, true, true, false));
-        assert!(!ready_state(true, true, false, true));
+        assert!(ready_state(true, true, true, true, true));
+        assert!(!ready_state(true, true, true, true, false));
+        assert!(!ready_state(true, true, false, true, true));
+        assert!(!ready_state(true, true, true, false, true));
+        assert!(ready_state(false, false, false, false, true));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::event::{kind, Event, Sequencer};
 use crate::tail::{drive, ms_to_rfc3339, EmitCtx, Source};
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -422,23 +422,28 @@ impl Stream {
         if events.is_empty() {
             return Ok(());
         }
-        // Per-day local file in the stream dir. Sync reads only appended bytes
-        // and publishes them as immutable chunks on its own cadence.
+        // Partition by the envelope's UTC event day, not the wall clock when a
+        // delayed source line happened to be tailed. Sync preserves the same
+        // event-day partition in the bucket.
         std::fs::create_dir_all(&self.out)?;
-        let path = self.out.join(format!(
-            "track.{}.jsonl",
-            day_stamp(unix_ms(SystemTime::now()))
-        ));
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        let mut body = String::new();
+        let fallback = day_stamp(unix_ms(SystemTime::now()));
+        let mut by_day: BTreeMap<String, String> = BTreeMap::new();
         for e in events {
+            let day = event_time_ms(e)
+                .map(day_stamp)
+                .unwrap_or_else(|| fallback.clone());
+            let body = by_day.entry(day).or_default();
             body.push_str(&serde_json::to_string(e).map_err(|e| anyhow!("encode: {e}"))?);
             body.push('\n');
         }
-        f.write_all(body.as_bytes())?;
+        for (day, body) in by_day {
+            let path = self.out.join(format!("track.{day}.jsonl"));
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            file.write_all(body.as_bytes())?;
+        }
         Ok(())
     }
 }
@@ -1142,6 +1147,50 @@ mod tests {
             "{body}"
         );
         assert!(!body.contains("old prompt"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delayed_events_are_written_to_their_utc_event_day() {
+        let dir =
+            std::env::temp_dir().join(format!("synty-track-event-day-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stream = Stream {
+            src: Box::new(ClaudeCode),
+            roots: vec![],
+            name: "edge-t-claudecode".into(),
+            out: dir.clone(),
+            seq: Sequencer::new(),
+            started: HashSet::new(),
+            files: HashMap::new(),
+            open: HashMap::new(),
+            n_sessions: 0,
+            n_skipped: 0,
+            actor: "tester".into(),
+            campaign: String::new(),
+            campaign_role: String::new(),
+        };
+        let make = |id: &str, ts: &str| Event {
+            v: crate::event::ENVELOPE_V,
+            event_id: id.into(),
+            stream: "edge-t-claudecode".into(),
+            seq: 0,
+            ts: ts.into(),
+            source: crate::event::source::CLAUDE_CODE.into(),
+            session_id: "session".into(),
+            kind: kind::USER_PROMPT.into(),
+            payload: json!({"text": id}),
+            rollup_dim: String::new(),
+        };
+        stream
+            .append(&[
+                make("old", "2026-07-21T23:59:00Z"),
+                make("new", "2026-07-23T00:01:00Z"),
+            ])
+            .unwrap();
+        assert!(dir.join("track.2026-07-21.jsonl").is_file());
+        assert!(dir.join("track.2026-07-23.jsonl").is_file());
+        assert!(!dir.join("track.2026-07-22.jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -178,8 +178,18 @@ stream plus the latest published read-model. MCP-only readers pull the semantic
 index and compact analysis projection. With `--athena-workgroup`, their trace
 tools query time/stream-pruned raw event rows directly and do not download
 `trace.json` or mirror raw chunks.
-A bounded stream registry and per-stream local key cursors avoid relisting
-historical chunks on each local read. The TUI builds unpublished event deltas in the background;
+A bounded stream registry and per-day local key cursors avoid rereading
+historical chunks. New uploads use each event's UTC day, while
+`event-partitions/<stream>.json` records the event-time range of every physical
+day and `event-partitions/<stream>/track.<day>.json` records each immutable
+object's range. Athena combines projected stream/day partitions with its hidden
+`$path` column, so a wide legacy capture day can prune unrelated objects.
+Readers always include historical or unindexed objects conservatively, so the
+layout change needs no raw-object migration and cannot hide delayed events.
+Existing objects remain queryable without metadata, but a one-time metadata-only
+range scan is recommended before broad historical MCP use; it writes only these
+small indexes and does not copy, rewrite, or delete JSONL. The TUI builds
+unpublished event deltas in the background;
 `synty build` does the same explicitly, while `search` warns if raw events are
 newer than the published index. One tokened machine scrapes GitHub for everyone.
 
@@ -204,15 +214,11 @@ For S3, scope each writer/reader role to the chosen bucket (or URI prefix):
 lease; event chunks and content-addressed derived objects are immutable.
 An MCP-only workload needs no writes: `deploy/aws/mcp-reader.yaml` creates an
 IRSA role with bucket location/list/object-get plus query-only access to one
-Athena workgroup and the raw/Parquet Glue tables.
-`deploy/aws/athena-trace.yaml` creates the existing JSONL overlay, an empty
-schema-compatible `trace_events_v1` Parquet table, and a managed-results
-workgroup without crawling or rewriting bucket objects. Raw remains the default.
-After a separately authorized projector fills the derived prefix, set
-`mcp.athena.table=trace_events_v1`; the MCP reader needs no write permission or
-binary change. Use it with the tracker and builder disabled. If EKS and S3 are
-in different regions, set Helm's `bucketRegion` to the bucket's region so S3
-and Athena requests are signed there.
+Athena workgroup and one Glue table. `deploy/aws/athena-trace.yaml` creates that
+external table and a managed-results workgroup without writing, crawling, or
+rewriting bucket objects. Use it with the tracker and builder disabled. If EKS
+and S3 are in different regions, set Helm's `bucketRegion` to the bucket's
+region so S3 and Athena requests are signed there.
 
 A one-shot local projection migration can still reuse that bucket's existing
 fleet embeddings without broadening the reader role:
@@ -242,19 +248,17 @@ MCP pulls the published semantic index and compact analysis projection before
 serving and refreshes them on a background thread; it never mirrors the raw
 event lake. In Athena mode it deliberately omits the legacy `trace.json` blob.
 Each trace request is a read-only `SELECT`, partition-pruned by stream and day,
-limited to seven days, 50,000 events, 64 MiB of returned envelopes, a 50-second
-query timeout, and the workgroup's 20 GiB scan cutoff. Limit hits fail closed
-and ask the caller for a narrower time/machine/source/operation filter.
-The optional Parquet table preserves the same `line`, `stream`, and `day`
-contract, so it reduces raw-byte scanning and compacts small JSONL objects
-without changing trace semantics. It is an additive derived copy: historical
-coverage needs a one-time backfill and new closed-day partitions need an
-incremental projector. Neither operation moves or deletes raw JSONL.
-The immutable layout, validation contract, and typed-entity follow-up are in
-[`docs/parquet-traces.md`](docs/parquet-traces.md).
+limited to seven days, 50,000 events, 64 MiB of returned envelopes, one shared
+45-second Athena budget across all queries needed by the request, 1,000 raw
+object paths per query, and the workgroup's 20 GiB scan cutoff. Success, error,
+timeout, and limit outcomes use the standard metrics block. Limit hits fail
+closed and ask the caller for a narrower time/machine/source/operation filter
+or a metadata-only object-range backfill.
 `/health` reports transport liveness and `/ready` waits for the semantic index
-and analysis projection, plus both dispatchers (`trace.json` is required only
-in local-projection mode). Analysis tools are
+and analysis projection, a compatible remote read-model format, plus both
+dispatchers (`trace.json` is required only in local-projection mode). Status
+and both health endpoints report the newest indexed raw-event timestamp, the
+published-model timestamp/format, and the last bucket metadata check. Analysis tools are
 serialized on a one-slot dispatcher so concurrent first loads cannot multiply
 memory. HTTP work is bounded by separate semantic and analysis queues, a
 120-second response deadline, 32 in-flight requests, 64 live connections,

@@ -8,7 +8,7 @@
 // pointing at a complete build. The per-doc embeddings (large, build-side,
 // already in the content-addressed store) are not published.
 
-use crate::{bucket, readmodel};
+use crate::{bucket, event_partitions, readmodel};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -262,6 +262,7 @@ fn push_events_scoped(
     let allowed_by_stream = state.allowed_sessions.entry(bucket_uri.to_string()).or_default();
     let (mut n, mut bytes_up) = (0, 0u64);
     let mut changed = profile_changed || repo_policy_changed;
+    let mut partition_indexes = BTreeMap::new();
     let mut files: Vec<std::path::PathBuf> = walkdir::WalkDir::new(local_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -333,22 +334,52 @@ fn push_events_scoped(
             filter_events_for_sessions(&filtered, allowed)
         };
         let redacted = redact_event_lines(&repo_filtered, profile);
-        for (part, chunk) in event_chunks(&redacted, EVENT_CHUNK_BYTES)
-            .into_iter()
-            .enumerate()
-        {
-            let hash = Sha256::digest(&chunk);
-            let short_hash = hash[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let stem = file.strip_suffix(".jsonl").unwrap_or(file);
-            let key = format!(
-                "{EVENTS}/{stream}/chunks/{stem}/{start:016x}-{end:016x}-{part:04}-{short_hash}.jsonl"
+        if !partition_indexes.contains_key(stream) {
+            partition_indexes.insert(
+                stream.to_string(),
+                event_partitions::load_or_initialize(b.as_ref(), stream)?,
             );
-            if b.put_if_absent(&key, &chunk)? {
-                bytes_up += chunk.len() as u64;
-                n += 1;
+        }
+        let partition_index = partition_indexes
+            .get_mut(stream)
+            .expect("partition index initialized");
+        let fallback_day = event_partitions::day_from_track_file(file)
+            .map(str::to_string)
+            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+        let partitioned =
+            event_partitions::partition_lines(partition_index, &redacted, &fallback_day);
+        // Publish coverage before the chunks. A reader may briefly query an
+        // empty projected day, but it can never miss a newly-addressable day.
+        event_partitions::save(b.as_ref(), partition_index)?;
+        for (day, body) in partitioned {
+            let mut object_index =
+                event_partitions::load_objects_or_empty(b.as_ref(), stream, &day)?;
+            let mut objects = Vec::new();
+            for (part, chunk) in event_chunks(&body, EVENT_CHUNK_BYTES)
+                .into_iter()
+                .enumerate()
+            {
+                let hash = Sha256::digest(&chunk);
+                let short_hash = hash[..8]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                let stem = format!("track.{day}");
+                let key = format!(
+                    "{EVENTS}/{stream}/chunks/{stem}/{start:016x}-{end:016x}-{part:04}-{short_hash}.jsonl"
+                );
+                event_partitions::record_object(&mut object_index, &key, &chunk);
+                objects.push((key, chunk));
+            }
+            // Like the day range, exact object coverage is visible first. A
+            // referenced-but-not-yet-present path scans nothing; the inverse
+            // ordering could briefly make a new object invisible.
+            event_partitions::save_objects(b.as_ref(), &object_index)?;
+            for (key, chunk) in objects {
+                if b.put_if_absent(&key, &chunk)? {
+                    bytes_up += chunk.len() as u64;
+                    n += 1;
+                }
             }
         }
         start = end;
@@ -588,6 +619,11 @@ fn event_chunks(raw: &[u8], target: usize) -> Vec<Vec<u8>> {
 struct DownloadState {
     #[serde(default)]
     buckets: BTreeMap<String, BTreeMap<String, String>>,
+    /// Event-day writers may publish a newly observed older day after a newer
+    /// one. Per-day cursors preserve delta reads without assuming stream keys
+    /// are globally append-sorted.
+    #[serde(default)]
+    partitions: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Download all devices' event files from the bucket into `local_dir`. Writers
@@ -611,6 +647,7 @@ fn pull_events_from(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     let cursors = state.buckets.entry(bucket_uri.to_string()).or_default();
+    let partition_cursors = state.partitions.entry(bucket_uri.to_string()).or_default();
     let (mut n, mut bytes_down) = (0, 0u64);
     let markers = b.list(EVENT_STREAMS)?;
     let mut cursor_changed = false;
@@ -630,18 +667,57 @@ fn pull_events_from(
             if stream.is_empty() || stream.contains('/') {
                 continue;
             }
-            let chunk_prefix = format!("{EVENTS}/{stream}/chunks/");
-            let mut cursor = cursors.get(stream).cloned().unwrap_or_default();
-            if !cursor.is_empty() && !event_dest(local_dir, &cursor)?.is_file() {
-                cursor.clear(); // local corpus was pruned; reconstruct it
-            }
-            for key in b.list_after(&chunk_prefix, &cursor)? {
-                let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
-                n += usize::from(fetched);
-                bytes_down += bytes;
-                cursor = key;
-                cursors.insert(stream.to_string(), cursor.clone());
-                cursor_changed = true;
+            if let Some(index) = event_partitions::load(b, stream)? {
+                for day in index.physical_days() {
+                    let partition = format!("{stream}\0{day}");
+                    let chunk_prefix = format!("{EVENTS}/{stream}/chunks/track.{day}/");
+                    let mut cursor = partition_cursors
+                        .get(&partition)
+                        .cloned()
+                        .unwrap_or_default();
+                    if !cursor.is_empty() && !event_dest(local_dir, &cursor)?.is_file() {
+                        cursor.clear();
+                    }
+                    for key in b.list_after(&chunk_prefix, &cursor)? {
+                        let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
+                        n += usize::from(fetched);
+                        bytes_down += bytes;
+                        cursor = key;
+                        partition_cursors.insert(partition.clone(), cursor.clone());
+                        cursor_changed = true;
+                    }
+                }
+                // Mixed-version compatibility: an older writer does not know
+                // about the partition index. Its wall-clock day and increasing
+                // byte-range keys still append to the global stream ordering,
+                // so retain that cursor until every tracker has rolled forward.
+                let chunk_prefix = format!("{EVENTS}/{stream}/chunks/");
+                let mut cursor = cursors.get(stream).cloned().unwrap_or_default();
+                if !cursor.is_empty() && !event_dest(local_dir, &cursor)?.is_file() {
+                    cursor.clear();
+                }
+                for key in b.list_after(&chunk_prefix, &cursor)? {
+                    let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
+                    n += usize::from(fetched);
+                    bytes_down += bytes;
+                    cursor = key;
+                    cursors.insert(stream.to_string(), cursor.clone());
+                    cursor_changed = true;
+                }
+            } else {
+                let chunk_prefix = format!("{EVENTS}/{stream}/chunks/");
+                let mut cursor = cursors.get(stream).cloned().unwrap_or_default();
+                if !cursor.is_empty() && !event_dest(local_dir, &cursor)?.is_file() {
+                    cursor.clear(); // local corpus was pruned; reconstruct it
+                }
+                for key in b.list_after(&chunk_prefix, &cursor)? {
+                    let (fetched, bytes) = pull_event_key(b, &key, local_dir)?;
+                    n += usize::from(fetched);
+                    bytes_down += bytes;
+                    cursor = key;
+                    cursors.insert(stream.to_string(), cursor.clone());
+                    cursor_changed = true;
+                }
             }
             // Old mutable daily files sit beside `chunks/`, so this bounded
             // compatibility list never walks the immutable chunk history.
@@ -964,12 +1040,14 @@ mod tests {
             rev: 0,
             format: readmodel::FORMAT,
             writer: "new".into(),
+            published_at: "2026-07-22T10:00:00Z".into(),
         };
         let remote = readmodel::Current {
             build: "remote-v1".into(),
             rev: 9,
             format: 1,
             writer: "old".into(),
+            published_at: String::new(),
         };
         assert!(local_format_is_newer(Some(&local), &remote));
         assert!(!local_format_is_newer(None, &remote));
@@ -1100,6 +1178,15 @@ mod tests {
             !first[0].ends_with("track.2026-07-21.jsonl"),
             "growing daily file is never the cloud object"
         );
+        let object_index = event_partitions::load_objects(
+            &b,
+            "edge-m-codex",
+            "2026-07-21",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(object_index.objects.len(), 1);
+        assert!(object_index.objects.contains_key(&first[0]));
         let first_bytes = b.get(&first[0]).unwrap().unwrap();
 
         use std::io::Write;
@@ -1132,6 +1219,15 @@ mod tests {
             b.list("events").unwrap().len(),
             2,
             "append creates one new object"
+        );
+        assert_eq!(
+            event_partitions::load_objects(&b, "edge-m-codex", "2026-07-21")
+                .unwrap()
+                .unwrap()
+                .objects
+                .len(),
+            2,
+            "object coverage advances with immutable chunks"
         );
         assert_eq!(
             b.get(&first[0]).unwrap().unwrap(),
@@ -1303,8 +1399,8 @@ mod tests {
                 Some(cutoff),
             )
             .unwrap(),
-            1,
-            "first eligible delta carries staged metadata"
+            2,
+            "first eligible delta carries staged metadata in its own event day"
         );
         let b = crate::bucket::LocalFs::new(&bucket);
         let body = b
@@ -1369,7 +1465,9 @@ mod tests {
         ).unwrap(), 0);
         let calls = store.calls.lock().unwrap().clone();
         assert!(!calls.iter().any(|c| c == "list:events"), "historical event namespace was relisted: {calls:?}");
-        assert!(calls.iter().any(|c| c.starts_with("after:events/edge-m-codex/chunks/:events/edge-m-codex/chunks/")), "missing persisted stream cursor: {calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with(
+            "after:events/edge-m-codex/chunks/track.2026-07-21/:events/edge-m-codex/chunks/track.2026-07-21/"
+        )), "missing persisted partition cursor: {calls:?}");
 
         use std::io::Write;
         std::fs::OpenOptions::new().append(true).open(&file).unwrap()
@@ -1387,6 +1485,102 @@ mod tests {
             reader.to_str().unwrap(),
             &download_state,
         ).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_late_older_event_day_is_visible_after_a_newer_partition_cursor() {
+        let root =
+            std::env::temp_dir().join(format!("synty-event-late-day-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source/edge-m-codex");
+        let bucket = root.join("bucket");
+        let reader = root.join("reader");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("track.2026-07-23.jsonl"),
+            event("newer", "s", "user_prompt", "2026-07-23T10:00:00Z", "newer"),
+        )
+        .unwrap();
+        let upload_state = root.join("uploads.json");
+        push_events_with(
+            bucket.to_str().unwrap(),
+            root.join("source").to_str().unwrap(),
+            upload_state.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let download_state = reader.join(".downloads.json");
+        let store = crate::bucket::LocalFs::new(&bucket);
+        assert_eq!(
+            pull_events_from(
+                &store,
+                bucket.to_str().unwrap(),
+                reader.to_str().unwrap(),
+                &download_state,
+            )
+            .unwrap(),
+            1
+        );
+
+        std::fs::write(
+            source.join("track.2026-07-21.jsonl"),
+            event(
+                "late",
+                "s",
+                "assistant_message",
+                "2026-07-21T10:00:00Z",
+                "late",
+            ),
+        )
+        .unwrap();
+        push_events_with(
+            bucket.to_str().unwrap(),
+            root.join("source").to_str().unwrap(),
+            upload_state.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            pull_events_from(
+                &store,
+                bucket.to_str().unwrap(),
+                reader.to_str().unwrap(),
+                &download_state,
+            )
+            .unwrap(),
+            1,
+            "per-day cursors must discover a newly published older day"
+        );
+        let body = crate::units::jsonl_files(&reader.join("edge-m-codex"))
+            .into_iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .collect::<String>();
+        assert!(body.contains("\"event_id\":\"late\""), "{body}");
+        store
+            .put(
+                "events/edge-m-codex/chunks/track.2026-07-24/legacy-writer.jsonl",
+                event(
+                    "legacy",
+                    "s",
+                    "assistant_message",
+                    "2026-07-24T10:00:00Z",
+                    "legacy",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            pull_events_from(
+                &store,
+                bucket.to_str().unwrap(),
+                reader.to_str().unwrap(),
+                &download_state,
+            )
+            .unwrap(),
+            1,
+            "the compatibility cursor must discover an old writer's new day"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

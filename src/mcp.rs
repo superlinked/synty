@@ -9,7 +9,7 @@ use crate::{encode::Encoder, load_docs, readmodel, search, trace, units, view};
 use anyhow::Result;
 use next_plaid::{MmapIndex, SearchParameters};
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::{io::{BufRead, Write}, sync::{OnceLock, RwLock}};
 
 pub(crate) const PROTOCOL_VERSION: &str = "2025-11-25";
 pub(crate) const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
@@ -422,12 +422,68 @@ impl Server {
     }
 }
 
-/// Keep the selected published model fresh without holding the dispatcher.
-/// Athena readers omit trace.json; neither mode mirrors the raw event lake.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BucketFreshness {
+    pub newest_raw_event: Option<String>,
+    pub published_read_model: Option<String>,
+    pub read_model_format: Option<u32>,
+    pub checked_at: Option<String>,
+    pub error: Option<String>,
+}
+
+static BUCKET_FRESHNESS: OnceLock<RwLock<BucketFreshness>> = OnceLock::new();
+
+pub(crate) fn bucket_freshness() -> BucketFreshness {
+    BUCKET_FRESHNESS
+        .get_or_init(|| RwLock::new(BucketFreshness::default()))
+        .read()
+        .map(|freshness| freshness.clone())
+        .unwrap_or_default()
+}
+
+fn refresh_bucket_freshness(bucket_uri: &str) -> Result<BucketFreshness> {
+    let bucket = crate::bucket::open(bucket_uri)?;
+    let current = bucket
+        .get("current.json")?
+        .map(|raw| serde_json::from_slice::<readmodel::Current>(&raw))
+        .transpose()?;
+    Ok(BucketFreshness {
+        newest_raw_event: crate::event_partitions::bucket_newest_event(bucket.as_ref())?,
+        published_read_model: current.as_ref().and_then(|current| {
+            (!current.published_at.is_empty()).then(|| current.published_at.clone())
+        }),
+        read_model_format: current.as_ref().map(|current| current.format),
+        checked_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        error: None,
+    })
+}
+
+fn record_bucket_freshness(freshness: BucketFreshness) {
+    if let Ok(mut current) = BUCKET_FRESHNESS
+        .get_or_init(|| RwLock::new(BucketFreshness::default()))
+        .write()
+    {
+        *current = freshness;
+    }
+}
+
+/// Keep the selected published model and its remote freshness metadata current
+/// without holding a dispatcher. Athena readers omit trace.json and inspect
+/// only the small partition indexes; neither mode mirrors the raw event lake.
 pub(crate) fn start_bucket_refresh(bucket: Option<String>, include_trace: bool) {
     let Some(bucket) = bucket else { return };
     std::thread::spawn(move || loop {
         crate::sync::pull_read_model_for_mcp(&bucket, include_trace);
+        match refresh_bucket_freshness(&bucket) {
+            Ok(freshness) => record_bucket_freshness(freshness),
+            Err(error) => record_bucket_freshness(BucketFreshness {
+                checked_at: Some(
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ),
+                error: Some(error.to_string()),
+                ..Default::default()
+            }),
+        }
         std::thread::sleep(std::time::Duration::from_secs(30));
     });
 }
@@ -751,5 +807,40 @@ mod tests {
             .unwrap();
         assert_eq!(resp["result"]["isError"], true);
         assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("query"));
+    }
+
+    #[test]
+    fn bucket_freshness_reads_only_pointer_and_partition_metadata() {
+        use crate::bucket::Bucket;
+
+        let root =
+            std::env::temp_dir().join(format!("synty-bucket-freshness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bucket = crate::bucket::LocalFs::new(&root);
+        bucket
+            .put(
+                "current.json",
+                br#"{"build":"b","rev":1,"format":2,"writer":"0.2.5","published_at":"2026-07-22T12:00:00Z"}"#,
+            )
+            .unwrap();
+        bucket
+            .put(
+                "event-partitions/edge-m-codex.json",
+                br#"{"format":1,"stream":"edge-m-codex","partitions":{"2026-07-22":{"min_ts":"2026-07-22T10:00:00Z","max_ts":"2026-07-22T11:00:00Z"}}}"#,
+            )
+            .unwrap();
+
+        let freshness = refresh_bucket_freshness(root.to_str().unwrap()).unwrap();
+
+        assert_eq!(freshness.read_model_format, Some(2));
+        assert_eq!(
+            freshness.published_read_model.as_deref(),
+            Some("2026-07-22T12:00:00Z")
+        );
+        assert_eq!(
+            freshness.newest_raw_event.as_deref(),
+            Some("2026-07-22T11:00:00Z")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

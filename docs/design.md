@@ -46,11 +46,8 @@ flowchart LR
     B --> P["Published next-plaid read model"]
     E --> B
     P -->|"download + mmap"| MCP["Read-only MCP"]
-    S3 -->|"external table; zero-copy fallback"| G["Glue raw_events"]
-    S3 -.->|"separate authorized projector"| Q["Immutable Parquet copy"]
-    Q --> GP["Glue trace_events_v1"]
+    S3 -->|"external table; no migration"| G["Glue raw_events"]
     G --> A["Bounded Athena SELECT"]
-    GP --> A
     A -->|"bounded raw envelopes"| F["Rust trace fold"]
     F --> MCP
     MCP --> H["Harness agents"]
@@ -65,16 +62,12 @@ jobs. The MCP pod does not need a trace projection job or `trace.json` on its
 volume. Local CLI/TUI operation stays self-contained and can use the local
 projection offline.
 
-The raw-table overlay is the zero-copy bootstrap, not a columnar rewrite:
-Athena still scans selected JSONL object bytes. The catalog also defines an
-empty, schema-compatible Parquet table under a separate derived prefix. A
-separately authorized projector can backfill existing `(stream, day)`
-partitions and compact new closed days without moving or deleting raw objects;
-the read-only MCP then switches table names without changing its query or fold.
-The catalog/read path is built. The projector and typed turn/span/job Parquet
-tables are not: line-compatible Parquet reduces scan and small-file overhead,
-but precomputed entities are the later step that removes the 64 MiB
-raw-envelope transfer ceiling for broad forensic queries.
+The raw-table overlay is a zero-copy query path, not a columnar rewrite:
+Athena still scans the selected JSONL object bytes. A compact per-stream
+partition-range index maps event-time windows onto physical days, including
+legacy capture-day chunks; per-day object-range indexes then prune immutable
+files through Athena's hidden `$path` column. Neither rewrites the authoritative
+objects.
 
 ## Engine
 
@@ -225,12 +218,17 @@ runs on CI or a server without a developer machine.
   artifacts in the background; it does not mirror the raw event lake. With
   `--athena-workgroup`, trace calls issue only bounded `SELECT` statements over
   the existing S3 event chunks and fold the returned rows in Rust. The backend
-  discovers injected stream partitions from `event-streams/`, caps the time
-  window at seven days, rows at 50,000, returned bytes at 64 MiB, query time at
-  50 seconds, and relies on a workgroup scan cutoff as the final cost guard.
+  discovers injected stream partitions from `event-streams/`, resolves
+  event-time windows through `event-partitions/<stream>.json`, caps the time
+  window at seven days, rows at 50,000, returned bytes at 64 MiB, and all
+  Athena work for one request at a shared 45-second budget. Queries include at
+  most 1,000 exact raw-object `$path` values. A workgroup scan cutoff is the
+  final cost guard; missing partition or object coverage is included
+  conservatively.
   `/health` remains a liveness check, while `/ready` requires the semantic
-  index, compact analysis projection, and both dispatchers; local-projection
-  mode additionally requires `trace.json`. Analysis calls use a
+  index, compact analysis projection, a compatible bucket read-model format,
+  and both dispatchers; local-projection mode additionally requires
+  `trace.json`. Health and status expose bucket raw/model freshness. Analysis calls use a
   serialized one-slot dispatcher so concurrent first loads cannot multiply
   memory or block semantic search. Each dispatcher has a bounded queue; HTTP
   clients have a 120-second response deadline and a per-client
@@ -282,11 +280,7 @@ instead: the external table exposes each JSONL envelope as one `line` column
 and partition projection maps `(stream, day)` directly onto existing keys.
 There is no one-time data migration or crawler. Returned rows are folded into
 the same trace structures, then the existing scope and rendering logic runs.
-An optional Parquet table preserves that exact three-column query contract at a
-separate derived prefix, allowing a no-code reader switch after a historical
-backfill. The JSONL objects remain authoritative and lossless; backfill copies
-and compacts them but never relocates them. *Raw and Parquet catalog/read
-contracts built; projector planned.*
+The raw envelopes remain authoritative and lossless. *Built.*
 
 ## Tiers and the trust boundary
 
@@ -339,12 +333,18 @@ bucket and drops into the viewer, so a paste goes from nothing to tracking.
 ## Storage layout (bucket)
 
 ```text
-events/<stream>/chunks/<track-day>/<range-hash>.jsonl
+events/<stream>/chunks/track.<event-day>/<range-hash>.jsonl
                                       immutable append deltas (source of truth);
                                         stream = edge-<machine>-<source>, so many
                                         trackers' files coexist without collision
-event-streams/<stream>                immutable bounded discovery registry;
-                                        readers continue each stream by key cursor
+event-streams/<stream>                immutable bounded discovery registry
+event-partitions/<stream>.json        physical day → complete event-time range;
+                                        legacy/unindexed days remain unconditional
+                                        query candidates (metadata-only; mutable)
+event-partitions/<stream>/track.<day>.json
+                                      immutable object → event-time range;
+                                        Athena uses exact $path pruning;
+                                        readers continue each day by key cursor
 members/<machine>/activation.json     immutable init access marker (no session data)
 embeddings/<hash[..2]>/<hash>.emb      content-addressed f16 vectors (write-once)
 summaries/<kh[..2]>/<kh>-<ihash>.json  per-(unit, input-hash) LLM summaries
@@ -373,9 +373,13 @@ fleet model is **no designated builder**: every tracker pushes events; whoever
 opens a local viewer pulls all raw streams and the published read-model, then
 contributes a build. MCP-only readers pull semantic/analysis artifacts without
 bucket write access or a raw-history mirror; an S3 reader can query trace rows
-through the read-only Glue/Athena overlay. Local commands can inspect and
-rebuild from every machine, while semantic results cover the latest published
-build and warn when newer raw chunks are pending.
+through the read-only Glue/Athena overlay. The partition-range index makes
+delayed event-time windows queryable without moving JSONL: new writers publish
+by event UTC day, while days created by old writers remain conservative until
+an optional metadata-only range backfill proves their exact day and object
+coverage. Local
+commands can inspect and rebuild from every machine, while semantic results
+cover the latest published build and warn when newer raw chunks are pending.
 Write-once stores are the collaboration primitive: a viewer encodes and
 summarizes only what no other machine has (pending lists shuffle per machine,
 so concurrent viewers split the work). The lease only prevents duplicate index

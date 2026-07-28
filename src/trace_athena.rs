@@ -2,7 +2,7 @@
 // lake by injected stream partitions and a bounded time window; the existing
 // trace fold then reconstructs turns, spans, and jobs from only those rows.
 
-use crate::{bucket, metrics, policy::ReadScope, trace};
+use crate::{bucket, event_partitions, metrics, policy::ReadScope, trace};
 use anyhow::{Context, Result, bail};
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_athena::types::{QueryExecutionContext, QueryExecutionState};
@@ -16,7 +16,9 @@ const MAX_LOOKBACK_HOURS: i64 = 24 * 7;
 const MAX_EVENTS: usize = 50_000;
 const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SESSIONS: usize = 200;
-const QUERY_TIMEOUT: StdDuration = StdDuration::from_secs(50);
+const MAX_OBJECT_PATHS: usize = 1_000;
+const MAX_PATH_PREDICATE_BYTES: usize = 200_000;
+const REQUEST_QUERY_TIMEOUT: StdDuration = StdDuration::from_secs(45);
 const AWS_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const AWS_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
@@ -55,8 +57,13 @@ struct QueryRows {
     lines: Vec<String>,
 }
 
+struct ObjectSelection {
+    days: Vec<String>,
+    paths: Vec<String>,
+}
+
 trait EventQuery: Send {
-    fn run(&mut self, sql: &str) -> Result<QueryRows>;
+    fn run(&mut self, sql: &str, deadline: Instant) -> Result<QueryRows>;
 }
 
 struct AwsEventQuery {
@@ -94,136 +101,149 @@ impl AwsEventQuery {
 }
 
 impl EventQuery for AwsEventQuery {
-    fn run(&mut self, sql: &str) -> Result<QueryRows> {
-        anyhow::ensure!(
-            sql.trim_start().to_ascii_uppercase().starts_with("SELECT "),
-            "Athena trace only permits SELECT statements"
-        );
+    fn run(&mut self, sql: &str, deadline: Instant) -> Result<QueryRows> {
         let started = Instant::now();
-        let execution = self
-            .runtime
-            .block_on(
-                self.client
-                    .start_query_execution()
-                    .work_group(&self.workgroup)
-                    .query_execution_context(
-                        QueryExecutionContext::builder()
-                            .database(&self.database)
-                            .build(),
-                    )
-                    .query_string(sql)
-                    .send(),
-            )
-            .context("start Athena trace query")?;
-        let id = execution
-            .query_execution_id()
-            .context("Athena returned no query execution id")?
-            .to_string();
-
-        let scanned_bytes = loop {
-            if started.elapsed() >= QUERY_TIMEOUT {
-                let _ = self.runtime.block_on(
-                    self.client
-                        .stop_query_execution()
-                        .query_execution_id(&id)
-                        .send(),
-                );
-                bail!(
-                    "Athena trace query timed out after {} seconds",
-                    QUERY_TIMEOUT.as_secs()
-                );
-            }
+        let mut row_count = 0usize;
+        let mut result_bytes = 0usize;
+        let mut scanned_bytes = 0i64;
+        let result = (|| {
+            anyhow::ensure!(
+                sql.trim_start().to_ascii_uppercase().starts_with("SELECT "),
+                "Athena trace only permits SELECT statements"
+            );
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "Athena trace request timed out before query execution"
+            );
             let execution = self
                 .runtime
                 .block_on(
                     self.client
-                        .get_query_execution()
-                        .query_execution_id(&id)
+                        .start_query_execution()
+                        .work_group(&self.workgroup)
+                        .query_execution_context(
+                            QueryExecutionContext::builder()
+                                .database(&self.database)
+                                .build(),
+                        )
+                        .query_string(sql)
                         .send(),
                 )
-                .context("poll Athena trace query")?;
-            let query = execution
-                .query_execution()
-                .context("Athena returned no query execution")?;
-            let status = query.status().context("Athena returned no query status")?;
-            match status.state() {
-                Some(QueryExecutionState::Succeeded) => {
-                    break query
-                        .statistics()
-                        .and_then(|statistics| statistics.data_scanned_in_bytes())
-                        .unwrap_or(0);
-                }
-                Some(QueryExecutionState::Failed | QueryExecutionState::Cancelled) => {
-                    bail!(
-                        "Athena trace query {}: {}",
-                        status
-                            .state()
-                            .map(|state| state.as_str())
-                            .unwrap_or("failed"),
-                        status.state_change_reason().unwrap_or("no reason returned")
-                    );
-                }
-                _ => std::thread::sleep(StdDuration::from_millis(250)),
-            }
-        };
+                .context("start Athena trace query")?;
+            let id = execution
+                .query_execution_id()
+                .context("Athena returned no query execution id")?
+                .to_string();
 
-        let mut lines = Vec::new();
-        let mut bytes = 0usize;
-        let mut next_token = None;
-        let mut first_page = true;
-        loop {
-            anyhow::ensure!(
-                started.elapsed() < QUERY_TIMEOUT,
-                "Athena trace result retrieval timed out after {} seconds",
-                QUERY_TIMEOUT.as_secs()
-            );
-            let mut request = self
-                .client
-                .get_query_results()
-                .query_execution_id(&id)
-                .max_results(1000);
-            if let Some(token) = next_token.as_deref() {
-                request = request.next_token(token);
-            }
-            let page = self
-                .runtime
-                .block_on(request.send())
-                .context("read Athena trace query results")?;
-            if let Some(result_set) = page.result_set() {
-                for (index, row) in result_set.rows().iter().enumerate() {
-                    if first_page && index == 0 {
-                        continue;
+            scanned_bytes = loop {
+                if Instant::now() >= deadline {
+                    let _ = self.runtime.block_on(
+                        self.client
+                            .stop_query_execution()
+                            .query_execution_id(&id)
+                            .send(),
+                    );
+                    bail!("Athena trace request timed out after its shared query budget");
+                }
+                let execution = self
+                    .runtime
+                    .block_on(
+                        self.client
+                            .get_query_execution()
+                            .query_execution_id(&id)
+                            .send(),
+                    )
+                    .context("poll Athena trace query")?;
+                let query = execution
+                    .query_execution()
+                    .context("Athena returned no query execution")?;
+                let status = query.status().context("Athena returned no query status")?;
+                match status.state() {
+                    Some(QueryExecutionState::Succeeded) => {
+                        break query
+                            .statistics()
+                            .and_then(|statistics| statistics.data_scanned_in_bytes())
+                            .unwrap_or(0);
                     }
-                    let Some(line) = row.data().first().and_then(|datum| datum.var_char_value())
-                    else {
-                        continue;
-                    };
-                    bytes = bytes.saturating_add(line.len());
-                    anyhow::ensure!(
-                        bytes <= MAX_RESULT_BYTES,
-                        "Athena trace selection exceeds {} MiB; narrow the time, machine, source, or operation filter",
-                        MAX_RESULT_BYTES / 1024 / 1024
-                    );
-                    lines.push(line.to_string());
-                    anyhow::ensure!(
-                        lines.len() <= MAX_EVENTS,
-                        "Athena trace selection exceeds {MAX_EVENTS} events; narrow the time, machine, source, or operation filter"
-                    );
+                    Some(QueryExecutionState::Failed | QueryExecutionState::Cancelled) => {
+                        bail!(
+                            "Athena trace query {}: {}",
+                            status
+                                .state()
+                                .map(|state| state.as_str())
+                                .unwrap_or("failed"),
+                            status.state_change_reason().unwrap_or("no reason returned")
+                        );
+                    }
+                    _ => std::thread::sleep(StdDuration::from_millis(250)),
+                }
+            };
+
+            let mut lines = Vec::new();
+            let mut next_token = None;
+            let mut first_page = true;
+            loop {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "Athena trace result retrieval timed out after its shared query budget"
+                );
+                let mut request = self
+                    .client
+                    .get_query_results()
+                    .query_execution_id(&id)
+                    .max_results(1000);
+                if let Some(token) = next_token.as_deref() {
+                    request = request.next_token(token);
+                }
+                let page = self
+                    .runtime
+                    .block_on(request.send())
+                    .context("read Athena trace query results")?;
+                if let Some(result_set) = page.result_set() {
+                    for (index, row) in result_set.rows().iter().enumerate() {
+                        if first_page && index == 0 {
+                            continue;
+                        }
+                        let Some(line) =
+                            row.data().first().and_then(|datum| datum.var_char_value())
+                        else {
+                            continue;
+                        };
+                        result_bytes = result_bytes.saturating_add(line.len());
+                        anyhow::ensure!(
+                            result_bytes <= MAX_RESULT_BYTES,
+                            "Athena trace selection exceeds {} MiB; narrow the time, machine, source, or operation filter",
+                            MAX_RESULT_BYTES / 1024 / 1024
+                        );
+                        lines.push(line.to_string());
+                        row_count = lines.len();
+                        anyhow::ensure!(
+                            lines.len() <= MAX_EVENTS,
+                            "Athena trace selection exceeds {MAX_EVENTS} events; narrow the time, machine, source, or operation filter"
+                        );
+                    }
+                }
+                first_page = false;
+                next_token = page.next_token().map(str::to_string);
+                if next_token.is_none() {
+                    break;
                 }
             }
-            first_page = false;
-            next_token = page.next_token().map(str::to_string);
-            if next_token.is_none() {
-                break;
-            }
-        }
+            Ok(QueryRows { lines })
+        })();
+        let outcome = result
+            .as_ref()
+            .err()
+            .map(|error| query_outcome(&error.to_string()))
+            .unwrap_or("success");
         metrics::Run::new("athena_trace")
-            .set("rows", lines.len())
-            .set("result_bytes", bytes)
+            .set("outcome", outcome)
+            .set("rows", row_count)
+            .set("result_bytes", result_bytes)
             .set("scanned_bytes", scanned_bytes)
             .set("elapsed_ms", started.elapsed().as_millis() as u64)
             .emit();
-        Ok(QueryRows { lines })
+        result
     }
 }
 
@@ -233,6 +253,8 @@ pub(crate) struct Backend {
     // Tests inject a fixed registry; production re-lists the bounded registry
     // for every tool call so newly enrolled streams appear without a restart.
     streams: Option<Vec<String>>,
+    // Tests may inject physical partitions without opening a real bucket.
+    days: Option<Vec<String>>,
     cached: Option<trace::TraceStore>,
 }
 
@@ -243,6 +265,7 @@ impl Backend {
             config,
             query,
             streams: None,
+            days: None,
             cached: None,
         })
     }
@@ -263,6 +286,7 @@ impl Backend {
         limit: usize,
         scope: &ReadScope,
     ) -> Result<String> {
+        let deadline = Instant::now() + REQUEST_QUERY_TIMEOUT;
         let window = Window::parse(since, None, DEFAULT_LIST_HOURS)?;
         let store = self.load_store(
             window,
@@ -273,6 +297,7 @@ impl Backend {
             &[],
             operation.is_some(),
             scope,
+            deadline,
         )?;
         let out = trace::list_store_text(
             &store,
@@ -290,6 +315,7 @@ impl Backend {
             false,
             Some(scope),
         )?;
+        self.cached = Some(store);
         Ok(out)
     }
 
@@ -305,8 +331,10 @@ impl Backend {
         {
             return Ok(out);
         }
+        let deadline = Instant::now() + REQUEST_QUERY_TIMEOUT;
         let window = Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?;
-        let store = self.load_store(window, None, None, None, None, &[id], true, scope)?;
+        let store =
+            self.load_store(window, None, None, None, None, &[id], true, scope, deadline)?;
         let out = trace::show_store_text(&store, id, before, after, false, Some(scope))?;
         self.cached = Some(store);
         Ok(out)
@@ -323,6 +351,7 @@ impl Backend {
         limit: usize,
         scope: &ReadScope,
     ) -> Result<String> {
+        let deadline = Instant::now() + REQUEST_QUERY_TIMEOUT;
         let window = Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?;
         let store = self.load_store(
             window,
@@ -333,6 +362,7 @@ impl Backend {
             &[],
             false,
             scope,
+            deadline,
         )?;
         let out = trace::search_store_text(
             &store,
@@ -354,8 +384,19 @@ impl Backend {
         {
             return Ok(out);
         }
+        let deadline = Instant::now() + REQUEST_QUERY_TIMEOUT;
         let window = Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?;
-        let store = self.load_store(window, None, None, None, None, &[left, right], true, scope)?;
+        let store = self.load_store(
+            window,
+            None,
+            None,
+            None,
+            None,
+            &[left, right],
+            true,
+            scope,
+            deadline,
+        )?;
         let out = trace::compare_store_text(&store, left, right, false, Some(scope))?;
         self.cached = Some(store);
         Ok(out)
@@ -372,17 +413,18 @@ impl Backend {
         ids: &[&str],
         expand_matching_sessions: bool,
         scope: &ReadScope,
+        deadline: Instant,
     ) -> Result<trace::TraceStore> {
-        let streams = self.selected_streams(machine)?;
+        let streams = self.selected_streams(machine, source, scope)?;
         let predicate = Predicate {
             source: source.map(str::to_string),
             scope_sources: scope.sources.clone(),
             needle: needle.map(str::to_string),
             kind_contains: kind.map(str::to_string),
-            ids: ids.iter().map(|id| (*id).to_string()).collect(),
+            ids: ids.iter().map(|id| query_id(id).to_string()).collect(),
             ..Default::default()
         };
-        let first = self.select(&streams, window, &predicate)?;
+        let first = self.select(&streams, window, &predicate, deadline)?;
         let sessions = event_sessions(&first.lines);
         anyhow::ensure!(
             sessions.len() <= MAX_SESSIONS,
@@ -406,6 +448,7 @@ impl Backend {
                     scope_sources: scope.sources.clone(),
                     ..Default::default()
                 },
+                deadline,
             )?
             .lines
         } else {
@@ -423,6 +466,7 @@ impl Backend {
                         dedupe_session_kinds: true,
                         ..Default::default()
                     },
+                    deadline,
                 )?
                 .lines;
             contexts.append(&mut lines);
@@ -436,12 +480,30 @@ impl Backend {
         streams: &[String],
         window: Window,
         predicate: &Predicate,
+        deadline: Instant,
     ) -> Result<QueryRows> {
-        let sql = select_sql(&self.config, streams, window, predicate, MAX_EVENTS + 1)?;
-        self.query.run(&sql)
+        let selection = self.selected_objects(streams, window)?;
+        if selection.paths.is_empty() {
+            return Ok(QueryRows { lines: Vec::new() });
+        }
+        let sql = select_sql(
+            &self.config,
+            streams,
+            &selection.days,
+            &selection.paths,
+            window,
+            predicate,
+            MAX_EVENTS + 1,
+        )?;
+        self.query.run(&sql, deadline)
     }
 
-    fn selected_streams(&mut self, machine: Option<&str>) -> Result<Vec<String>> {
+    fn selected_streams(
+        &mut self,
+        machine: Option<&str>,
+        source: Option<&str>,
+        scope: &ReadScope,
+    ) -> Result<Vec<String>> {
         let mut streams = if let Some(streams) = &self.streams {
             streams.clone()
         } else {
@@ -458,15 +520,119 @@ impl Backend {
             );
             streams
         };
-        if let Some(machine) = machine {
-            let machine = machine.to_ascii_lowercase();
-            streams.retain(|stream| stream.to_ascii_lowercase().contains(&machine));
-        }
+        let machine = machine.map(str::to_ascii_lowercase);
+        let requested_source = source.and_then(canonical_source);
+        let scope_sources = scope
+            .sources
+            .iter()
+            .filter_map(|source| canonical_source(source))
+            .collect::<BTreeSet<_>>();
+        streams.retain(|stream| {
+            let Some((stream_machine, stream_source)) = crate::identity::stream_parts(stream)
+            else {
+                return machine.is_none() && requested_source.is_none() && scope_sources.is_empty();
+            };
+            machine
+                .as_deref()
+                .is_none_or(|wanted| stream_machine.eq_ignore_ascii_case(wanted))
+                && requested_source.is_none_or(|wanted| stream_source.eq_ignore_ascii_case(wanted))
+                && (scope_sources.is_empty()
+                    || canonical_source(stream_source)
+                        .is_some_and(|source| scope_sources.contains(&source)))
+        });
         anyhow::ensure!(
             !streams.is_empty(),
-            "no event streams match the machine filter"
+            "no event streams match the machine, source, and read-scope filters"
         );
         Ok(streams)
+    }
+
+    fn selected_objects(&self, streams: &[String], window: Window) -> Result<ObjectSelection> {
+        if let Some(days) = &self.days {
+            let stream = streams.first().context("Athena trace needs a test stream")?;
+            return Ok(ObjectSelection {
+                days: days.clone(),
+                paths: days
+                    .iter()
+                    .map(|day| {
+                        format!(
+                            "{}/events/{stream}/chunks/track.{day}/test.jsonl",
+                            self.config.bucket.trim_end_matches('/')
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        let bucket = bucket::open(&self.config.bucket)?;
+        let mut selected = BTreeSet::new();
+        for stream in streams {
+            let physical = bucket
+                .list(&format!("events/{stream}/chunks/"))?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            if let Some(index) = event_partitions::load(bucket.as_ref(), stream)? {
+                let mut days = index.candidate_days(window.since, window.until);
+                let indexed = index.physical_days();
+                days.extend(
+                    physical
+                        .iter()
+                        .filter_map(|key| event_partitions::day_from_event_key(key))
+                        .filter(|day| !indexed.contains(*day))
+                        .map(str::to_string),
+                );
+                for day in days {
+                    let physical_day = physical
+                        .iter()
+                        .filter(|key| {
+                            event_partitions::day_from_event_key(key) == Some(day.as_str())
+                        })
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    if let Some(objects) =
+                        event_partitions::load_objects(bucket.as_ref(), stream, &day)?
+                    {
+                        let indexed_objects =
+                            objects.objects.keys().cloned().collect::<BTreeSet<_>>();
+                        selected.extend(
+                            objects.candidate_objects(window.since, window.until),
+                        );
+                        selected.extend(
+                            physical_day
+                                .difference(&indexed_objects)
+                                .cloned(),
+                        );
+                    } else {
+                        selected.extend(physical_day);
+                    }
+                }
+            } else {
+                selected.extend(physical);
+            }
+        }
+        anyhow::ensure!(
+            selected.len() <= MAX_OBJECT_PATHS,
+            "Athena trace selection needs {} raw objects, exceeding the {MAX_OBJECT_PATHS}-object query limit; narrow the machine, source, or time filter, or backfill object-range metadata",
+            selected.len()
+        );
+        let path_bytes = selected
+            .iter()
+            .map(|key| key.len() + self.config.bucket.len() + 4)
+            .sum::<usize>();
+        anyhow::ensure!(
+            path_bytes <= MAX_PATH_PREDICATE_BYTES,
+            "Athena trace object paths need {path_bytes} SQL bytes, exceeding the {MAX_PATH_PREDICATE_BYTES}-byte path-predicate limit; narrow the machine, source, or time filter"
+        );
+        let days = selected
+            .iter()
+            .filter_map(|key| event_partitions::day_from_event_key(key).map(str::to_string))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let paths = selected
+            .into_iter()
+            .map(|key| format!("{}/{}", self.config.bucket.trim_end_matches('/'), key))
+            .collect();
+        Ok(ObjectSelection { days, paths })
     }
 }
 
@@ -522,6 +688,8 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>> {
 fn select_sql(
     config: &Config,
     streams: &[String],
+    days: &[String],
+    paths: &[String],
     window: Window,
     predicate: &Predicate,
     limit: usize,
@@ -530,18 +698,27 @@ fn select_sql(
         !streams.is_empty(),
         "Athena trace needs at least one stream"
     );
+    anyhow::ensure!(!days.is_empty(), "Athena trace needs at least one day");
+    anyhow::ensure!(!paths.is_empty(), "Athena trace needs at least one object path");
     let stream_values = streams
         .iter()
         .map(|stream| sql_string(stream))
         .collect::<Vec<_>>()
         .join(", ");
+    let day_values = days
+        .iter()
+        .map(|day| sql_string(day))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let path_values = paths
+        .iter()
+        .map(|path| sql_string(path))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut clauses = vec![
         format!("stream IN ({stream_values})"),
-        format!(
-            "day BETWEEN {} AND {}",
-            sql_string(&window.since.format("%Y-%m-%d").to_string()),
-            sql_string(&window.until.format("%Y-%m-%d").to_string())
-        ),
+        format!("day IN ({day_values})"),
+        format!("\"$path\" IN ({path_values})"),
         format!(
             "from_iso8601_timestamp(json_extract_scalar(line, '$.ts')) >= from_iso8601_timestamp({})",
             sql_string(&window.since.to_rfc3339())
@@ -656,6 +833,32 @@ fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn query_id(id: &str) -> &str {
+    id.strip_prefix("job:").unwrap_or(id)
+}
+
+fn canonical_source(source: &str) -> Option<&'static str> {
+    match source.to_ascii_lowercase().as_str() {
+        "codex" | "codex_cli" | "codex-cli" => Some("codex"),
+        "claude" | "claudecode" | "claude_code" | "claude-code" => Some("claudecode"),
+        "cowork" => Some("cowork"),
+        "harness" => Some("harness"),
+        "devin" => Some("devin"),
+        _ => None,
+    }
+}
+
+fn query_outcome(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("timed out") {
+        "timeout"
+    } else if error.contains("exceeds") || error.contains("limited to") {
+        "limit"
+    } else {
+        "error"
+    }
+}
+
 fn validate_name(label: &str, value: &str, lowercase_only: bool) -> Result<()> {
     let valid = !value.is_empty()
         && value.len() <= 128
@@ -683,7 +886,7 @@ mod tests {
     }
 
     impl EventQuery for FakeQuery {
-        fn run(&mut self, sql: &str) -> Result<QueryRows> {
+        fn run(&mut self, sql: &str, _deadline: Instant) -> Result<QueryRows> {
             self.calls.lock().unwrap().push(sql.to_string());
             Ok(QueryRows {
                 lines: self.lines.clone(),
@@ -712,6 +915,11 @@ mod tests {
         let sql = select_sql(
             &config,
             &["edge-m-codex".into()],
+            &["2026-07-20".into(), "2026-07-22".into()],
+            &[
+                "s3://bucket/events/edge-m-codex/chunks/track.2026-07-20/a.jsonl".into(),
+                "s3://bucket/events/edge-m-codex/chunks/track.2026-07-22/b.jsonl".into(),
+            ],
             Window {
                 since: parse_time("2026-07-22T10:00:00Z").unwrap(),
                 until: parse_time("2026-07-22T11:00:00Z").unwrap(),
@@ -722,37 +930,11 @@ mod tests {
         .unwrap();
         assert!(sql.starts_with("SELECT line"));
         assert!(sql.contains("stream IN ('edge-m-codex')"));
-        assert!(sql.contains("day BETWEEN '2026-07-22' AND '2026-07-22'"));
+        assert!(sql.contains("day IN ('2026-07-20', '2026-07-22')"));
+        assert!(sql.contains("\"$path\" IN ('s3://bucket/events/edge-m-codex/"));
         for mutating in ["INSERT", "UPDATE", "DELETE", "CREATE", "UNLOAD", "CTAS"] {
             assert!(!sql.to_ascii_uppercase().contains(mutating), "{mutating}");
         }
-    }
-
-    #[test]
-    fn parquet_line_table_preserves_the_raw_query_contract() {
-        let config = Config::new(
-            "s3://bucket".into(),
-            "wg".into(),
-            "synty".into(),
-            "trace_events_v1".into(),
-        )
-        .unwrap();
-        let sql = select_sql(
-            &config,
-            &["edge-m-codex".into()],
-            Window {
-                since: parse_time("2026-07-23T10:00:00Z").unwrap(),
-                until: parse_time("2026-07-23T11:00:00Z").unwrap(),
-            },
-            &Predicate::default(),
-            20,
-        )
-        .unwrap();
-
-        assert!(sql.starts_with("SELECT line"));
-        assert!(sql.contains("FROM \"synty\".\"trace_events_v1\""));
-        assert!(sql.contains("stream IN ('edge-m-codex')"));
-        assert!(sql.contains("day BETWEEN '2026-07-23' AND '2026-07-23'"));
     }
 
     #[test]
@@ -792,6 +974,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
             streams: Some(vec!["edge-m-codex".into()]),
+            days: Some(vec!["2026-07-22".into()]),
             cached: None,
         };
         let out = backend
@@ -852,6 +1035,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
             streams: Some(vec!["edge-m-codex".into()]),
+            days: Some(vec!["2026-07-22".into()]),
             cached: None,
         };
 
@@ -912,6 +1096,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
             streams: Some(vec!["edge-m-codex".into()]),
+            days: Some(vec!["2026-07-22".into()]),
             cached: None,
         };
 
@@ -922,6 +1107,192 @@ mod tests {
         assert_eq!(calls.len(), 2, "id lookup plus one full-session query");
         assert!(calls[1].contains("$.session_id"));
         assert!(!calls[1].contains("synty_context_rank"));
+    }
+
+    #[test]
+    fn listed_job_ids_query_the_native_span_id() {
+        let lines = vec![
+            event(
+                "call-1",
+                "2026-07-22T10:00:01Z",
+                "tool_call",
+                json!({"name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"cargo test\"}"}),
+            ),
+            event(
+                "result-1",
+                "2026-07-22T10:00:03Z",
+                "tool_result",
+                json!({"call_id":"c1","output":"Process running with session ID 42"}),
+            ),
+        ];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = Config::new(
+            "s3://bucket".into(),
+            "wg".into(),
+            "synty".into(),
+            "raw_events".into(),
+        )
+        .unwrap();
+        let mut backend = Backend {
+            config,
+            query: Box::new(FakeQuery {
+                lines,
+                calls: Arc::clone(&calls),
+            }),
+            streams: Some(vec!["edge-m-codex".into()]),
+            days: Some(vec!["2026-07-22".into()]),
+            cached: None,
+        };
+
+        let out = backend
+            .show("job:call-1", 3, 5, &ReadScope::default())
+            .unwrap();
+
+        assert!(out.contains("cargo test"), "{out}");
+        let calls = calls.lock().unwrap();
+        assert!(calls[0].contains("'call-1'"));
+        assert!(!calls[0].contains("'job:call-1'"));
+    }
+
+    #[test]
+    fn stream_pruning_uses_exact_machine_and_canonical_source_suffixes() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = Config::new(
+            "s3://bucket".into(),
+            "wg".into(),
+            "synty".into(),
+            "raw_events".into(),
+        )
+        .unwrap();
+        let mut backend = Backend {
+            config,
+            query: Box::new(FakeQuery {
+                lines: Vec::new(),
+                calls,
+            }),
+            streams: Some(vec![
+                "edge-dev-box-codex".into(),
+                "edge-dev-box-claudecode".into(),
+                "edge-dev-box-2-codex".into(),
+            ]),
+            days: Some(vec!["2026-07-22".into()]),
+            cached: None,
+        };
+        let scope = ReadScope {
+            sources: vec!["codex_cli".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            backend
+                .selected_streams(Some("dev-box"), Some("codex_cli"), &scope)
+                .unwrap(),
+            vec!["edge-dev-box-codex"]
+        );
+    }
+
+    #[test]
+    fn partition_ranges_select_delayed_and_unknown_physical_days() {
+        use crate::bucket::Bucket;
+
+        let root =
+            std::env::temp_dir().join(format!("synty-athena-partitions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bucket = crate::bucket::LocalFs::new(&root);
+        for day in ["2026-07-19", "2026-07-20", "2026-07-24"] {
+            bucket
+                .put(
+                    &format!("events/edge-m-codex/chunks/track.{day}/one.jsonl"),
+                    b"{}\n",
+                )
+                .unwrap();
+        }
+        bucket
+            .put(
+                "events/edge-m-codex/chunks/track.2026-07-20/old.jsonl",
+                b"{}\n",
+            )
+            .unwrap();
+        bucket
+            .put(
+                "event-partitions/edge-m-codex.json",
+                serde_json::to_string(&json!({
+                    "format": 1,
+                    "stream": "edge-m-codex",
+                    "legacy_days": ["2026-07-19"],
+                    "partitions": {
+                        "2026-07-20": {
+                            "min_ts": "2026-07-22T10:00:00Z",
+                            "max_ts": "2026-07-22T11:00:00Z"
+                        }
+                    },
+                    "updated_at": "2026-07-24T12:00:00Z"
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+        bucket
+            .put(
+                "event-partitions/edge-m-codex/track.2026-07-20.json",
+                serde_json::to_string(&json!({
+                    "format": 1,
+                    "stream": "edge-m-codex",
+                    "day": "2026-07-20",
+                    "objects": {
+                        "events/edge-m-codex/chunks/track.2026-07-20/one.jsonl": {
+                            "min_ts": "2026-07-22T10:00:00Z",
+                            "max_ts": "2026-07-22T11:00:00Z"
+                        },
+                        "events/edge-m-codex/chunks/track.2026-07-20/old.jsonl": {
+                            "min_ts": "2026-06-21T10:00:00Z",
+                            "max_ts": "2026-06-21T11:00:00Z"
+                        }
+                    }
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+        let backend = Backend {
+            config: Config {
+                bucket: root.to_string_lossy().into_owned(),
+                workgroup: "wg".into(),
+                database: "synty".into(),
+                table: "raw_events".into(),
+            },
+            query: Box::new(FakeQuery {
+                lines: Vec::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+            streams: Some(vec!["edge-m-codex".into()]),
+            days: None,
+            cached: None,
+        };
+        let selection = backend
+            .selected_objects(
+                &["edge-m-codex".into()],
+                Window {
+                    since: parse_time("2026-07-22T10:30:00Z").unwrap(),
+                    until: parse_time("2026-07-22T10:45:00Z").unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            selection.days,
+            ["2026-07-19", "2026-07-20", "2026-07-24"]
+        );
+        assert_eq!(selection.paths.len(), 3);
+        assert!(!selection.paths.iter().any(|path| path.ends_with("/old.jsonl")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn query_metrics_classify_timeouts_and_limits() {
+        assert_eq!(query_outcome("request timed out"), "timeout");
+        assert_eq!(query_outcome("selection exceeds 50000 events"), "limit");
+        assert_eq!(query_outcome("AWS rejected the request"), "error");
     }
 
     #[test]

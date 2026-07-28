@@ -31,6 +31,10 @@ pub struct Current {
     /// The synty version that wrote this pointer — for debugging mixed fleets.
     #[serde(default)]
     pub writer: String,
+    /// Wall-clock publication time for remote freshness reporting. Old
+    /// pointers deserialize with an empty value and remain readable.
+    #[serde(default)]
+    pub published_at: String,
 }
 
 fn format_default() -> u32 {
@@ -82,6 +86,7 @@ pub fn repoint(build: &str, rev: u64) -> Result<()> {
         rev,
         format: FORMAT,
         writer: env!("CARGO_PKG_VERSION").into(),
+        published_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     };
     repoint_current(&cur)
 }
@@ -221,7 +226,7 @@ mod tests {
     // docs/clusters paths through it (rev selects the clusters file).
     #[test]
     fn pointer_resolves_versioned_paths() {
-        let c = Current { build: "abc123".into(), rev: 2, format: FORMAT, writer: String::new() };
+        let c = Current { build: "abc123".into(), rev: 2, format: FORMAT, writer: String::new(), published_at: String::new() };
         assert_eq!(c.dir(), Path::new("index/builds/abc123"));
         assert!(c.docs().ends_with("index/builds/abc123/docs.jsonl"));
         assert!(c.clusters().ends_with("index/builds/abc123/unit_clusters.2.json"));
@@ -266,6 +271,7 @@ mod tests {
             rev: 0,
             format: FORMAT,
             writer: String::new(),
+            published_at: String::new(),
         };
 
         assert!(mediated_ready_from(Some(current.clone()), false));
