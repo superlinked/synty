@@ -423,6 +423,29 @@ mod tests {
     }
 
     #[test]
+    fn object_watermarks_advance_per_day_and_never_regress() {
+        let mut index = EventPartitionIndex::empty("edge-m-codex");
+        let day = "2026-07-22";
+        let first = "events/edge-m-codex/chunks/track.2026-07-22/b.jsonl";
+        index.record_object(day, first);
+        assert_eq!(index.object_cursors[day], first);
+
+        index.record_object(
+            day,
+            "events/edge-m-codex/chunks/track.2026-07-22/a.jsonl",
+        );
+        assert_eq!(
+            index.object_cursors[day], first,
+            "a late smaller key must not move the reader watermark backward"
+        );
+
+        let next_day = "2026-07-23";
+        let next = "events/edge-m-codex/chunks/track.2026-07-23/a.jsonl";
+        index.record_object(next_day, next);
+        assert_eq!(index.object_cursors[next_day], next);
+    }
+
+    #[test]
     fn bucket_freshness_uses_the_stream_registry_and_parsed_instants() {
         let root =
             std::env::temp_dir().join(format!("synty-event-freshness-{}", std::process::id()));
