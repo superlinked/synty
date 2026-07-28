@@ -106,6 +106,29 @@ pub fn deterministic_ulid(ts_ms: u64, key: &str) -> String {
     ulid_string(ts_ms, &entropy)
 }
 
+/// Recover the 48-bit millisecond timestamp from a canonical ULID. Trace
+/// lookups use this to prune the raw event lake before applying an exact id
+/// predicate; foreign/non-ULID ids deliberately return `None`.
+pub fn ulid_timestamp_ms(id: &str) -> Option<u64> {
+    if id.len() != 26 {
+        return None;
+    }
+    let mut timestamp = 0u64;
+    for byte in id.bytes().take(10) {
+        let value = match byte.to_ascii_uppercase() {
+            b'0'..=b'9' => byte - b'0',
+            b'A'..=b'H' => byte.to_ascii_uppercase() - b'A' + 10,
+            b'J'..=b'K' => byte.to_ascii_uppercase() - b'J' + 18,
+            b'M'..=b'N' => byte.to_ascii_uppercase() - b'M' + 20,
+            b'P'..=b'T' => byte.to_ascii_uppercase() - b'P' + 22,
+            b'V'..=b'Z' => byte.to_ascii_uppercase() - b'V' + 27,
+            _ => return None,
+        };
+        timestamp = (timestamp << 5) | u64::from(value);
+    }
+    (timestamp <= 0x0000_ffff_ffff_ffff).then_some(timestamp)
+}
+
 /// Encode (48-bit time, 80-bit entropy) into the canonical 26-char Crockford
 /// base32 ULID string (the oklog/ulid byte packing).
 fn ulid_string(ts_ms: u64, entropy: &[u8; 10]) -> String {
@@ -190,6 +213,16 @@ mod tests {
         let early = deterministic_ulid(1_700_000_000_000, "k");
         let late = deterministic_ulid(1_700_000_001_000, "k");
         assert!(early[..10] < late[..10]);
+    }
+
+    #[test]
+    fn ulid_timestamp_roundtrips_and_rejects_foreign_ids() {
+        let timestamp = 1_700_000_000_123;
+        let id = deterministic_ulid(timestamp, "session");
+        assert_eq!(ulid_timestamp_ms(&id), Some(timestamp));
+        assert_eq!(ulid_timestamp_ms(&id.to_ascii_lowercase()), Some(timestamp));
+        assert_eq!(ulid_timestamp_ms("job:call-1"), None);
+        assert_eq!(ulid_timestamp_ms("Z0000000000000000000000000"), None);
     }
 
     // The envelope round-trips and matches the wire field names ingest reads.
