@@ -186,10 +186,10 @@ New uploads use each event's UTC day, while
 day and `event-partitions/<stream>/track.<day>.json` records each immutable
 object's range. Athena combines projected stream/day partitions with its hidden
 `$path` column, so a wide legacy capture day can prune unrelated objects.
-Exact `trace_show` lookups recover the event time from Synty's ULID ids. If an
-exact id or resolved-session lookup still spans more object paths than the
-request guard permits, Athena falls back to the bounded stream/day partitions
-while retaining the exact id/session predicate.
+Exact `trace_show` and `trace_compare` lookups recover event time from Synty's
+ULID ids. If an exact id or resolved-session lookup still spans more object
+paths than the request guard permits, Athena falls back to the bounded
+stream/day partitions while retaining the exact id/session predicate.
 Once a stream index exists, readers include its legacy days and objects missing
 from the object index conservatively. A stream with no partition metadata falls
 back to physical days overlapping the requested window; initialize or backfill

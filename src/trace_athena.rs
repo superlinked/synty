@@ -433,7 +433,8 @@ impl Backend {
             return Ok(out);
         }
         let deadline = Instant::now() + REQUEST_QUERY_TIMEOUT;
-        let window = Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?;
+        let window = ids_lookup_window(&[left, right])
+            .unwrap_or(Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?);
         let store = self.load_store(
             window,
             None,
@@ -934,12 +935,27 @@ fn query_id(id: &str) -> &str {
 }
 
 fn id_lookup_window(id: &str) -> Option<Window> {
-    let timestamp = crate::event::ulid_timestamp_ms(query_id(id))?;
-    let center = DateTime::<Utc>::from_timestamp_millis(timestamp as i64)?;
-    Some(Window {
-        since: center - Duration::minutes(ID_LOOKUP_MINUTES),
-        until: center + Duration::minutes(ID_LOOKUP_MINUTES),
-    })
+    ids_lookup_window(&[id])
+}
+
+fn ids_lookup_window(ids: &[&str]) -> Option<Window> {
+    let mut timestamps = ids.iter().map(|id| {
+        let timestamp = crate::event::ulid_timestamp_ms(query_id(id))?;
+        DateTime::<Utc>::from_timestamp_millis(timestamp as i64)
+    });
+    let first = timestamps.next()??;
+    let (mut since, mut until) = (first, first);
+    for timestamp in timestamps {
+        let timestamp = timestamp?;
+        since = since.min(timestamp);
+        until = until.max(timestamp);
+    }
+    let window = Window {
+        since: since - Duration::minutes(ID_LOOKUP_MINUTES),
+        until: until + Duration::minutes(ID_LOOKUP_MINUTES),
+    };
+    (window.until - window.since <= Duration::hours(MAX_LOOKBACK_HOURS))
+        .then_some(window)
 }
 
 fn normalized_stream_source(source: &str) -> String {
@@ -1346,6 +1362,20 @@ mod tests {
         assert!(calls[0].contains("'edge-other-claudecode'"));
         assert!(calls[1].contains("stream IN ('edge-m-codex')"));
         assert!(!calls[1].contains("'edge-other-claudecode'"));
+    }
+
+    #[test]
+    fn compare_window_covers_both_ulid_timestamps() {
+        let early = parse_time("2026-07-22T10:00:00Z").unwrap();
+        let late = parse_time("2026-07-22T10:30:00Z").unwrap();
+        let left = crate::event::deterministic_ulid(early.timestamp_millis() as u64, "left");
+        let right = crate::event::deterministic_ulid(late.timestamp_millis() as u64, "right");
+
+        let window = ids_lookup_window(&[&left, &format!("job:{right}")]).unwrap();
+
+        assert_eq!(window.since, parse_time("2026-07-22T09:55:00Z").unwrap());
+        assert_eq!(window.until, parse_time("2026-07-22T10:35:00Z").unwrap());
+        assert!(ids_lookup_window(&[&left, "foreign-id"]).is_none());
     }
 
     #[test]
