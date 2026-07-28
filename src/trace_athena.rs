@@ -13,6 +13,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 const DEFAULT_LIST_HOURS: i64 = 1;
 const DEFAULT_LOOKUP_HOURS: i64 = 24 * 7;
+const ID_LOOKUP_MINUTES: i64 = 5;
 const MAX_LOOKBACK_HOURS: i64 = 24 * 7;
 const MAX_EVENTS: usize = 50_000;
 const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
@@ -378,7 +379,8 @@ impl Backend {
             return Ok(out);
         }
         let deadline = Instant::now() + REQUEST_QUERY_TIMEOUT;
-        let window = Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?;
+        let window = id_lookup_window(id)
+            .unwrap_or(Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?);
         let store =
             self.load_store(window, None, None, None, None, &[id], true, scope, deadline)?;
         let out = trace::show_store_text(&store, id, before, after, false, Some(scope))?;
@@ -431,7 +433,8 @@ impl Backend {
             return Ok(out);
         }
         let deadline = Instant::now() + REQUEST_QUERY_TIMEOUT;
-        let window = Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?;
+        let window = ids_lookup_window(&[left, right])
+            .unwrap_or(Window::parse(None, None, DEFAULT_LOOKUP_HOURS)?);
         let store = self.load_store(
             window,
             None,
@@ -472,6 +475,16 @@ impl Backend {
         };
         let first = self.select(&streams, window, &predicate, deadline)?;
         let sessions = event_sessions(&first.lines);
+        let matched_streams = event_streams(&first.lines);
+        let context_streams = if matched_streams.is_empty() {
+            streams.clone()
+        } else {
+            streams
+                .iter()
+                .filter(|stream| matched_streams.contains(*stream))
+                .cloned()
+                .collect()
+        };
         if sessions.len() > MAX_SESSIONS {
             return Err(limit_error(format!(
                 "Athena trace selection spans more than {MAX_SESSIONS} sessions; narrow the time, machine, source, or operation filter"
@@ -488,7 +501,7 @@ impl Backend {
             && !sessions.is_empty();
         let mut lines = if expands_sessions {
             self.select(
-                &streams,
+                &context_streams,
                 context_window,
                 &Predicate {
                     sessions: sessions.iter().cloned().collect(),
@@ -504,7 +517,7 @@ impl Backend {
         if !sessions.is_empty() && !expands_sessions {
             let mut contexts = self
                 .select(
-                    &streams,
+                    &context_streams,
                     context_window,
                     &Predicate {
                         sessions: sessions.into_iter().collect(),
@@ -529,8 +542,28 @@ impl Backend {
         predicate: &Predicate,
         deadline: Instant,
     ) -> Result<QueryRows> {
-        let selection = self.selected_objects(streams, window)?;
-        if selection.paths.is_empty() {
+        let permits_partition_scan =
+            !predicate.ids.is_empty() || !predicate.sessions.is_empty();
+        let (selection, partition_scan) = match self.selected_objects(streams, window) {
+            Ok(selection) => (selection, false),
+            Err(error)
+                if permits_partition_scan
+                    && matches!(
+                        error.downcast_ref::<TraceQueryError>(),
+                        Some(TraceQueryError::Limit(_))
+                    ) =>
+            {
+                (
+                    ObjectSelection {
+                        days: window_days(window).into_iter().collect(),
+                        paths: Vec::new(),
+                    },
+                    true,
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        if selection.days.is_empty() || (!partition_scan && selection.paths.is_empty()) {
             metrics::Run::new("athena_trace")
                 .set("outcome", "empty")
                 .set("rows", 0)
@@ -751,7 +784,6 @@ fn select_sql(
         "Athena trace needs at least one stream"
     );
     anyhow::ensure!(!days.is_empty(), "Athena trace needs at least one day");
-    anyhow::ensure!(!paths.is_empty(), "Athena trace needs at least one object path");
     let stream_values = streams
         .iter()
         .map(|stream| sql_string(stream))
@@ -762,15 +794,19 @@ fn select_sql(
         .map(|day| sql_string(day))
         .collect::<Vec<_>>()
         .join(", ");
-    let path_values = paths
-        .iter()
-        .map(|path| sql_string(path))
-        .collect::<Vec<_>>()
-        .join(", ");
     let mut clauses = vec![
         format!("stream IN ({stream_values})"),
         format!("day IN ({day_values})"),
-        format!("\"$path\" IN ({path_values})"),
+    ];
+    if !paths.is_empty() {
+        let path_values = paths
+            .iter()
+            .map(|path| sql_string(path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("\"$path\" IN ({path_values})"));
+    }
+    clauses.extend([
         format!(
             "from_iso8601_timestamp(json_extract_scalar(line, '$.ts')) >= from_iso8601_timestamp({})",
             sql_string(&window.since.to_rfc3339())
@@ -779,7 +815,7 @@ fn select_sql(
             "from_iso8601_timestamp(json_extract_scalar(line, '$.ts')) < from_iso8601_timestamp({})",
             sql_string(&window.until.to_rfc3339())
         ),
-    ];
+    ]);
     if let Some(source) = predicate.source.as_deref() {
         clauses.push(format!(
             "strpos(lower(coalesce(json_extract_scalar(line, '$.source'), '')), {}) > 0",
@@ -881,12 +917,45 @@ fn event_sessions(lines: &[String]) -> BTreeSet<String> {
     sessions
 }
 
+fn event_streams(lines: &[String]) -> BTreeSet<String> {
+    lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<crate::event::Event>(line).ok())
+        .map(|event| event.stream)
+        .filter(|stream| !stream.is_empty())
+        .collect()
+}
+
 fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
 fn query_id(id: &str) -> &str {
     id.strip_prefix("job:").unwrap_or(id)
+}
+
+fn id_lookup_window(id: &str) -> Option<Window> {
+    ids_lookup_window(&[id])
+}
+
+fn ids_lookup_window(ids: &[&str]) -> Option<Window> {
+    let mut timestamps = ids.iter().map(|id| {
+        let timestamp = crate::event::ulid_timestamp_ms(query_id(id))?;
+        DateTime::<Utc>::from_timestamp_millis(timestamp as i64)
+    });
+    let first = timestamps.next()??;
+    let (mut since, mut until) = (first, first);
+    for timestamp in timestamps {
+        let timestamp = timestamp?;
+        since = since.min(timestamp);
+        until = until.max(timestamp);
+    }
+    let window = Window {
+        since: since - Duration::minutes(ID_LOOKUP_MINUTES),
+        until: until + Duration::minutes(ID_LOOKUP_MINUTES),
+    };
+    (window.until - window.since <= Duration::hours(MAX_LOOKBACK_HOURS))
+        .then_some(window)
 }
 
 fn normalized_stream_source(source: &str) -> String {
@@ -1004,6 +1073,66 @@ mod tests {
         for mutating in ["INSERT", "UPDATE", "DELETE", "CREATE", "UNLOAD", "CTAS"] {
             assert!(!sql.to_ascii_uppercase().contains(mutating), "{mutating}");
         }
+    }
+
+    #[test]
+    fn exact_id_falls_back_to_stream_day_partitions_when_paths_exceed_the_guard() {
+        use crate::bucket::Bucket;
+
+        let root = std::env::temp_dir().join(format!(
+            "synty-athena-id-partition-fallback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bucket = crate::bucket::LocalFs::new(&root);
+        for index in 0..=MAX_OBJECT_PATHS {
+            bucket
+                .put(
+                    &format!(
+                        "events/edge-m-codex/chunks/track.2026-07-22/{index:04}.jsonl"
+                    ),
+                    b"{}\n",
+                )
+                .unwrap();
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = Backend {
+            config: Config {
+                bucket: root.to_string_lossy().into_owned(),
+                workgroup: "wg".into(),
+                database: "synty".into(),
+                table: "raw_events".into(),
+            },
+            query: Box::new(FakeQuery {
+                lines: Vec::new(),
+                calls: Arc::clone(&calls),
+            }),
+            streams: Some(vec!["edge-m-codex".into()]),
+            days: None,
+            cached: None,
+        };
+
+        backend
+            .select(
+                &["edge-m-codex".into()],
+                Window {
+                    since: parse_time("2026-07-22T10:00:00Z").unwrap(),
+                    until: parse_time("2026-07-22T10:10:00Z").unwrap(),
+                },
+                &Predicate {
+                    ids: vec!["event-id".into()],
+                    ..Default::default()
+                },
+                Instant::now() + StdDuration::from_secs(5),
+            )
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("day IN ('2026-07-22')"));
+        assert!(!calls[0].contains("\"$path\""));
+        assert!(calls[0].contains("'event-id'"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1180,6 +1309,73 @@ mod tests {
         assert_eq!(calls.len(), 2, "id lookup plus one full-session query");
         assert!(calls[1].contains("$.session_id"));
         assert!(!calls[1].contains("synty_context_rank"));
+    }
+
+    #[test]
+    fn show_uses_ulid_time_and_matching_stream_for_bounded_lookup() {
+        let timestamp = parse_time("2026-07-22T10:00:01Z").unwrap();
+        let id = crate::event::deterministic_ulid(timestamp.timestamp_millis() as u64, "call");
+        let lines = vec![
+            event(
+                "start",
+                "2026-07-22T10:00:00Z",
+                "session_start",
+                json!({"cwd":"/work/synty"}),
+            ),
+            event(
+                &id,
+                "2026-07-22T10:00:01Z",
+                "tool_call",
+                json!({"name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"cargo test\"}"}),
+            ),
+        ];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = Backend {
+            config: Config::new(
+                "s3://bucket".into(),
+                "wg".into(),
+                "synty".into(),
+                "raw_events".into(),
+            )
+            .unwrap(),
+            query: Box::new(FakeQuery {
+                lines,
+                calls: Arc::clone(&calls),
+            }),
+            streams: Some(vec![
+                "edge-m-codex".into(),
+                "edge-other-claudecode".into(),
+            ]),
+            days: Some(vec!["2026-07-22".into()]),
+            cached: None,
+        };
+
+        let out = backend
+            .show(&id, 3, 5, &ReadScope::default())
+            .unwrap();
+
+        assert!(out.contains("cargo test"));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains("2026-07-22T09:55:01+00:00"));
+        assert!(calls[0].contains("2026-07-22T10:05:01+00:00"));
+        assert!(calls[0].contains("'edge-other-claudecode'"));
+        assert!(calls[1].contains("stream IN ('edge-m-codex')"));
+        assert!(!calls[1].contains("'edge-other-claudecode'"));
+    }
+
+    #[test]
+    fn compare_window_covers_both_ulid_timestamps() {
+        let early = parse_time("2026-07-22T10:00:00Z").unwrap();
+        let late = parse_time("2026-07-22T10:30:00Z").unwrap();
+        let left = crate::event::deterministic_ulid(early.timestamp_millis() as u64, "left");
+        let right = crate::event::deterministic_ulid(late.timestamp_millis() as u64, "right");
+
+        let window = ids_lookup_window(&[&left, &format!("job:{right}")]).unwrap();
+
+        assert_eq!(window.since, parse_time("2026-07-22T09:55:00Z").unwrap());
+        assert_eq!(window.until, parse_time("2026-07-22T10:35:00Z").unwrap());
+        assert!(ids_lookup_window(&[&left, "foreign-id"]).is_none());
     }
 
     #[test]
