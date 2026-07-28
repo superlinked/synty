@@ -62,6 +62,13 @@ pub struct Status {
     /// A newer synty version published to the bucket, or None (current, or no
     /// bucket). Drives the passive upgrade nag; never blocks anything.
     pub upgrade: Option<String>,
+    /// Remote raw-event and published-model freshness, sampled from small
+    /// bucket metadata objects by MCP readers without downloading the lake.
+    pub bucket_newest_event: Option<String>,
+    pub bucket_published_read_model: Option<String>,
+    pub bucket_read_model_format: Option<u32>,
+    pub bucket_checked_at: Option<String>,
+    pub bucket_freshness_error: Option<String>,
     /// Tracked events are newer than the index — answers may miss recent work.
     pub stale: bool,
     /// Per-machine liveness and the actor↔GitHub-author join (M8 coverage).
@@ -127,6 +134,7 @@ pub fn status() -> Result<Status> {
     // A newer binary published to GitHub Releases (cached, token-gated, best-
     // effort). Independent of the bucket — it's about synty itself, not the data.
     let bucket = crate::config::load().bucket;
+    let bucket_freshness = crate::mcp::bucket_freshness();
     let upgrade = crate::release::available();
     let fleet = crate::units::analysis_roster()
         .unwrap_or_else(|| crate::fleet::roster(&docs, std::path::Path::new(crate::units::LOCAL_DIR)));
@@ -145,6 +153,11 @@ pub fn status() -> Result<Status> {
         autostart: crate::track::autostart_enabled(),
         bucket,
         upgrade,
+        bucket_newest_event: bucket_freshness.newest_raw_event,
+        bucket_published_read_model: bucket_freshness.published_read_model,
+        bucket_read_model_format: bucket_freshness.read_model_format,
+        bucket_checked_at: bucket_freshness.checked_at,
+        bucket_freshness_error: bucket_freshness.error,
         stale: stale_note().is_some(),
         fleet,
     })
@@ -829,6 +842,24 @@ pub fn status_md(s: &Status) -> String {
         o.push_str(&line);
         o.push('\n');
     }
+    if s.bucket.is_some() {
+        o.push_str(&format!(
+            "bucket raw: {} · published model: {} · format: {} · checked: {}{}\n",
+            s.bucket_newest_event.as_deref().unwrap_or("unknown"),
+            s.bucket_published_read_model
+                .as_deref()
+                .unwrap_or("unknown"),
+            s.bucket_read_model_format
+                .map(|format| format.to_string())
+                .as_deref()
+                .unwrap_or("unknown"),
+            s.bucket_checked_at.as_deref().unwrap_or("pending"),
+            s.bucket_freshness_error
+                .as_deref()
+                .map(|error| format!(" · error: {error}"))
+                .unwrap_or_default(),
+        ));
+    }
     o.push_str(&format!(
         "{} docs · {} GitHub · {} sessions · autostart {}\nnewest: {}\nlast indexed: {} · last tracked: {}\n\nkinds: ",
         s.docs,
@@ -965,40 +996,48 @@ pub fn topics_json(topics: &[TopicUnits]) -> String {
 }
 
 pub fn status_json(s: &Status) -> String {
-    envelope("status", serde_json::json!({
-        "docs": s.docs,
-        "github": s.github,
-        "sessions": s.sessions,
-        "by_kind": s.by_kind,
-        "by_repo": s.by_repo.iter().map(|t| serde_json::json!({"name": t.name, "docs": t.docs, "github": t.github, "sessions": t.sessions})).collect::<Vec<_>>(),
-        "by_user": s.by_user.iter().map(|t| serde_json::json!({"name": t.name, "docs": t.docs, "github": t.github, "sessions": t.sessions})).collect::<Vec<_>>(),
-        "newest_ts": s.newest_ts,
-        "last_indexed": s.last_indexed,
-        "last_tracked": s.last_tracked,
-        "autostart": s.autostart,
-        "bucket": s.bucket,
-        "upgrade": s.upgrade,
-        "stale": s.stale,
-        "fleet": {
-            "machines": s.fleet.machines.iter().map(|m| serde_json::json!({
-                "machine": m.machine,
-                "sources": m.sources,
-                "actors": m.actors,
-                "last_ts": m.last_ts,
-                "tracker_version": m.version,
-                "events": m.events,
-                "quiet": m.quiet,
-            })).collect::<Vec<_>>(),
-            "actors_tracked": s.fleet.actors_tracked,
-            "gh_active": s.fleet.gh_active,
-            "untracked": s.fleet.untracked.iter().map(|u| serde_json::json!({
-                "login": u.login, "agent": u.agent,
-            })).collect::<Vec<_>>(),
-            "untracked_attributed": s.fleet.untracked_attributed(),
-            "install_rate_pct": s.fleet.install_rate_pct,
-            "quiet_days": s.fleet.quiet_days,
-        },
-    }))
+    envelope(
+        "status",
+        serde_json::json!({
+            "docs": s.docs,
+            "github": s.github,
+            "sessions": s.sessions,
+            "by_kind": s.by_kind,
+            "by_repo": s.by_repo.iter().map(|t| serde_json::json!({"name": t.name, "docs": t.docs, "github": t.github, "sessions": t.sessions})).collect::<Vec<_>>(),
+            "by_user": s.by_user.iter().map(|t| serde_json::json!({"name": t.name, "docs": t.docs, "github": t.github, "sessions": t.sessions})).collect::<Vec<_>>(),
+            "newest_ts": s.newest_ts,
+            "last_indexed": s.last_indexed,
+            "last_tracked": s.last_tracked,
+            "autostart": s.autostart,
+            "bucket": s.bucket,
+            "upgrade": s.upgrade,
+            "bucket_newest_event": s.bucket_newest_event,
+            "bucket_published_read_model": s.bucket_published_read_model,
+            "bucket_read_model_format": s.bucket_read_model_format,
+            "bucket_checked_at": s.bucket_checked_at,
+            "bucket_freshness_error": s.bucket_freshness_error,
+            "stale": s.stale,
+            "fleet": {
+                "machines": s.fleet.machines.iter().map(|m| serde_json::json!({
+                    "machine": m.machine,
+                    "sources": m.sources,
+                    "actors": m.actors,
+                    "last_ts": m.last_ts,
+                    "tracker_version": m.version,
+                    "events": m.events,
+                    "quiet": m.quiet,
+                })).collect::<Vec<_>>(),
+                "actors_tracked": s.fleet.actors_tracked,
+                "gh_active": s.fleet.gh_active,
+                "untracked": s.fleet.untracked.iter().map(|u| serde_json::json!({
+                    "login": u.login, "agent": u.agent,
+                })).collect::<Vec<_>>(),
+                "untracked_attributed": s.fleet.untracked_attributed(),
+                "install_rate_pct": s.fleet.install_rate_pct,
+                "quiet_days": s.fleet.quiet_days,
+            },
+        }),
+    )
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -1661,17 +1700,52 @@ mod tests {
             last_indexed: None,
             last_tracked: None,
             autostart: false,
-            bucket: None,
+            bucket: Some("s3://team-synty".into()),
             upgrade: None,
+            bucket_newest_event: Some("2026-07-22T11:00:00Z".into()),
+            bucket_published_read_model: Some("2026-07-22T12:00:00Z".into()),
+            bucket_read_model_format: Some(2),
+            bucket_checked_at: Some("2026-07-22T12:01:00Z".into()),
+            bucket_freshness_error: Some("raw index unavailable".into()),
             stale: false,
             fleet: Default::default(),
         };
-        let s: serde_json::Value = serde_json::from_str(&status_json(&s)).unwrap();
-        assert_eq!((s["v"].as_i64(), s["kind"].as_str()), (Some(1), Some("status")));
-        assert_eq!(s["data"]["docs"], 3, "the data keeps the prior object shape");
-        assert!(s["data"]["fleet"]["machines"].is_array());
-        // Activation + the upgrade nag are exposed to agents (null here).
-        let data = s["data"].as_object().unwrap();
+        let markdown = status_md(&s);
+        for value in [
+            "2026-07-22T11:00:00Z",
+            "2026-07-22T12:00:00Z",
+            "format: 2",
+            "2026-07-22T12:01:00Z",
+            "raw index unavailable",
+        ] {
+            assert!(markdown.contains(value), "missing {value} from:\n{markdown}");
+        }
+        let json: serde_json::Value = serde_json::from_str(&status_json(&s)).unwrap();
+        assert_eq!(
+            (json["v"].as_i64(), json["kind"].as_str()),
+            (Some(1), Some("status"))
+        );
+        assert_eq!(json["data"]["docs"], 3, "the data keeps the prior object shape");
+        assert!(json["data"]["fleet"]["machines"].is_array());
+        assert_eq!(
+            json["data"]["bucket_newest_event"],
+            "2026-07-22T11:00:00Z"
+        );
+        assert_eq!(
+            json["data"]["bucket_published_read_model"],
+            "2026-07-22T12:00:00Z"
+        );
+        assert_eq!(json["data"]["bucket_read_model_format"], 2);
+        assert_eq!(
+            json["data"]["bucket_checked_at"],
+            "2026-07-22T12:01:00Z"
+        );
+        assert_eq!(
+            json["data"]["bucket_freshness_error"],
+            "raw index unavailable"
+        );
+        // Activation + the upgrade nag remain explicit fields for agents.
+        let data = json["data"].as_object().unwrap();
         assert!(data.contains_key("bucket"), "activation in json");
         assert!(data.contains_key("upgrade"), "upgrade availability in json");
     }

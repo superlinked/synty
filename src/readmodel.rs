@@ -31,6 +31,10 @@ pub struct Current {
     /// The synty version that wrote this pointer — for debugging mixed fleets.
     #[serde(default)]
     pub writer: String,
+    /// Wall-clock publication time for remote freshness reporting. Old
+    /// pointers deserialize with an empty value and remain readable.
+    #[serde(default)]
+    pub published_at: String,
 }
 
 fn format_default() -> u32 {
@@ -77,20 +81,31 @@ pub fn current() -> Option<Current> {
 /// Atomically repoint readers at `build`/`rev`. The build directory must be
 /// complete before this is called — the pointer move IS the publish.
 pub fn repoint(build: &str, rev: u64) -> Result<()> {
+    repoint_at(Path::new(POINTER), build, rev)
+}
+
+fn repoint_at(pointer: &Path, build: &str, rev: u64) -> Result<()> {
     let cur = Current {
         build: build.into(),
         rev,
         format: FORMAT,
         writer: env!("CARGO_PKG_VERSION").into(),
+        published_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     };
-    repoint_current(&cur)
+    repoint_current_at(pointer, &cur)
 }
 
 /// Preserve the exact pointer advertised by a remote writer. In particular,
 /// pulling a legacy build must not relabel it as the current layout format.
 pub fn repoint_current(cur: &Current) -> Result<()> {
-    std::fs::create_dir_all(ROOT)?;
-    crate::write_atomic(POINTER, serde_json::to_string(cur)?.as_bytes())
+    repoint_current_at(Path::new(POINTER), cur)
+}
+
+fn repoint_current_at(pointer: &Path, cur: &Current) -> Result<()> {
+    if let Some(parent) = pointer.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::write_atomic(&pointer.to_string_lossy(), serde_json::to_string(cur)?.as_bytes())
 }
 
 /// Reader conveniences: resolve through the pointer, with the working-corpus
@@ -221,7 +236,7 @@ mod tests {
     // docs/clusters paths through it (rev selects the clusters file).
     #[test]
     fn pointer_resolves_versioned_paths() {
-        let c = Current { build: "abc123".into(), rev: 2, format: FORMAT, writer: String::new() };
+        let c = Current { build: "abc123".into(), rev: 2, format: FORMAT, writer: String::new(), published_at: String::new() };
         assert_eq!(c.dir(), Path::new("index/builds/abc123"));
         assert!(c.docs().ends_with("index/builds/abc123/docs.jsonl"));
         assert!(c.clusters().ends_with("index/builds/abc123/unit_clusters.2.json"));
@@ -240,6 +255,26 @@ mod tests {
             serde_json::from_str(r#"{"build":"abc","rev":1,"format":9,"writer":"9.9.9"}"#).unwrap();
         assert!(newer.format > FORMAT, "upgrade gate can see the newer format");
         assert_eq!(old, newer, "identity is (build, rev) only");
+    }
+
+    #[test]
+    fn publishing_a_pointer_persists_an_rfc3339_publication_time() {
+        let root =
+            std::env::temp_dir().join(format!("synty-repoint-time-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pointer = root.join("index/current.json");
+
+        repoint_at(&pointer, "published-build", 3).unwrap();
+
+        let current: Current =
+            serde_json::from_slice(&std::fs::read(&pointer).unwrap()).unwrap();
+        assert!(!current.published_at.is_empty());
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&current.published_at).is_ok(),
+            "published_at must be an RFC3339 instant: {}",
+            current.published_at
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -266,6 +301,7 @@ mod tests {
             rev: 0,
             format: FORMAT,
             writer: String::new(),
+            published_at: String::new(),
         };
 
         assert!(mediated_ready_from(Some(current.clone()), false));

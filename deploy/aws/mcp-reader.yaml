@@ -30,7 +30,6 @@ Parameters:
   GlueTable:
     Type: String
     Default: raw_events
-
 Resources:
   ReaderRole:
     Type: AWS::IAM::Role

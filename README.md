@@ -178,8 +178,22 @@ stream plus the latest published read-model. MCP-only readers pull the semantic
 index and compact analysis projection. With `--athena-workgroup`, their trace
 tools query time/stream-pruned raw event rows directly and do not download
 `trace.json` or mirror raw chunks.
-A bounded stream registry and per-stream local key cursors avoid relisting
-historical chunks on each local read. The TUI builds unpublished event deltas in the background;
+A bounded stream registry, per-day object watermarks, and local key cursors
+avoid relisting unchanged historical chunks. A reader scans pre-watermark
+history once, then lists only days whose published high-water key advanced.
+New uploads use each event's UTC day, while
+`event-partitions/<stream>.json` records the event-time range of every physical
+day and `event-partitions/<stream>/track.<day>.json` records each immutable
+object's range. Athena combines projected stream/day partitions with its hidden
+`$path` column, so a wide legacy capture day can prune unrelated objects.
+Once a stream index exists, readers include its legacy days and objects missing
+from the object index conservatively. A stream with no partition metadata falls
+back to physical days overlapping the requested window; initialize or backfill
+the metadata before relying on delayed historical event-time lookups. No raw
+object migration is required. A one-time metadata-only range scan is recommended
+before broad historical MCP use; it writes only these small indexes and does
+not copy, rewrite, or delete JSONL. The TUI builds
+unpublished event deltas in the background;
 `synty build` does the same explicitly, while `search` warns if raw events are
 newer than the published index. One tokened machine scrapes GitHub for everyone.
 
@@ -238,12 +252,17 @@ MCP pulls the published semantic index and compact analysis projection before
 serving and refreshes them on a background thread; it never mirrors the raw
 event lake. In Athena mode it deliberately omits the legacy `trace.json` blob.
 Each trace request is a read-only `SELECT`, partition-pruned by stream and day,
-limited to seven days, 50,000 events, 64 MiB of returned envelopes, a 50-second
-query timeout, and the workgroup's 20 GiB scan cutoff. Limit hits fail closed
-and ask the caller for a narrower time/machine/source/operation filter.
+limited to seven days, 50,000 events, 64 MiB of returned envelopes, one shared
+45-second Athena budget across all queries needed by the request, 1,000 raw
+object paths per query, and the workgroup's 20 GiB scan cutoff. Success, error,
+timeout, and limit outcomes use the standard metrics block. Limit hits fail
+closed and ask the caller for a narrower time/machine/source/operation filter
+or a metadata-only object-range backfill.
 `/health` reports transport liveness and `/ready` waits for the semantic index
-and analysis projection, plus both dispatchers (`trace.json` is required only
-in local-projection mode). Analysis tools are
+and analysis projection, a compatible remote read-model format, plus both
+dispatchers (`trace.json` is required only in local-projection mode). Status
+and both health endpoints report the newest indexed raw-event timestamp, the
+published-model timestamp/format, and the last bucket metadata check. Analysis tools are
 serialized on a one-slot dispatcher so concurrent first loads cannot multiply
 memory. HTTP work is bounded by separate semantic and analysis queues, a
 120-second response deadline, 32 in-flight requests, 64 live connections,

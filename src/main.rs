@@ -16,6 +16,7 @@ mod encode;
 mod eval;
 mod event;
 mod config;
+mod event_partitions;
 mod fleet;
 mod github;
 mod generation;
