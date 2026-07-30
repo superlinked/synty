@@ -644,6 +644,15 @@ pub(crate) fn installed_workdir(home: &Path) -> std::path::PathBuf {
     home.to_path_buf()
 }
 
+fn unit_output_for(cwd: &Path, home: &Path, out: &str) -> String {
+    let path = Path::new(out);
+    if path.is_absolute() || out.starts_with(".synty/") || cwd != home {
+        out.to_string()
+    } else {
+        format!(".synty/{out}")
+    }
+}
+
 fn launch_domain() -> String {
     #[cfg(unix)]
     unsafe {
@@ -829,11 +838,14 @@ fn github_due(elapsed_since_last: Option<Duration>, every: Duration) -> bool {
 fn write_unit(kind: &str, path: &str, out: &str, machine: &str) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
     let cwd = unit_workdir()?;
+    let out = std::env::var("HOME")
+        .map(|home| unit_output_for(Path::new(&cwd), Path::new(&home), out))
+        .unwrap_or_else(|_| out.to_string());
     let mut args = vec![
         "track".to_string(),
         "--watch".to_string(),
         "--out".to_string(),
-        out.to_string(),
+        out,
         "--machine".to_string(),
         machine.to_string(),
     ];
@@ -1081,6 +1093,23 @@ mod tests {
         assert_eq!(
             workdir.join(".synty/track.log"),
             Path::new("/home/ec2-user/.synty/track.log")
+        );
+        assert_eq!(
+            unit_output_for(
+                &workdir,
+                Path::new("/home/ec2-user"),
+                "corpus/local"
+            ),
+            ".synty/corpus/local"
+        );
+        assert_eq!(
+            unit_output_for(
+                Path::new("/work/synty"),
+                Path::new("/home/ec2-user"),
+                "corpus/local"
+            ),
+            "corpus/local",
+            "a checkout keeps its repository-local corpus"
         );
     }
 
