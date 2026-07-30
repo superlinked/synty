@@ -1137,22 +1137,28 @@ mod tests {
 
     #[test]
     fn raw_athena_rows_reconstruct_the_existing_span_surface() {
+        let started = Utc::now() - Duration::minutes(2);
+        let called = started + Duration::seconds(1);
+        let completed = started + Duration::seconds(3);
+        let started = started.to_rfc3339();
+        let called = called.to_rfc3339();
+        let completed = completed.to_rfc3339();
         let lines = vec![
             event(
                 "start",
-                "2026-07-22T10:00:00Z",
+                &started,
                 "session_start",
                 json!({"cwd":"/work/synty"}),
             ),
             event(
                 "call-1",
-                "2026-07-22T10:00:01Z",
+                &called,
                 "tool_call",
                 json!({"name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"cargo test\"}"}),
             ),
             event(
                 "result-1",
-                "2026-07-22T10:00:03Z",
+                &completed,
                 "tool_result",
                 json!({"call_id":"c1","output":"Process exited with code 0"}),
             ),
@@ -1184,7 +1190,7 @@ mod tests {
                 None,
                 None,
                 false,
-                Some("2026-07-22T10:00:00Z"),
+                Some(&started),
                 None,
                 "recent",
                 20,
