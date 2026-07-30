@@ -171,6 +171,9 @@ tracker starts at boot without an SSH login, then run `init` normally:
 sudo loginctl enable-linger "$USER"
 ```
 
+The installed service runs from `$HOME`; its config, cursors, corpus, upload
+ledger, and log therefore stay under exactly one `$HOME/.synty/` directory.
+
 The bucket is the durable shared backplane; an S3 deployment may optionally add
 Glue catalog metadata and a bounded Athena workgroup for remote trace queries.
 There is still no migration, crawler, build server, or coordination service.

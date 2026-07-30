@@ -604,10 +604,10 @@ pub fn restart() -> Result<bool> {
     Ok(true)
 }
 
-/// The directory the autostart unit runs from. The current home when it holds
-/// synty state (the dev-checkout case), else ~/.synty — created so a fresh
-/// install's tracker has a stable, machine-wide home instead of whatever
-/// directory `init` happened to run in.
+/// The directory the autostart unit runs from. The current directory when it
+/// holds synty state (the dev-checkout case), else $HOME. State paths already
+/// include `.synty/`, so running from ~/.synty would accidentally create a
+/// second nested state directory.
 fn unit_workdir() -> Result<String> {
     if Path::new(".synty").exists() {
         return Ok(std::env::current_dir()?.display().to_string());
@@ -615,7 +615,11 @@ fn unit_workdir() -> Result<String> {
     let home = std::env::var("HOME").map_err(|_| anyhow!("no $HOME"))?;
     let d = Path::new(&home).join(".synty");
     std::fs::create_dir_all(&d)?;
-    Ok(d.display().to_string())
+    Ok(installed_workdir(Path::new(&home)).display().to_string())
+}
+
+pub(crate) fn installed_workdir(home: &Path) -> std::path::PathBuf {
+    home.to_path_buf()
 }
 
 fn launch_domain() -> String {
@@ -1045,6 +1049,16 @@ mod tests {
         assert_eq!(
             systemd_path("/tmp/a b/%n\\x\""),
             "/tmp/a\\x20b/%%n\\x5cx\\x22"
+        );
+    }
+
+    #[test]
+    fn installed_tracker_keeps_state_under_one_dot_synty_directory() {
+        let workdir = installed_workdir(Path::new("/home/ec2-user"));
+        assert_eq!(workdir, Path::new("/home/ec2-user"));
+        assert_eq!(
+            workdir.join(".synty/track.log"),
+            Path::new("/home/ec2-user/.synty/track.log")
         );
     }
 

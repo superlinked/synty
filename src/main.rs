@@ -696,9 +696,9 @@ enum TraceCmd {
 
 /// Run from the synty home: an explicit $SYNTY_HOME wins; a cwd that already
 /// holds synty state (.synty/) is its own home (the dev-checkout case); else
-/// fall back to ~/.synty when the installer created it. Every state path in
-/// the binary is home-relative, so this one chdir makes `synty tui` work from
-/// any directory.
+/// fall back to $HOME when the installer created ~/.synty. Every state path in
+/// the binary already includes `.synty/`, so this one chdir makes `synty tui`
+/// work from any directory without nesting the state directory.
 fn resolve_home() {
     if let Ok(h) = std::env::var("SYNTY_HOME") {
         if let Err(e) = std::env::set_current_dir(&h) {
@@ -711,8 +711,9 @@ fn resolve_home() {
     }
     if let Ok(home) = std::env::var("HOME") {
         let d = std::path::Path::new(&home).join(".synty");
-        if d.is_dir() && std::env::set_current_dir(&d).is_ok() {
-            eprintln!("synty: home {}", d.display());
+        let workdir = track::installed_workdir(std::path::Path::new(&home));
+        if d.is_dir() && std::env::set_current_dir(&workdir).is_ok() {
+            eprintln!("synty: home {}", workdir.display());
         }
     }
 }
