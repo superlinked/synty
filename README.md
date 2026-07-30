@@ -157,10 +157,14 @@ when set (otherwise `~/.codex` / `~/.claude`). MCP responses default to the
 `mcp_safe` redaction profile. Upload redaction defaults to `off`, preserving raw
 events as the rebuildable source of truth; opt in with `init
 --upload-redaction standard`. A repository allowlist is enforced before upload
-and during import. Unknown sessions fail closed. Changing upload redaction or
-the repository allowlist after offsets advance requires a new bucket prefix or
-an intentional ledger reset, because already-uploaded chunks are immutable and
-filtered history cannot be backfilled from an advanced cursor.
+and during import. An explicitly allowed local-only repository is resolved from
+its working-directory path even when it intentionally has no Git remote; the
+tracker stamps that canonical repository into session metadata so remote trace
+queries retain the same attribution. Unknown sessions fail closed. Changing
+upload redaction or the repository allowlist after offsets advance requires a
+new bucket prefix or an intentional ledger reset, because already-uploaded
+chunks are immutable and filtered history cannot be backfilled from an
+advanced cursor.
 
 On a systemd-based EC2 developer VM, enable lingering once so the per-user
 tracker starts at boot without an SSH login, then run `init` normally:
@@ -169,11 +173,16 @@ tracker starts at boot without an SSH login, then run `init` normally:
 sudo loginctl enable-linger "$USER"
 ```
 
+The installed service runs from `$HOME`; its config, cursors, corpus, upload
+ledger, and log therefore stay under exactly one `$HOME/.synty/` directory.
+
 The bucket is the durable shared backplane; an S3 deployment may optionally add
 Glue catalog metadata and a bounded Athena workgroup for remote trace queries.
 There is still no migration, crawler, build server, or coordination service.
 Each machine writes a stable `edge-<machine>-<source>` stream, so
-writers do not overwrite one another. Local readers and builders pull every
+writers do not overwrite one another. `init` persists the resolved machine id
+and writes that same id into the login-time tracker, activation marker, and
+stream names. Local readers and builders pull every
 stream plus the latest published read-model. MCP-only readers pull the semantic
 index and compact analysis projection. With `--athena-workgroup`, their trace
 tools query time/stream-pruned raw event rows directly and do not download

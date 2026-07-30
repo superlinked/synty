@@ -289,6 +289,7 @@ impl Tracker {
 impl Stream {
     fn drain(&mut self, cutoff_ms: i64, cursors: &HashMap<String, i64>) -> Result<usize> {
         let mut events = Vec::new();
+        let known_repos = configured_repositories();
         for path in discover(&self.roots, cutoff_ms) {
             let Ok(content) = std::fs::read(&path) else { continue };
 
@@ -349,6 +350,7 @@ impl Stream {
                         e.payload["campaign_id"] = json!(self.campaign);
                     }
                     e.payload["backend"] = json!(self.src.envelope_source());
+                    stamp_session_repo(e, &known_repos);
                 }
             }
             if cutoff_ms > 0 {
@@ -445,6 +447,26 @@ impl Stream {
             file.write_all(body.as_bytes())?;
         }
         Ok(())
+    }
+}
+
+fn configured_repositories() -> HashSet<String> {
+    let config = crate::config::load();
+    config
+        .repos
+        .into_iter()
+        .chain(config.capture_repos)
+        .collect()
+}
+
+/// Stamp the canonical repository while the source checkout is available.
+/// Remote trace readers cannot inspect this machine's Git metadata, and
+/// local-only repositories intentionally have no remote.
+fn stamp_session_repo(event: &mut Event, known_repos: &HashSet<String>) {
+    let cwd = event.payload["cwd"].as_str().unwrap_or("");
+    let repo = crate::units::resolve_repo(cwd, known_repos);
+    if !repo.is_empty() {
+        event.payload["repo"] = json!(repo);
     }
 }
 
@@ -565,16 +587,28 @@ pub fn autostart_unit() -> Option<(String, &'static str)> {
 /// Turn login-time autostart on or off and verify the service manager accepted
 /// it. A failed bootstrap is an error, not a green status badge.
 pub fn autostart_set(on: bool) -> Result<()> {
+    autostart_set_for_machine(on, None)
+}
+
+/// Install the tracker with the exact machine identity selected by `init`.
+/// TUI toggles omit the override and reuse the persisted identity.
+pub(crate) fn autostart_set_for_machine(on: bool, machine: Option<&str>) -> Result<()> {
     let (path, kind) =
         autostart_unit().ok_or_else(|| anyhow!("autostart unsupported on this platform"))?;
     if on {
-        write_unit(kind, &path, "corpus/local", "local")?;
+        let cfg = crate::config::load();
+        let machine = autostart_machine(machine, cfg.machine.as_deref());
+        write_unit(kind, &path, "corpus/local", &machine)?;
         loader(kind, &path, true)?;
     } else {
         loader(kind, &path, false)?;
         let _ = std::fs::remove_file(&path);
     }
     Ok(())
+}
+
+pub(crate) fn autostart_machine(explicit: Option<&str>, configured: Option<&str>) -> String {
+    explicit.or(configured).unwrap_or("local").to_string()
 }
 
 /// Restart the login-time tracker so a freshly installed binary takes over
@@ -592,10 +626,10 @@ pub fn restart() -> Result<bool> {
     Ok(true)
 }
 
-/// The directory the autostart unit runs from. The current home when it holds
-/// synty state (the dev-checkout case), else ~/.synty — created so a fresh
-/// install's tracker has a stable, machine-wide home instead of whatever
-/// directory `init` happened to run in.
+/// The directory the autostart unit runs from. The current directory when it
+/// holds synty state (the dev-checkout case), else $HOME. State paths already
+/// include `.synty/`, so running from ~/.synty would accidentally create a
+/// second nested state directory.
 fn unit_workdir() -> Result<String> {
     if Path::new(".synty").exists() {
         return Ok(std::env::current_dir()?.display().to_string());
@@ -603,7 +637,20 @@ fn unit_workdir() -> Result<String> {
     let home = std::env::var("HOME").map_err(|_| anyhow!("no $HOME"))?;
     let d = Path::new(&home).join(".synty");
     std::fs::create_dir_all(&d)?;
-    Ok(d.display().to_string())
+    Ok(installed_workdir(Path::new(&home)).display().to_string())
+}
+
+pub(crate) fn installed_workdir(home: &Path) -> std::path::PathBuf {
+    home.to_path_buf()
+}
+
+fn unit_output_for(cwd: &Path, home: &Path, out: &str) -> String {
+    let path = Path::new(out);
+    if path.is_absolute() || out.starts_with(".synty/") || cwd != home {
+        out.to_string()
+    } else {
+        format!(".synty/{out}")
+    }
 }
 
 fn launch_domain() -> String {
@@ -791,11 +838,14 @@ fn github_due(elapsed_since_last: Option<Duration>, every: Duration) -> bool {
 fn write_unit(kind: &str, path: &str, out: &str, machine: &str) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
     let cwd = unit_workdir()?;
+    let out = std::env::var("HOME")
+        .map(|home| unit_output_for(Path::new(&cwd), Path::new(&home), out))
+        .unwrap_or_else(|_| out.to_string());
     let mut args = vec![
         "track".to_string(),
         "--watch".to_string(),
         "--out".to_string(),
-        out.to_string(),
+        out,
         "--machine".to_string(),
         machine.to_string(),
     ];
@@ -1034,6 +1084,64 @@ mod tests {
             systemd_path("/tmp/a b/%n\\x\""),
             "/tmp/a\\x20b/%%n\\x5cx\\x22"
         );
+    }
+
+    #[test]
+    fn installed_tracker_keeps_state_under_one_dot_synty_directory() {
+        let workdir = installed_workdir(Path::new("/home/ec2-user"));
+        assert_eq!(workdir, Path::new("/home/ec2-user"));
+        assert_eq!(
+            workdir.join(".synty/track.log"),
+            Path::new("/home/ec2-user/.synty/track.log")
+        );
+        assert_eq!(
+            unit_output_for(
+                &workdir,
+                Path::new("/home/ec2-user"),
+                "corpus/local"
+            ),
+            ".synty/corpus/local"
+        );
+        assert_eq!(
+            unit_output_for(
+                Path::new("/work/synty"),
+                Path::new("/home/ec2-user"),
+                "corpus/local"
+            ),
+            "corpus/local",
+            "a checkout keeps its repository-local corpus"
+        );
+    }
+
+    #[test]
+    fn session_start_stamps_an_explicitly_captured_local_repo() {
+        let mut event = Event {
+            v: crate::event::ENVELOPE_V,
+            event_id: "event".into(),
+            stream: "edge-machine-codex".into(),
+            seq: 0,
+            ts: "2026-07-30T14:00:00Z".into(),
+            source: "codex_cli".into(),
+            session_id: "session".into(),
+            kind: kind::SESSION_START.into(),
+            payload: json!({"cwd":"/mnt/cache/workspaces/sie-harness"}),
+            rollup_dim: String::new(),
+        };
+        let known = HashSet::from(["sie-harness".to_string()]);
+
+        stamp_session_repo(&mut event, &known);
+
+        assert_eq!(event.payload["repo"], "sie-harness");
+    }
+
+    #[test]
+    fn autostart_prefers_init_machine_then_persisted_machine() {
+        assert_eq!(
+            autostart_machine(Some("eval-1"), Some("workstation-2")),
+            "eval-1"
+        );
+        assert_eq!(autostart_machine(None, Some("workstation-2")), "workstation-2");
+        assert_eq!(autostart_machine(None, None), "local");
     }
 
     #[test]

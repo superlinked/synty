@@ -193,6 +193,7 @@ pub(crate) struct Server {
     scope: crate::policy::ReadScope,
     redaction: crate::redact::Profile,
     allow_repo_paths: bool,
+    bucket: Option<String>,
     trace: TraceBackend,
     /// The build the engine serves + encoder + index — loaded on the first
     /// search call, kept warm, reopened when the pointer moves.
@@ -216,6 +217,7 @@ impl Server {
             scope,
             redaction,
             allow_repo_paths,
+            bucket,
             trace,
             engine: None,
         }
@@ -264,7 +266,9 @@ impl Server {
             "synty_related" => self.related(a),
             "synty_topics" => topics_text(a, &self.scope),
             "synty_recent" => recent_text(a, &self.scope),
-            "synty_status" => view::status().map(|s| view::status_md(&s)),
+            "synty_status" => {
+                view::status_for_bucket(self.bucket.as_deref()).map(|s| view::status_md(&s))
+            }
             "synty_stats" => view::stats(bounded_positive(a, "weeks", 4, 52)).map(|s| view::stats_md(&s)),
             "synty_tool" => {
                 let name = a["name"].as_str().unwrap_or("");
@@ -751,6 +755,30 @@ mod tests {
         let called = server.handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"synty_status","arguments":{}}})).unwrap();
         assert!(called["error"]["message"].as_str().unwrap().contains("restricted"));
+    }
+
+    #[test]
+    fn status_reports_the_server_bucket_without_local_config() {
+        let mut server = Server::new(
+            "m".into(),
+            crate::policy::McpRole::Operator,
+            crate::policy::ReadScope::default(),
+            crate::redact::Profile::Off,
+            true,
+            Some("s3://team-synty".into()),
+            None,
+        );
+        let response = server
+            .handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"synty_status","arguments":{}}}))
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("✓ on the team — s3://team-synty")
+        );
     }
 
     #[test]

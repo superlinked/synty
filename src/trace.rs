@@ -482,9 +482,14 @@ impl TraceStore {
         if ctx.role.is_empty() {
             ctx.role = crate::policy::role(ev).to_string();
         }
+        if ctx.repo.is_empty() {
+            ctx.repo = ev.payload["repo"].as_str().unwrap_or("").to_string();
+        }
         if let Some(cwd) = event_cwd(&ev.payload).filter(|cwd| !cwd.is_empty()) {
             if ctx.cwd.is_empty() {
-                ctx.repo = crate::units::resolve_repo(&cwd, known);
+                if ctx.repo.is_empty() {
+                    ctx.repo = crate::units::resolve_repo(&cwd, known);
+                }
                 ctx.cwd = cwd;
             }
         }
@@ -2915,6 +2920,40 @@ mod tests {
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].repo, "repo");
+    }
+
+    #[test]
+    fn remote_trace_uses_edge_stamped_repo_without_a_local_checkout() {
+        let lines = [
+            ev(
+                "start",
+                "2026-06-01T10:00:00Z",
+                "codex_cli",
+                "S",
+                "session_start",
+                json!({"cwd":"/mnt/cache/workspaces/sie-harness","repo":"sie-harness"}),
+            ),
+            ev(
+                "call",
+                "2026-06-01T10:00:01Z",
+                "codex_cli",
+                "S",
+                "tool_call",
+                json!({"name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"pytest\"}"}),
+            ),
+            ev(
+                "result",
+                "2026-06-01T10:00:02Z",
+                "codex_cli",
+                "S",
+                "tool_result",
+                json!({"call_id":"c1","output":"Process exited with code 0"}),
+            ),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let store = TraceStore::from_lines(&refs);
+
+        assert_eq!(store.spans[0].repo, "sie-harness");
     }
 
     #[test]
