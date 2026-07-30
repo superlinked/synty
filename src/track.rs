@@ -289,6 +289,7 @@ impl Tracker {
 impl Stream {
     fn drain(&mut self, cutoff_ms: i64, cursors: &HashMap<String, i64>) -> Result<usize> {
         let mut events = Vec::new();
+        let known_repos = configured_repositories();
         for path in discover(&self.roots, cutoff_ms) {
             let Ok(content) = std::fs::read(&path) else { continue };
 
@@ -349,6 +350,7 @@ impl Stream {
                         e.payload["campaign_id"] = json!(self.campaign);
                     }
                     e.payload["backend"] = json!(self.src.envelope_source());
+                    stamp_session_repo(e, &known_repos);
                 }
             }
             if cutoff_ms > 0 {
@@ -445,6 +447,26 @@ impl Stream {
             file.write_all(body.as_bytes())?;
         }
         Ok(())
+    }
+}
+
+fn configured_repositories() -> HashSet<String> {
+    let config = crate::config::load();
+    config
+        .repos
+        .into_iter()
+        .chain(config.capture_repos)
+        .collect()
+}
+
+/// Stamp the canonical repository while the source checkout is available.
+/// Remote trace readers cannot inspect this machine's Git metadata, and
+/// local-only repositories intentionally have no remote.
+fn stamp_session_repo(event: &mut Event, known_repos: &HashSet<String>) {
+    let cwd = event.payload["cwd"].as_str().unwrap_or("");
+    let repo = crate::units::resolve_repo(cwd, known_repos);
+    if !repo.is_empty() {
+        event.payload["repo"] = json!(repo);
     }
 }
 
@@ -1060,6 +1082,27 @@ mod tests {
             workdir.join(".synty/track.log"),
             Path::new("/home/ec2-user/.synty/track.log")
         );
+    }
+
+    #[test]
+    fn session_start_stamps_an_explicitly_captured_local_repo() {
+        let mut event = Event {
+            v: crate::event::ENVELOPE_V,
+            event_id: "event".into(),
+            stream: "edge-machine-codex".into(),
+            seq: 0,
+            ts: "2026-07-30T14:00:00Z".into(),
+            source: "codex_cli".into(),
+            session_id: "session".into(),
+            kind: kind::SESSION_START.into(),
+            payload: json!({"cwd":"/mnt/cache/workspaces/sie-harness"}),
+            rollup_dim: String::new(),
+        };
+        let known = HashSet::from(["sie-harness".to_string()]);
+
+        stamp_session_repo(&mut event, &known);
+
+        assert_eq!(event.payload["repo"], "sie-harness");
     }
 
     #[test]

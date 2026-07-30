@@ -158,11 +158,13 @@ when set (otherwise `~/.codex` / `~/.claude`). MCP responses default to the
 events as the rebuildable source of truth; opt in with `init
 --upload-redaction standard`. A repository allowlist is enforced before upload
 and during import. An explicitly allowed local-only repository is resolved from
-its working-directory path even when it intentionally has no Git remote.
-Unknown sessions fail closed. Changing upload redaction or the repository
-allowlist after offsets advance requires a new bucket prefix or an intentional
-ledger reset, because already-uploaded chunks are immutable and filtered
-history cannot be backfilled from an advanced cursor.
+its working-directory path even when it intentionally has no Git remote; the
+tracker stamps that canonical repository into session metadata so remote trace
+queries retain the same attribution. Unknown sessions fail closed. Changing
+upload redaction or the repository allowlist after offsets advance requires a
+new bucket prefix or an intentional ledger reset, because already-uploaded
+chunks are immutable and filtered history cannot be backfilled from an
+advanced cursor.
 
 On a systemd-based EC2 developer VM, enable lingering once so the per-user
 tracker starts at boot without an SSH login, then run `init` normally:
