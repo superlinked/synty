@@ -232,7 +232,7 @@ fn push_events_scoped(
     let profile = crate::config::upload_redaction();
     let config = crate::config::load();
     let capture_repos = config.capture_repos;
-    let known_repos: std::collections::HashSet<String> = config.repos.into_iter().collect();
+    let known_repos = upload_known_repos(config.repos, &capture_repos);
     let profile_name = profile.as_str();
     ensure_upload_policy_compatible(
         &state,
@@ -396,6 +396,19 @@ fn push_events_scoped(
     }
     sync_metric("event_chunks_up", n, bytes_up);
     Ok(n)
+}
+
+/// Repository names that can be resolved without consulting a checkout's Git
+/// remote. Explicit upload policy is part of this set: local-only repositories
+/// have no remote by design, but their cwd still identifies them unambiguously.
+fn upload_known_repos(
+    configured: Vec<String>,
+    capture_repos: &[String],
+) -> std::collections::HashSet<String> {
+    configured
+        .into_iter()
+        .chain(capture_repos.iter().cloned())
+        .collect()
 }
 
 fn ensure_upload_policy_compatible(
@@ -1137,6 +1150,28 @@ mod tests {
         assert!(!filtered.contains("denied"));
         assert!(!filtered.contains("agent_meta"));
         assert!(!filtered.contains("not-json"));
+    }
+
+    #[test]
+    fn explicitly_allowed_local_repo_resolves_without_a_git_remote() {
+        let capture_repos = vec!["sie-harness".to_string()];
+        let known_repos = upload_known_repos(Vec::new(), &capture_repos);
+        let raw = concat!(
+            r#"{"session_id":"local","kind":"session_start","payload":{"cwd":"/mnt/cache/workspaces/sie-harness"}}"#,
+            "\n",
+            r#"{"session_id":"other","kind":"session_start","payload":{"cwd":"/mnt/cache/workspaces/unlisted-local"}}"#,
+            "\n",
+        );
+        let mut allowed = BTreeSet::new();
+
+        update_allowed_sessions(
+            raw.as_bytes(),
+            &capture_repos,
+            &known_repos,
+            &mut allowed,
+        );
+
+        assert_eq!(allowed, BTreeSet::from(["local".to_string()]));
     }
 
     #[test]
