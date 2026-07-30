@@ -175,14 +175,25 @@ pub fn captured_at(ts: &str, cutoff_ms: Option<i64>) -> bool {
 }
 
 pub fn load() -> Config {
-    std::fs::read_to_string(PATH).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    load_from(Path::new(PATH))
 }
 
 pub fn save(c: &Config) -> Result<()> {
-    if let Some(dir) = Path::new(PATH).parent() {
+    save_to(Path::new(PATH), c)
+}
+
+fn load_from(path: &Path) -> Config {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn save_to(path: &Path, c: &Config) -> Result<()> {
+    if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    crate::write_atomic(PATH, serde_json::to_string_pretty(c)?.as_bytes())?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("config path must be valid UTF-8"))?;
+    crate::write_atomic(path, serde_json::to_string_pretty(c)?.as_bytes())?;
     Ok(())
 }
 
@@ -205,5 +216,29 @@ mod tests {
         assert!(!captured_at("2026-07-20T23:59:59Z", Some(cutoff)));
         assert!(captured_at("2026-07-21T00:00:00Z", Some(cutoff)));
         assert!(captured_at("future-envelope-time", Some(cutoff)));
+    }
+
+    #[test]
+    fn machine_identity_roundtrips_and_legacy_config_defaults_to_none() {
+        let root = std::env::temp_dir().join(format!(
+            "synty-machine-config-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("config.json");
+        let configured = Config {
+            machine: Some("sie-dev-cuda-rust".into()),
+            ..Default::default()
+        };
+
+        save_to(&path, &configured).unwrap();
+        assert_eq!(
+            load_from(&path).machine.as_deref(),
+            Some("sie-dev-cuda-rust")
+        );
+
+        std::fs::write(&path, r#"{"bucket":"s3://team"}"#).unwrap();
+        assert!(load_from(&path).machine.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
