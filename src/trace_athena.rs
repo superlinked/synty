@@ -1140,6 +1140,7 @@ mod tests {
         let started = Utc::now() - Duration::minutes(2);
         let called = started + Duration::seconds(1);
         let completed = started + Duration::seconds(3);
+        let day = started.format("%Y-%m-%d").to_string();
         let started = started.to_rfc3339();
         let called = called.to_rfc3339();
         let completed = completed.to_rfc3339();
@@ -1178,7 +1179,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
             streams: Some(vec!["edge-m-codex".into()]),
-            days: Some(vec!["2026-07-22".into()]),
+            days: Some(vec![day]),
             cached: None,
         };
         let out = backend
