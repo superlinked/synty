@@ -173,7 +173,9 @@ The bucket is the durable shared backplane; an S3 deployment may optionally add
 Glue catalog metadata and a bounded Athena workgroup for remote trace queries.
 There is still no migration, crawler, build server, or coordination service.
 Each machine writes a stable `edge-<machine>-<source>` stream, so
-writers do not overwrite one another. Local readers and builders pull every
+writers do not overwrite one another. `init` persists the resolved machine id
+and writes that same id into the login-time tracker, activation marker, and
+stream names. Local readers and builders pull every
 stream plus the latest published read-model. MCP-only readers pull the semantic
 index and compact analysis projection. With `--athena-workgroup`, their trace
 tools query time/stream-pruned raw event rows directly and do not download

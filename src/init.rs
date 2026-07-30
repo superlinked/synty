@@ -42,6 +42,7 @@ pub fn run(opts: Opts) -> Result<()> {
         no_build,
         no_autostart,
     } = opts;
+    let machine = identity::resolve_machine(&machine);
     let mut cfg = config::load();
 
     // 1. Bucket: setting it is the local→bucket switch; absent → stay local
@@ -73,6 +74,7 @@ pub fn run(opts: Opts) -> Result<()> {
     if let Some(role) = role.filter(|value| !value.is_empty()) {
         cfg.campaign_role = Some(role);
     }
+    cfg.machine = Some(machine.clone());
 
     // 2. GitHub identity — best-effort, no prompts. With a token, pin the login
     //    (so sessions merge with the person's PRs) and default the backfill org
@@ -114,7 +116,7 @@ pub fn run(opts: Opts) -> Result<()> {
     if no_autostart {
         eprintln!("init: autostart skipped — run `synty track --watch` under your supervisor");
     } else {
-        track::autostart_set(true).context(
+        track::autostart_set_for_machine(true, Some(&machine)).context(
             "enable login-time tracker (configuration was saved, but initialization is not complete)",
         )?;
         eprintln!("init: login-time tracker enabled");
@@ -164,5 +166,16 @@ mod tests {
         assert!(root.join("members/dev-a/activation.json").is_file());
         assert!(root.join("members/dev-b/activation.json").is_file());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_machine_is_resolved_once_for_activation_and_tracking() {
+        let requested = "runner/7";
+        let resolved = identity::resolve_machine(requested);
+        assert_eq!(resolved, "runner-7");
+        assert_eq!(
+            track::autostart_machine(Some(&resolved), Some("stale-machine")),
+            "runner-7"
+        );
     }
 }

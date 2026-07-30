@@ -565,16 +565,28 @@ pub fn autostart_unit() -> Option<(String, &'static str)> {
 /// Turn login-time autostart on or off and verify the service manager accepted
 /// it. A failed bootstrap is an error, not a green status badge.
 pub fn autostart_set(on: bool) -> Result<()> {
+    autostart_set_for_machine(on, None)
+}
+
+/// Install the tracker with the exact machine identity selected by `init`.
+/// TUI toggles omit the override and reuse the persisted identity.
+pub(crate) fn autostart_set_for_machine(on: bool, machine: Option<&str>) -> Result<()> {
     let (path, kind) =
         autostart_unit().ok_or_else(|| anyhow!("autostart unsupported on this platform"))?;
     if on {
-        write_unit(kind, &path, "corpus/local", "local")?;
+        let cfg = crate::config::load();
+        let machine = autostart_machine(machine, cfg.machine.as_deref());
+        write_unit(kind, &path, "corpus/local", &machine)?;
         loader(kind, &path, true)?;
     } else {
         loader(kind, &path, false)?;
         let _ = std::fs::remove_file(&path);
     }
     Ok(())
+}
+
+pub(crate) fn autostart_machine(explicit: Option<&str>, configured: Option<&str>) -> String {
+    explicit.or(configured).unwrap_or("local").to_string()
 }
 
 /// Restart the login-time tracker so a freshly installed binary takes over
@@ -1034,6 +1046,16 @@ mod tests {
             systemd_path("/tmp/a b/%n\\x\""),
             "/tmp/a\\x20b/%%n\\x5cx\\x22"
         );
+    }
+
+    #[test]
+    fn autostart_prefers_init_machine_then_persisted_machine() {
+        assert_eq!(
+            autostart_machine(Some("eval-1"), Some("workstation-2")),
+            "eval-1"
+        );
+        assert_eq!(autostart_machine(None, Some("workstation-2")), "workstation-2");
+        assert_eq!(autostart_machine(None, None), "local");
     }
 
     #[test]

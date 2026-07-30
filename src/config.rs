@@ -34,6 +34,10 @@ pub struct Config {
     /// defaults to it; an explicit --bucket flag still wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
+    /// Resolved machine id used by the login-time tracker. Persisting it keeps
+    /// the autostart unit aligned with the activation marker and stream names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     /// Named AWS shared-config profile used by the S3 credential chain. For an
     /// unattended workstation this should use credential_process (including
     /// IAM Roles Anywhere); ordinary shared credentials also work. Empty means

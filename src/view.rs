@@ -77,6 +77,12 @@ pub struct Status {
 
 /// What synty holds and how fresh it is.
 pub fn status() -> Result<Status> {
+    status_for_bucket(None)
+}
+
+/// Build status with an explicit runtime bucket when a supervised MCP process
+/// receives `--bucket` without a workstation config file.
+pub fn status_for_bucket(runtime_bucket: Option<&str>) -> Result<Status> {
     use std::collections::HashSet;
     let docs = load_docs(readmodel::docs_path()).unwrap_or_default();
     let github = docs.iter().filter(|d| d.meta.source == "github").count();
@@ -133,7 +139,9 @@ pub fn status() -> Result<Status> {
     by_model.sort_by(|a, b| b.tok_out.cmp(&a.tok_out).then(a.model.cmp(&b.model)));
     // A newer binary published to GitHub Releases (cached, token-gated, best-
     // effort). Independent of the bucket — it's about synty itself, not the data.
-    let bucket = crate::config::load().bucket;
+    let bucket = runtime_bucket
+        .map(ToOwned::to_owned)
+        .or_else(|| crate::config::load().bucket);
     let bucket_freshness = crate::mcp::bucket_freshness();
     let upgrade = crate::release::available();
     let fleet = crate::units::analysis_roster()

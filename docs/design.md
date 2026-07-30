@@ -328,7 +328,9 @@ the watcher. `--capture-since` persists an absolute event boundary and
 `--upload-interval` sets the network batching cadence. Optional `--campaign` /
 `--role` persist campaign stamps used by later track/import runs.
 `--capture-repo`, `--upload-redaction`, and `--mcp-redaction` persist the
-corresponding privacy policy. A systemd
+corresponding privacy policy. The resolved `--machine` identity is persisted
+and reused by autostart, so activation and event streams cannot silently fall
+back to `local`. A systemd
 user service starts at boot on a headless developer VM when the administrator
 enables lingering for that user (`loginctl enable-linger`).
 The state shows on `status` and the TUI footer (`◐ local`, accent → `✓
