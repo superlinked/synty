@@ -107,10 +107,11 @@ fn fetch_build(b: &dyn bucket::Bucket, dir: &Path, files: &BTreeMap<String, Stri
                 continue;
             }
         }
-        let bytes = b.get(&format!("blobs/{blob}"))?.ok_or_else(|| anyhow!("missing blob {blob} for {name}"))?;
-        bytes_down += bytes.len() as u64;
+        let n = b
+            .get_to_path(&format!("blobs/{blob}"), &dest)?
+            .ok_or_else(|| anyhow!("missing blob {blob} for {name}"))?;
+        bytes_down += n;
         fetched += 1;
-        crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
     }
     write_local_manifest(dir, files); // so the next pull can reuse these blobs
     Ok((reused, fetched, bytes_down))

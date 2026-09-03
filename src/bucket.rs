@@ -25,6 +25,20 @@ pub trait Bucket: Send + Sync {
     /// Byte size of an object, or None if absent — used for legacy mutable
     /// event compatibility and other metadata-only checks.
     fn size(&self, key: &str) -> Result<Option<u64>>;
+    /// Materialize an object into `dest` (atomic: never a partial file under
+    /// the final name), returning its byte size, or None if absent. Cloud
+    /// backends override this to stream large objects in bounded ranges
+    /// instead of buffering one unbounded response body in memory.
+    fn get_to_path(&self, key: &str, dest: &Path) -> Result<Option<u64>> {
+        match self.get(key)? {
+            Some(bytes) => {
+                let len = bytes.len() as u64;
+                crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
+                Ok(Some(len))
+            }
+            None => Ok(None),
+        }
+    }
     /// All keys under `prefix` (recursive), relative to the bucket root.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
     /// Keys under `prefix` whose full key sorts after `offset`. Cloud stores
