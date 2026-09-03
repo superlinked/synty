@@ -15,6 +15,13 @@ use tokio::runtime::Runtime;
 /// workstation build into an unbounded connection or memory spike.
 const OBJECT_CONCURRENCY: usize = 32;
 
+/// Objects above this stream to disk in per-range requests. One range must
+/// finish inside the client's per-request timeout, and each range is a fresh
+/// request, so rotating credentials refresh between ranges instead of
+/// expiring mid-body on a multi-GB blob.
+const RANGE_BYTES: u64 = 16 * 1024 * 1024;
+const RANGE_RETRIES: u32 = 4;
+
 struct Cloud {
     store: Arc<dyn ObjectStore>,
     rt: Runtime,
@@ -213,6 +220,64 @@ impl Bucket for Cloud {
             out[i] = value.map_err(|e| anyhow!("get {key}: {e}"))?;
         }
         Ok(out)
+    }
+
+    fn get_to_path(&self, key: &str, dest: &std::path::Path) -> Result<Option<u64>> {
+        let p = self.full(key);
+        let size = match self.rt.block_on(self.store.head(&p)) {
+            Ok(meta) => meta.size as u64,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(anyhow!("head {key}: {e}")),
+        };
+        if size <= RANGE_BYTES {
+            return match self.get(key)? {
+                Some(bytes) => {
+                    crate::write_atomic(&dest.to_string_lossy(), &bytes)?;
+                    Ok(Some(bytes.len() as u64))
+                }
+                None => Ok(None),
+            };
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = dest.with_file_name(format!(
+            "{}.part.{}",
+            dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+            let mut offset: u64 = 0;
+            while offset < size {
+                let end = (offset + RANGE_BYTES).min(size);
+                let mut attempt = 0;
+                let bytes = loop {
+                    attempt += 1;
+                    match self
+                        .rt
+                        .block_on(self.store.get_range(&p, (offset as usize)..(end as usize)))
+                    {
+                        Ok(b) => break b,
+                        Err(e) if attempt < RANGE_RETRIES => {
+                            std::thread::sleep(std::time::Duration::from_secs(1 << attempt));
+                            let _ = e;
+                        }
+                        Err(e) => bail!("get {key} range {offset}..{end}: {e}"),
+                    }
+                };
+                std::io::Write::write_all(&mut file, &bytes)?;
+                offset = end;
+            }
+            let file = file.into_inner()?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, dest)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result.map(|()| Some(size))
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
